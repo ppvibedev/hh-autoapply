@@ -1,0 +1,22 @@
+# Локальные настройки и приватные данные
+.env*
+!.env.example
+.envrc
+state/
+secrets/
+credentials/
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Окружение и кэши Python
+.venv/
+__pycache__/
+*.pyc
+
+# Логи и служебные файлы
+*.log
+*.pid
+.DS_Store
