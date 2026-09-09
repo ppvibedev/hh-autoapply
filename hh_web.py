@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import config
 
@@ -49,7 +49,11 @@ def _parse_salary(text: str) -> dict | None:
         return None
     lo = nums[0]
     hi = nums[1] if len(nums) > 1 else None
-    return {"from": lo, "to": hi}
+    # Only positively identified rubles may be compared with the RUB minimum.
+    currency = "RUR" if re.search(r"₽|\b(?:RUB|RUR|руб(?:лей|ля|ль)?\.?)\b", text, re.I) else None
+    if len(nums) == 1 and re.search(r"\bдо\b", text, re.I):
+        lo, hi = None, lo
+    return {"from": lo, "to": hi, "currency": currency}
 
 
 def _vac_id(url: str) -> str:
@@ -64,12 +68,14 @@ def search_page(page, *, text: str, area: str, salary_min: int,
 
     extra_params — родные фильтры hh (experience/employment/schedule/…).
     """
-    params: dict = {"text": text, "area": area, "page": page_num}
+    params: dict = {"text": text, "page": page_num}
+    if area:
+        params["area"] = area
     # search_field не ограничиваем — чтобы hh находил синонимы и англ/рус варианты.
     # Точность обеспечивает ИИ-оценка названия в decide.score.
     if salary_min:
         params["salary"] = salary_min       # сам порог зарплаты (как в hh)
-        params["only_with_salary"] = "true"
+        params["currency"] = "RUR"
     if work_format_codes:
         params["work_format"] = work_format_codes  # список → повторяющийся параметр
     for k, v in (extra_params or {}).items():
@@ -108,8 +114,19 @@ def load_full(page, vac: dict) -> dict:
     page.goto(vac["url"], wait_until="domcontentloaded")
     _pause()
     desc = page.locator(SEL["vac_desc"]).first
-    if desc.count():
-        vac["description"] = (desc.inner_text() or "").strip()
+    if not desc.count():
+        raise ValueError("vacancy_description_not_found")
+    vac["description"] = (desc.inner_text() or "").strip()
+    if not vac["description"]:
+        raise ValueError("vacancy_description_empty")
+    # Отдельная строка условий; отсутствие не подменяем native-фильтром.
+    fmt = page.locator('[data-qa="vacancy-view-work-format"]').first
+    vac["work_format_text"] = fmt.inner_text().strip() if fmt.count() else ""
+    if not vac["work_format_text"]:
+        body = page.locator("body").inner_text()
+        match = re.search(r"Формат работы:\s*([^\n]+)", body, re.I)
+        if match:
+            vac["work_format_text"] = match.group(1).strip()
     if not vac.get("salary"):
         sal = page.locator(SEL["vac_salary"]).first
         if sal.count():
@@ -117,93 +134,54 @@ def load_full(page, vac: dict) -> dict:
     return vac
 
 
-def load_resume_text(page, direct_url: str = "") -> str:
-    """Подтягивает текст твоего резюме с hh.ru (по залогиненной сессии).
+def resume_id_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ("hh.ru", "www.hh.ru") or parsed.username or parsed.password:
+        raise ValueError("select_specific_hh_resume")
+    match = re.fullmatch(r"/resume/([0-9a-fA-F]+)/*", parsed.path)
+    if not match:
+        raise ValueError("select_specific_hh_resume")
+    return match.group(1).lower()
 
-    Без direct_url открывает список резюме и берёт первое. Возвращает текст
-    (обрезанный), который пойдёт в ИИ как бэкграунд для письма.
-    """
-    if direct_url:
-        page.goto(direct_url, wait_until="domcontentloaded")
-    else:
-        page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded")
-        _pause()
-        link = page.locator('a[href*="/resume/"]').first
-        href = link.get_attribute("href") if link.count() else None
-        if href:
-            full = href if href.startswith("http") else "https://hh.ru" + href
-            page.goto(full, wait_until="domcontentloaded")
+
+def load_resume_text(page, direct_url: str = "", *, on_stage=None) -> str:
+    """Только явно выбранное резюме, подтверждённое URL и заголовком страницы."""
+    rid = resume_id_from_url(direct_url)
+    if on_stage:
+        on_stage("resume_open")
+    page.goto(f"https://hh.ru/resume/{rid}", wait_until="domcontentloaded")
     _pause()
+    if resume_id_from_url(page.url) != rid:
+        raise ValueError("resume_identity_mismatch")
+    if on_stage:
+        on_stage("resume_extract")
+    title = page.locator('[data-qa="resume-block-title-position"], [data-qa="resume-title"]').first
+    if not title.count():
+        raise ValueError("resume_identity_not_verified")
+    # Контактные блоки исключаем на клоне DOM до получения текста.
     main = page.locator('[data-qa="resume"], main').first
-    text = main.inner_text() if main.count() else page.locator("body").inner_text()
-    return (text or "").strip()[:5000]
+    if not main.count():
+        raise ValueError("resume_content_not_found")
+    text = main.evaluate("""el => {
+        const copy = el.cloneNode(true);
+        copy.querySelectorAll('[data-qa*="contact"], [data-qa*="phone"], [data-qa*="email"], [data-qa*="address"], a[href^="mailto:"], a[href^="tel:"], script, style')
+            .forEach(node => node.remove());
+        copy.querySelectorAll('div, p, section, li, br, h1, h2, h3').forEach(node => node.append('\\n'));
+        return copy.textContent || '';
+    }""")
+    from privacy import sanitize_candidate_text
+    text = sanitize_candidate_text(text, (config.LLM_API_KEY, config.ACCESS_TOKEN)).strip()
+    if not text:
+        raise ValueError("resume_content_empty")
+    return text
 
 
-def apply(page, vac: dict, letter: str, *, dry_run: bool, resume_url: str = "") -> str:
-    """Отклик через сайт. В dry_run НЕ жмёт финальную кнопку.
-
-    resume_url — какое резюме прикрепить (если у тебя их несколько).
-    Возвращает статус: 'would_apply' | 'applied' | 'no_button' | 'error:...'.
-    """
-    page.goto(vac["url"], wait_until="domcontentloaded")
-    _pause()
-
-    # Закрыть cookie-баннер — иначе он перехватывает клик по «Откликнуться».
-    ck = page.locator(SEL["cookie_accept"]).first
-    if ck.count():
-        try:
-            ck.click()
-            time.sleep(1)
-        except Exception:  # noqa: BLE001
-            pass
-
-    btn = page.locator(SEL["respond_btn"]).first
-    if not btn.count():
-        return "no_button"  # уже откликались / вакансия закрыта / сменился селектор
-
-    if dry_run:
-        # Ничего не кликаем — только фиксируем, что кнопка есть и мы бы нажали.
-        return "would_apply"
-
-    # 1) Клик «Откликнуться» → открывается попап (отправки ещё НЕТ).
-    btn.click()
-    _pause()
-
-    # 2) Попап не открылся и submit-кнопки нет → это «быстрый отклик»,
-    #    он ушёл мгновенно без письма. Помечаем, не молчим.
-    submit = page.locator(SEL["submit_btn"]).first
-    if not submit.count():
-        return "applied_no_letter"
-
-    # 3) Выбор резюме в попапе (если несколько) — по id из URL.
-    if resume_url:
-        rid = resume_url.rstrip("/").split("/")[-1]
-        try:
-            opt = page.locator(f'[href*="{rid}"], input[value*="{rid}"], [data-qa*="{rid}"]').first
-            if opt.count():
-                opt.click()
-                time.sleep(1)
-        except Exception:  # noqa: BLE001 — выбор резюме best-effort
-            pass
-
-    # 4) Раскрыть поле письма («Добавить сопроводительное») и заполнить.
-    if letter:
-        acl = page.locator(SEL["add_cover"]).first
-        if acl.count():
-            try:
-                acl.click()
-                time.sleep(1)
-            except Exception:  # noqa: BLE001
-                pass
-        area = page.locator(SEL["letter_area"]).first
-        if area.count():
-            area.fill(letter)
-            time.sleep(1)
-
-    # 5) Отправка (только теперь отклик реально уходит — уже с письмом).
-    submit = page.locator(SEL["submit_btn"]).first
-    if not submit.count():
-        return "error:no_submit"
-    submit.click()
-    _pause()
-    return "applied"
+def apply(page, vac: dict, letter: str, *, dry_run: bool, resume_url: str = "", **kwargs):
+    """SAFE barrier remains before all page actions; guarded LIVE uses explicit resume."""
+    if config.DRY_RUN or dry_run:
+        return "safe_not_sent"
+    if not kwargs.get("before_submit"):
+        return "needs_manual_review"
+    from application import apply as apply_form
+    return apply_form(page, vac, letter, resume_id=resume_id_from_url(resume_url),
+                      dry_run=dry_run, **kwargs)

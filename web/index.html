@@ -70,7 +70,7 @@
 
   <div id="runBanner">
     <span class="pulse"></span>
-    <span>Идёт прогон — отклики отправляются реально</span>
+    <span id="runBannerMode">Идёт SAFE-прогон — отклики не отправляются</span>
     <span id="runBannerCount" class="muted"></span>
     <button class="danger" style="margin-left:auto" onclick="stop()">Стоп</button>
   </div>
@@ -79,7 +79,7 @@
   <div class="row sp" style="margin-bottom:20px">
     <h1>Автоотклик hh.ru</h1>
     <div class="row">
-      <span id="modeBadge" class="badge b-live">БОЙ</span>
+      <span id="modeBadge" class="badge b-shadow">SAFE</span>
       <span id="sessBadge" class="badge b-off">сессия?</span>
     </div>
   </div>
@@ -106,7 +106,7 @@
   </div>
 
   <div class="card">
-    <h2>Итоги (весь лог)</h2>
+    <h2 id="resultsHeading">Итоги последнего прогона</h2>
     <div class="stats" id="stats"></div>
   </div>
 
@@ -118,15 +118,13 @@
       <div><label>Регион / город (AREA)</label><select id="AREA"><option>загрузка…</option></select></div>
       <div><label>Зарплата от, ₽ (SALARY_MIN)</label><input id="SALARY_MIN" type="number"></div>
       <div><label>Порог отклика 0–100 (SCORE_THRESHOLD)</label><input id="SCORE_THRESHOLD" type="number"></div>
-      <div><label>Лимит откликов за прогон (DAILY_LIMIT)</label><input id="DAILY_LIMIT" type="number"></div>
+      <div><label>Подтверждённых откликов за LIVE-прогон</label><input id="TARGET_APPLICATIONS_PER_RUN" type="number"></div>
       <div><label>Страниц за прогон (PAGES_PER_RUN)</label><input id="PAGES_PER_RUN" type="number"></div>
       <div><label>Пауза, сек (PAUSE_SECONDS)</label><input id="PAUSE_SECONDS" type="number"></div>
       <div style="grid-column:1/3"><label>Режим</label>
-        <div class="badge b-live" style="display:inline-block;padding:8px 14px">БОЙ — отклики отправляются реально</div></div>
+        <select id="RUN_MODE"><option value="SAFE">SAFE — без отправки откликов</option><option value="LIVE">LIVE — реальные отклики</option></select><div class="muted">LIVE требует подтверждения при каждом запуске.</div></div>
       <div><label>Формат работы (WORK_FORMAT)</label>
         <select id="WORK_FORMAT">
-          <option value="any">Любой формат</option>
-          <option value="remote_ok">Можно удалённо (удалёнка + гибрид)</option>
           <option value="remote_only">Только полная удалёнка</option>
         </select></div>
       <div><label>Опыт работы (EXPERIENCE)</label>
@@ -176,7 +174,7 @@
     <h2 style="margin-top:20px">Резюме для отклика</h2>
     <div class="grid2">
       <div style="grid-column:1/3"><label>Какое резюме использовать (для письма и отклика)</label>
-        <select id="RESUME_URL"><option value="">первое из списка</option></select></div>
+        <select id="RESUME_URL"><option value="">выберите конкретное резюме</option></select></div>
     </div>
     <div class="row" style="margin-top:10px">
       <button onclick="refreshResumes()">Обновить список резюме</button>
@@ -218,6 +216,15 @@
 
 <script>
 const TAGS = {
+  applied_confirmed:['t-applied','Отклик подтверждён'],
+  apply_failed:['t-reject','Отклик не отправлен'],
+  submission_unknown:['t-nobtn','Результат неизвестен'],
+  already_applied:['t-below','Уже откликались'],
+  safe_ready:['t-would','SAFE · письмо готово'],
+  rejected_score:['t-below','Ниже порога'],
+  rejected_hard_filter:['t-reject','Фильтр'],
+  rejected_remote:['t-reject','Не remote'],
+  needs_manual_review:['t-nobtn','Проверить вручную'],
   would_apply:['t-would','откликнулся бы'], applied:['t-applied','отклик + письмо'],
   applied_no_letter:['t-nobtn','отклик БЕЗ письма'],
   below_threshold:['t-below','мимо'], reject:['t-reject','отбой'], no_button:['t-nobtn','нет кнопки'],
@@ -225,7 +232,7 @@ const TAGS = {
 let cfgTouched = false;
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>cfgTouched=true));
 
-function esc(s){ return String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function showToast(text, kind){
   const box = document.getElementById('toasts');
@@ -252,7 +259,7 @@ function populateResumes(list){
   const sig = JSON.stringify(list.map(r=>r.url));
   if(sel.dataset.sig === sig) return;          // список не менялся — не трогаем
   const cur = sel.value;
-  sel.innerHTML = '<option value="">первое из списка</option>' +
+  sel.innerHTML = '<option value="">выберите конкретное резюме</option>' +
     list.map(r=>`<option value="${esc(r.url)}">${esc(r.title)}</option>`).join('');
   sel.value = cur;                             // сохранить выбор
   sel.dataset.sig = sig;
@@ -267,7 +274,7 @@ async function loadAreas(){
   const sel = document.getElementById('AREA');
   try{
     const d = await (await fetch('/api/areas')).json();
-    let html = '<option value="113">🌍 Все регионы (вся Россия)</option>';
+    let html = '<option value="">🌍 Весь мир</option><option value="113">Вся Россия</option>';
     for(const r of d.regions){
       html += `<optgroup label="${r.name}">`;
       html += `<option value="${r.id}">${r.name} — весь регион</option>`;
@@ -276,26 +283,28 @@ async function loadAreas(){
     }
     sel.innerHTML = html;
     sel.dataset.loaded = '1';
-  }catch(e){ sel.innerHTML = '<option value="2">Санкт-Петербург</option>'; }
+  }catch(e){ sel.innerHTML = '<option value="">🌍 Весь мир</option>'; }
 }
 
 async function refresh(){
   const s = await (await fetch('/api/state')).json();
-  document.getElementById('modeBadge').textContent = 'БОЙ';
-  document.getElementById('modeBadge').className = 'badge b-live';
+  document.getElementById('modeBadge').textContent = s.mode === 'LIVE' ? 'LIVE — реальные отклики' : 'SAFE';
+  document.getElementById('modeBadge').className = s.mode === 'LIVE' ? 'badge b-live' : 'badge b-shadow';
+  document.getElementById('runBannerMode').textContent = s.mode === 'LIVE' ? 'LIVE: реальные отклики разрешены' : 'SAFE: отклики не отправляются';
   const sb = document.getElementById('sessBadge');
   sb.textContent = s.has_session ? 'сессия есть' : 'нет сессии';
   sb.className = 'badge ' + (s.has_session?'b-ok':'b-off');
 
   document.getElementById('runBtn').disabled = s.running || !s.has_session;
   document.getElementById('stopBtn').disabled = !s.running;
-  document.getElementById('runState').textContent = s.running ? 'идёт прогон…' : 'готов';
+  document.getElementById('resultsHeading').textContent = s.running ? 'Итоги текущего прогона' : 'Итоги последнего прогона';
+  document.getElementById('runState').textContent = s.running ? `${s.mode}: идёт прогон…` : (s.last_run ? `Последний прогон: ${s.last_run.status}: ${s.last_run.stop_reason}` : 'готов');
 
   const rb = document.getElementById('runBanner');
   rb.style.display = s.running ? 'flex' : 'none';
   if(s.running){
-    const done = (s.counts.applied||0) + (s.counts.applied_no_letter||0);
-    document.getElementById('runBannerCount').textContent = `· отправлено ${done}`;
+    const done = s.counts.safe_ready||0;
+    document.getElementById('runBannerCount').textContent = `· SAFE готово ${done} · подтверждено ${s.counts.applied_confirmed||0}`;
   }
 
   document.getElementById('loginStartBtn').disabled = s.login_running;
@@ -308,8 +317,8 @@ async function refresh(){
 
   const c = s.counts;
   document.getElementById('stats').innerHTML = [
-    ['would_apply','Откликнулся бы'],['applied','Отклики'],
-    ['below_threshold','Мимо'],['reject','Отбой'],['no_button','Нет кнопки'],
+    ['scanned','Просмотрено'],['applied_confirmed','Подтверждено'],['apply_failed','Не отправлено'],['submission_unknown','Неизвестно'],['safe_ready','SAFE готово'],['rejected_score','Ниже порога'],
+    ['rejected_hard_filter','Фильтр'],['rejected_remote','Не remote'],['needs_manual_review','Проверить'],
   ].map(([k,l])=>`<div class="stat"><div class="n">${c[k]||0}</div><div class="l">${l}</div></div>`).join('');
 
   populateResumes(s.resumes || []);
@@ -326,23 +335,23 @@ async function refresh(){
   keyEl.placeholder = s.llm_key_set ? 'ключ сохранён — оставь пустым, чтобы не менять' : 'вставь свой ключ';
 
   const feed = document.getElementById('feed');
-  const sig = JSON.stringify(s.decisions.map(r=>[r.vid,r.decision]));
+  const sig = JSON.stringify(s.decisions.map(r=>[r.run_id,r.vid,r.decision,r.ts]));
   if(feed.dataset.sig !== sig){                          // перерисовываем только если лента изменилась
     const open = new Set([...feed.querySelectorAll('details[open]')].map(d=>d.dataset.vid));
     feed.innerHTML = s.decisions.map(r=>{
-      const [cls,label] = TAGS[r.decision]||['t-below',r.decision];
+      const [cls,label] = TAGS[r.decision]||['t-below','Ранее: '+String(r.decision)];
       const extra = r.reason ? ` · ${r.reason}` : (r.why? ` · ${r.why}`:'');
-      const sc = (r.score!=null)?`<span class="sc">${r.score}</span>`:'';
+      const sc = (r.score!=null)?`<span class="sc">${esc(r.score)}</span>`:'';
       const isOpen = open.has(String(r.vid)) ? ' open' : '';
       const letter = r.letter ? `<details data-vid="${esc(r.vid)}"${isOpen} style="margin-top:6px"><summary class="muted" style="cursor:pointer">письмо</summary><div class="muted" style="white-space:pre-wrap;margin-top:6px">${esc(r.letter)}</div></details>` : '';
-      return `<div class="item"><span class="tag ${cls}">${label}</span>
-        <div style="flex:1"><div>${esc(r.title||'')}</div><div class="muted">${esc(r.employer||'')}${esc(extra)}</div>${letter}</div>${sc}</div>`;
+      return `<div class="item"><span class="tag ${cls}">${esc(label)}</span>
+        <div style="flex:1"><div>${esc(r.title||'')}</div>
+          ${/^https:\/\/hh\.ru\/vacancy\/\d+$/.test(r.url||'') ? `<a href="${r.url}" target="_blank" rel="noopener noreferrer">Открыть вакансию HH</a>` : ''}<div class="muted">${esc(r.company||r.employer||'')}${esc(extra)}</div>${letter}</div>${sc}</div>`;
     }).join('') || '<div class="muted">Пусто. Запусти прогон.</div>';
     feed.dataset.sig = sig;
   }
 
-  const lg = await (await fetch('/api/runlog')).json();
-  document.getElementById('runlog').textContent = lg.log || '—';
+  document.getElementById('runlog').textContent = s.run_log || '—';
 }
 
 async function postForm(silent){
@@ -354,9 +363,11 @@ async function postForm(silent){
   return d;
 }
 async function run(){
-  if(!confirm('БОЕВОЙ режим: бот отправит РЕАЛЬНЫЕ отклики от твоего имени. Запустить?')) return;
-  await postForm(true);            // молча сохраняем то, что в полях
-  const d = await postAction('/api/run', 'Прогон запущен');
+  if(!document.getElementById('RESUME_URL').value){ showToast('Выберите конкретное резюме','err'); return; }
+  const mode = document.getElementById('RUN_MODE').value;
+  if(!confirm(mode === 'LIVE' ? 'LIVE: разрешить реальные отклики выбранным резюме и ответы работодателям в этом прогоне?' : 'SAFE: анализ и письмо без откликов на HH. Запустить?')) return;
+  if(!await postForm(true)) return;            // молча сохраняем то, что в полях
+  const d = await postAction('/api/run', 'Прогон запущен', {mode, confirm_live: mode === 'LIVE'});
   if(d) showToast('Настройки применены к этому прогону', 'ok');
   refresh();
 }

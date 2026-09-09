@@ -49,16 +49,7 @@ class HHClient:
 
         Возвращает HTTP-код (201 = успех). Ошибки не глушим — пусть всплывают.
         """
-        r = self.s.post(
-            f"{BASE}/negotiations",
-            params={
-                "vacancy_id": vacancy_id,
-                "resume_id": resume_id,
-                "message": message,
-            },
-            timeout=30,
-        )
-        # 201 Created — отклик отправлен; 4xx — уже откликался / нет доступа / лимит
-        if r.status_code not in (200, 201):
-            raise RuntimeError(f"negotiate failed {r.status_code}: {r.text[:300]}")
-        return r.status_code
+        if config.DRY_RUN:
+            raise RuntimeError("safe_mode_submission_disabled")
+        # API-flow ещё не поддерживает проверенное matching/резюме нового MVP.
+        raise RuntimeError("api_live_not_supported_in_safe_mvp")

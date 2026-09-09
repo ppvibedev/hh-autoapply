@@ -36,6 +36,9 @@ def _log(entry: dict) -> None:
 
 
 def main() -> int:
+    print("API-прогон нового MVP не поддерживается. Используйте SAFE в веб-интерфейсе.")
+    return 1
+
     if not config.ACCESS_TOKEN:
         print("Нет HH_ACCESS_TOKEN — заполни .env (см. .env.example).", file=sys.stderr)
         return 1

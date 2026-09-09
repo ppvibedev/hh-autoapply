@@ -3,6 +3,8 @@
 !.env.example
 .envrc
 state/
+private/
+work/
 secrets/
 credentials/
 *credentials*.json

@@ -32,19 +32,7 @@ def main() -> int:
                 return { title: (e.innerText||'').trim(), href: a ? a.getAttribute('href') : '' };
             })""",
         )
-        # Фолбэк: если href не нашёлся у заголовков — собрать хэши из всех ссылок по порядку.
-        hashes = page.eval_on_selector_all(
-            'a[href*="/resume/"]',
-            """els => els.map(e => e.getAttribute('href'))
-                         .filter(h => /\\/resume\\/[0-9a-f]+/.test(h))""",
-        )
         import re
-        clean_hashes = []
-        for h in hashes:
-            m = re.search(r"/resume/([0-9a-f]+)", h)
-            if m and m.group(1) not in clean_hashes:
-                clean_hashes.append(m.group(1))
-
         seen = set()
         for i, item in enumerate(raw):
             title = item.get("title", "").strip()
@@ -53,19 +41,15 @@ def main() -> int:
             if href:
                 m = re.search(r"/resume/([0-9a-f]+)", href)
                 rid = m.group(1) if m else ""
-            if not rid and i < len(clean_hashes):
-                rid = clean_hashes[i]
             if not rid or not title or rid in seen:
                 continue
             seen.add(rid)
-            out.append({"url": f"https://hh.ru/resume/{rid}", "title": title})
+            out.append({"resume_id": rid, "url": f"https://hh.ru/resume/{rid}", "title": title})
 
     os.makedirs("state", exist_ok=True)
     with open(config.RESUMES_FILE, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False)
     print(f"Резюме найдено: {len(out)}")
-    for r in out:
-        print(" -", r["title"])
     return 0
 
 

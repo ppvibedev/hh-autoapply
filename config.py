@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 # override=True — .env всегда главнее унаследованного окружения.
 # Иначе стейл-переменная (напр. DRY_RUN из родителя) молча ломает режим.
+LIVE_CONFIRMED_FOR_RUN = os.environ.pop("HH_LIVE_CONFIRMED_FOR_RUN", "") == "1"
 load_dotenv(override=True)
 
 
@@ -23,12 +24,13 @@ def _list(name: str) -> list[str]:
 ACCESS_TOKEN = os.getenv("HH_ACCESS_TOKEN", "").strip()
 RESUME_ID = os.getenv("HH_RESUME_ID", "").strip()
 
-# Режим: ВСЕГДА боевой. Shadow убран намеренно и жёстко —
-# никакое значение в .env/окружении не может включить shadow. Не менять.
-DRY_RUN = False
+# Старый DRY_RUN=0 не включает LIVE. Неизвестный режим также безопасен.
+RUN_MODE = os.getenv("RUN_MODE", "SAFE").strip().upper()
+DRY_RUN = RUN_MODE != "LIVE" or not LIVE_CONFIRMED_FOR_RUN
 
 # Предохранители
 DAILY_LIMIT = _int("DAILY_LIMIT", 30)
+TARGET_APPLICATIONS_PER_RUN = _int("TARGET_APPLICATIONS_PER_RUN", DAILY_LIMIT)
 SCORE_THRESHOLD = _int("SCORE_THRESHOLD", 90)
 
 # Фильтры поиска
@@ -40,7 +42,7 @@ if len(SEARCH_PHRASES) > 1:
     SEARCH_QUERY = " OR ".join(f'"{p}"' for p in SEARCH_PHRASES)
 else:
     SEARCH_QUERY = SEARCH_TEXT
-AREA = os.getenv("AREA", "2").strip()
+AREA = os.getenv("AREA", "").strip()
 SALARY_MIN = _int("SALARY_MIN", 0)
 STOPWORDS = _list("STOPWORDS")
 BLACKLIST_EMPLOYERS = _list("BLACKLIST_EMPLOYERS")
@@ -49,10 +51,7 @@ BLACKLIST_EMPLOYERS = _list("BLACKLIST_EMPLOYERS")
 WORK_FORMAT = os.getenv("WORK_FORMAT", "any").strip()
 
 # Коды hh.ru для параметра work_format по выбранному режиму.
-WORK_FORMAT_CODES = {
-    "remote_ok": ["REMOTE", "HYBRID"],   # можно удалённо (удалёнка + гибрид)
-    "remote_only": ["REMOTE"],           # только полная удалёнка
-}.get(WORK_FORMAT, [])                    # any → пусто, без фильтра
+WORK_FORMAT_CODES = ["REMOTE"]  # Текущее требование: полноценная удалёнка.
 
 # Родные фильтры поиска hh.ru (пусто = не фильтровать). Значения — коды hh.
 EXPERIENCE = os.getenv("EXPERIENCE", "").strip()        # noExperience|between1And3|between3And6|moreThan6
@@ -81,6 +80,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "").strip()  # пусто → дефолт п
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "").strip()  # нужен для YandexGPT
 RESUME_URL = os.getenv("RESUME_URL", "").strip()  # выбранное резюме; пусто = первое
 RESUME_FILE = "state/resume.txt"       # кэш текста выбранного резюме
+RESUME_CACHE_DIR = "state/resumes"
 RESUMES_FILE = "state/resumes.json"    # список твоих резюме с hh.ru (для выбора)
 
 # Браузерная автоматизация (Playwright)

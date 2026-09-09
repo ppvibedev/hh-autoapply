@@ -18,6 +18,8 @@ from flask import Flask, jsonify, request, send_from_directory
 
 import config
 import envfile
+from hh_web import resume_id_from_url
+from privacy import sanitize_record, sanitize_candidate_text
 
 app = Flask(__name__, static_folder="web")
 
@@ -32,7 +34,7 @@ _areas_cache: list | None = None
 
 # Ключи .env, которые разрешено править из интерфейса.
 EDITABLE = [
-    "DRY_RUN", "SCORE_THRESHOLD", "DAILY_LIMIT",
+    "RUN_MODE", "SCORE_THRESHOLD", "TARGET_APPLICATIONS_PER_RUN",
     "SEARCH_TEXT", "AREA", "SALARY_MIN", "WORK_FORMAT",
     "EXPERIENCE", "EMPLOYMENT", "SCHEDULE", "SEARCH_PERIOD", "ORDER_BY",
     "STOPWORDS", "BLACKLIST_EMPLOYERS",
@@ -53,16 +55,47 @@ def _read_decisions(limit: int = 100) -> list[dict]:
             line = line.strip()
             if line:
                 try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
+                    item = sanitize_record(json.loads(line))
+                    if isinstance(item, dict):
+                        rows.append(item)
+                except (ValueError, TypeError):
                     pass
     return rows[-limit:][::-1]  # новые сверху
 
 
+_pending_after_run = None
+_display_run_id = None
+_active_mode = "SAFE"
+
+
+def _current_run_rows():
+    """Only a run started in this server session; never restore history on startup."""
+    global _display_run_id
+    if _pending_after_run is None:
+        return None, []
+    rows = _read_decisions(limit=100000)
+    if _display_run_id is None:
+        run_id = next((r.get("run_id") for r in rows if r.get("run_id")), None)
+        if not run_id or run_id == _pending_after_run:
+            return None, []
+        _display_run_id = run_id
+    return _display_run_id, [r for r in rows if r.get("run_id") == _display_run_id]
+
+
+
+def _run_log(rows):
+    # Structured events already carry run_id; raw stdout mixes all past runs.
+    return "\n".join(json.dumps(r, ensure_ascii=False) for r in reversed(rows)
+                     if r.get("event"))
+
+
 def _counts(rows: list[dict]) -> dict[str, int]:
-    c = {"would_apply": 0, "applied": 0, "below_threshold": 0,
-         "reject": 0, "no_button": 0}
+    c = {"safe_ready": 0, "rejected_score": 0, "rejected_hard_filter": 0,
+         "rejected_remote": 0, "needs_manual_review": 0, "applied_confirmed": 0,
+         "apply_failed": 0, "submission_unknown": 0, "already_applied": 0, "scanned": 0}
     for r in rows:
+        if not r.get("event") and r.get("vacancy_id"):
+            c["scanned"] += 1
         d = r.get("decision", "")
         if d in c:
             c[d] += 1
@@ -104,20 +137,9 @@ def _any_run_alive() -> bool:
 
 
 def _kill_all_runs() -> None:
-    """Убить активный прогон по PID + подчистить осиротевшие (точный паттерн)."""
-    pid = _run_pid()
-    if pid:
-        try:
-            os.kill(pid, 9)
-        except OSError:
-            pass
-    try:
-        if os.path.exists(config.RUN_PID_FILE):
-            os.remove(config.RUN_PID_FILE)
-    except OSError:
-        pass
-    # бэкап на случай осиротевших: точный паттерн «python … run_web.py»
-    subprocess.run(["pkill", "-9", "-f", r"[p]ython.*run_web\.py"])
+    """Остановить только свой процесс: он завершит текущую операцию и сохранит итог."""
+    if _running():
+        _proc.terminate()
 
 
 def _login_running() -> bool:
@@ -132,16 +154,24 @@ def _read_resumes() -> list:
     if os.path.exists(config.RESUMES_FILE):
         try:
             with open(config.RESUMES_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
+                rows = json.load(f)
+            return [{"url": "https://hh.ru/resume/" + resume_id_from_url(r["url"]),
+                     "title": sanitize_candidate_text(r["title"])} for r in rows]
+
+        except (ValueError, TypeError, KeyError, OSError):
             return []
     return []
 
 
-def _spawn(script: str) -> subprocess.Popen:
+def _spawn(script: str, *, live_confirmed=False) -> subprocess.Popen:
     os.makedirs("state", exist_ok=True)
-    logf = open(f"state/{script}.log", "w", encoding="utf-8")
-    env = dict(os.environ, PYTHONUNBUFFERED="1")  # чтобы лог прогона писался сразу
+    log_path = "state/safe_run.log" if script == "run_web.py" else f"state/{script}.log"
+    logf = open(log_path, "a", encoding="utf-8")
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    env.pop("HH_LIVE_CONFIRMED_FOR_RUN", None)
+    if live_confirmed:
+        env["HH_LIVE_CONFIRMED_FOR_RUN"] = "1"
+    #  # чтобы лог прогона писался сразу
     return subprocess.Popen(
         [sys.executable, script],
         stdout=logf, stderr=subprocess.STDOUT,
@@ -158,48 +188,93 @@ def index():
 @app.get("/api/state")
 def api_state():
     env = envfile.read_env()
-    rows = _read_decisions()
-    all_rows = _read_decisions(limit=100000)
+    run_id, rows = _current_run_rows()
     return jsonify({
-        "running": _any_run_alive(),  # учитывает и осиротевшие процессы
+        "running": _running() or _any_run_alive(),  # учитывает и осиротевшие процессы
         "login_running": _login_running(),
-        "dry_run": config.DRY_RUN,  # всегда False — программа только боевая, shadow убран
+        "dry_run": _active_mode != "LIVE",
+        "mode": _active_mode,
         "has_session": os.path.exists(config.SESSION_FILE),
-        "config": {k: env.get(k, "") for k in EDITABLE},
+        "config": {**{k: env.get(k, "") for k in EDITABLE}, "RUN_MODE": env.get("RUN_MODE", "SAFE"),
+                   "WORK_FORMAT": "remote_only",
+                   "TARGET_APPLICATIONS_PER_RUN": env.get("TARGET_APPLICATIONS_PER_RUN", env.get("DAILY_LIMIT", "30"))},
         "llm_key_set": bool(env.get("LLM_API_KEY", "").strip()),
         "resumes": _read_resumes(),
         "resumes_refreshing": _resumes_running(),
-        "counts": _counts(all_rows),
-        "decisions": rows,
+        "run_id": run_id,
+        "run_log": _run_log(rows),
+        "counts": _counts(rows),
+        "decisions": [r for r in rows if not r.get("event")][:100],
+        "last_run": next((r for r in rows if r.get("event") == "run_finished"), None),
     })
 
 
 @app.post("/api/config")
 def api_config():
     payload = request.get_json(force=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "Некорректные настройки"}), 400
     updates = {k: str(v) for k, v in payload.items() if k in EDITABLE}
+    if updates.get("RUN_MODE", "SAFE") not in ("SAFE", "LIVE"):
+        return jsonify({"ok": False, "error": "Неизвестный режим"}), 400
+    for k, v in updates.items():
+        if "\n" in v or "\r" in v:
+            return jsonify({"ok": False, "error": "Переводы строк в настройках недопустимы"}), 400
+    for k, bounds in {"SCORE_THRESHOLD": (0, 100), "TARGET_APPLICATIONS_PER_RUN": (1, 1000),
+                      "PAGES_PER_RUN": (1, 100), "PAUSE_SECONDS": (0, 300)}.items():
+        if k in updates:
+            try:
+                valid = bounds[0] <= int(updates[k]) <= bounds[1]
+            except ValueError:
+                valid = False
+            if not valid:
+                return jsonify({"ok": False, "error": f"Некорректное значение {k}"}), 400
+    updates.setdefault("RUN_MODE", "SAFE")
+    updates["WORK_FORMAT"] = "remote_only"
+    if updates.get("RESUME_URL"):
+        try:
+            rid = resume_id_from_url(updates["RESUME_URL"])
+            updates["RESUME_URL"] = f"https://hh.ru/resume/{rid}"
+        except ValueError:
+            return jsonify({"ok": False, "error": "Выберите конкретное резюме HH"}), 400
     # Секретные ключи обновляем, только если прислано непустое значение.
     for k in SECRET_KEYS:
         val = str(payload.get(k, "")).strip()
+        if "\n" in val or "\r" in val:
+            return jsonify({"ok": False, "error": "Некорректный формат ключа"}), 400
         if val:
             updates[k] = val
     if updates:
         envfile.update_env(updates)
-    # Сменили выбранное резюме → сбрасываем кэш его текста, чтобы письмо строилось по нему.
-    if "RESUME_URL" in updates and os.path.exists(config.RESUME_FILE):
-        os.remove(config.RESUME_FILE)
     return jsonify({"ok": True, "updated": [k for k in updates if k not in SECRET_KEYS]})
 
 
 @app.post("/api/run")
 def api_run():
-    global _proc
-    if _any_run_alive():  # ловим и осиротевшие процессы, не только свой
+    global _proc, _pending_after_run, _display_run_id, _active_mode
+    if _running() or _any_run_alive():
         return jsonify({"ok": False, "error": "Прогон уже идёт (или остался фоновый) — нажми Стоп"}), 409
     if not os.path.exists(config.SESSION_FILE):
         return jsonify({"ok": False, "error": "Нет сессии — сначала войди в hh.ru"}), 400
-    _kill_all_runs()  # подчистить любые зависшие перед стартом — гарантия одного прогона
-    _proc = _spawn("run_web.py")
+    env = envfile.read_env()
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "Некорректный запрос"}), 400
+    mode = payload.get("mode", "SAFE")
+    if mode not in ("SAFE", "LIVE") or (mode == "LIVE" and payload.get("confirm_live") is not True):
+        return jsonify({"ok": False, "error": "LIVE требует явного подтверждения этого запуска"}), 400
+    if mode != env.get("RUN_MODE", "SAFE").strip().upper():
+        return jsonify({"ok": False, "error": "Сохраните выбранный режим перед запуском"}), 400
+    try:
+        resume_id_from_url(env.get("RESUME_URL", ""))
+    except ValueError:
+        return jsonify({"ok": False, "error": "Выберите конкретное резюме HH"}), 400
+    previous_id = next((r.get("run_id") for r in _read_decisions(limit=100000)
+                        if r.get("run_id")), None)
+    _proc = _spawn("run_web.py", live_confirmed=True) if mode == "LIVE" else _spawn("run_web.py")
+    _active_mode = mode
+    _pending_after_run = previous_id or ""
+    _display_run_id = None
     return jsonify({"ok": True})
 
 
@@ -249,6 +324,8 @@ def api_resumes_refresh():
 @app.post("/api/reset")
 def api_reset():
     """Очистить ленту решений и список просмотренных (для чистого повторного прогона)."""
+    if _running() or _any_run_alive():
+        return jsonify({"ok": False, "error": "Сначала остановите прогон"}), 409
     for path in (config.DECISIONS_LOG, config.SEEN_FILE, config.RESUME_FILE):
         if os.path.exists(path):
             os.remove(path)
@@ -257,8 +334,8 @@ def api_reset():
 
 @app.post("/api/stop")
 def api_stop():
-    """Kill-switch: убивает ВСЕ процессы прогона, включая осиротевшие."""
-    was_alive = _any_run_alive()
+    """Попросить свой процесс завершиться с сохранением истории."""
+    was_alive = _running()
     _kill_all_runs()
     return jsonify({"ok": True, "stopped": was_alive})
 
@@ -281,11 +358,8 @@ def api_areas():
 
 @app.get("/api/runlog")
 def api_runlog():
-    path = "state/run.log"
-    if not os.path.exists(path):
-        return jsonify({"log": ""})
-    with open(path, encoding="utf-8") as f:
-        return jsonify({"log": f.read()[-8000:]})
+    run_id, rows = _current_run_rows()
+    return jsonify({"run_id": run_id, "log": _run_log(rows)})
 
 
 if __name__ == "__main__":

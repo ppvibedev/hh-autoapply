@@ -2,13 +2,14 @@
 
 Ключ и провайдер — в .env (LLM_PROVIDER, LLM_API_KEY, LLM_MODEL). Без SDK,
 чтобы не тянуть зависимости. Если ключа нет или провайдер none — вернёт None,
-и вызывающий код откатится на шаблон.
+вызывающий код должен обработать отсутствие результата.
 """
 from __future__ import annotations
 
 import requests
 
 import config
+from privacy import sanitize_candidate_text
 
 DEFAULT_MODEL = {
     "anthropic": "claude-haiku-4-5-20251001",
@@ -19,6 +20,8 @@ DEFAULT_MODEL = {
 
 
 def generate(prompt: str, max_tokens: int = 600) -> str | None:
+    # Последний барьер для всех существующих путей обращения к модели.
+    prompt = sanitize_candidate_text(prompt, (config.LLM_API_KEY, config.ACCESS_TOKEN))
     prov = config.LLM_PROVIDER
     key = config.LLM_API_KEY
     if prov == "none" or not key:
