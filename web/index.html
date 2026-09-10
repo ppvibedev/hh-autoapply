@@ -340,7 +340,8 @@ async function refresh(){
     const open = new Set([...feed.querySelectorAll('details[open]')].map(d=>d.dataset.vid));
     feed.innerHTML = s.decisions.map(r=>{
       const [cls,label] = TAGS[r.decision]||['t-below','Ранее: '+String(r.decision)];
-      const extra = r.reason ? ` · ${r.reason}` : (r.why? ` · ${r.why}`:'');
+      const detail = r.reason_code || r.reason;
+      const extra = detail ? ` · ${detail}` : (r.why? ` · ${r.why}`:'');
       const sc = (r.score!=null)?`<span class="sc">${esc(r.score)}</span>`:'';
       const isOpen = open.has(String(r.vid)) ? ' open' : '';
       const letter = r.letter ? `<details data-vid="${esc(r.vid)}"${isOpen} style="margin-top:6px"><summary class="muted" style="cursor:pointer">письмо</summary><div class="muted" style="white-space:pre-wrap;margin-top:6px">${esc(r.letter)}</div></details>` : '';

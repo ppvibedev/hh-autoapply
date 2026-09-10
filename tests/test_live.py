@@ -47,7 +47,7 @@ class LiveTests(unittest.TestCase):
         for raw in (None, 'garbage', '{}', '{"answer":null}',json.dumps({'answer':'10','evidence':'invented'})):
             with patch('llm.generate',return_value=raw), self.assertRaises(ValueError):
                 application.answer_question(Q,VAC,FACT)
-        with patch('llm.generate',side_effect=RuntimeError('fake')), self.assertRaises(RuntimeError):
+        with patch('llm.generate',side_effect=RuntimeError('fake')), self.assertRaisesRegex(ValueError,'llm_error'):
             application.answer_question(Q,VAC,FACT)
 
     def test_unsupported_question_and_invalid_number_or_choice(self):
@@ -97,6 +97,7 @@ class LiveTests(unittest.TestCase):
         stack=ExitStack(); self.addCleanup(stack.close)
         stack.enter_context(patch.object(config,'DRY_RUN',False))
         stack.enter_context(patch('application._wait_response_form',return_value=(form,None)))
+        stack.enter_context(patch('application._transient_error',return_value=False))
         stack.enter_context(patch('application._resume_diagnostics',return_value={'verified':chosen}))
         stack.enter_context(patch('application.form_diagnostics',return_value={}))
         stack.enter_context(patch('application._choose_resume',return_value=chosen))
@@ -243,5 +244,6 @@ class LiveTests(unittest.TestCase):
         def fail_journal(): raise OSError('artificial disk failure')
         result=application.apply(page,VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=fail_journal)
         route.continue_.assert_not_called()
-        route.abort.assert_called()
+        submit.click.assert_not_called()
+        self.assertEqual(result['reason_code'],'submission_journal_failed')
         self.assertEqual(result['application_status'],'needs_manual_review')

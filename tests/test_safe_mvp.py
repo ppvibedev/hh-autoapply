@@ -28,6 +28,7 @@ class SafeTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.settings = patch.multiple(config, DRY_RUN=True, LLM_API_KEY='', ACCESS_TOKEN='',
+            RESUMES_FILE=str(self.root/'resume-list.json'),
             RESUME_URL='https://hh.ru/resume/aaaa', RESUME_CACHE_DIR=str(self.root/'resumes'),
             DECISIONS_LOG=str(self.root/'history.jsonl'), RUN_PID_FILE=str(self.root/'run.pid'),
             PAGES_PER_RUN=1, PAUSE_SECONDS=0, TARGET_APPLICATIONS_PER_RUN=1, SCORE_THRESHOLD=80)

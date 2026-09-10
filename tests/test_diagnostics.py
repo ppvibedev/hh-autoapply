@@ -49,3 +49,14 @@ class DiagnosticsTests(unittest.TestCase):
         text = json.dumps(rows)+str(output.call_args_list)
         for private in ('PRIVATE_RESUME_TEXT','artificial-secret','person@example.test','private_local'):
             self.assertNotIn(private,text)
+
+    def test_matching_error_is_visible_without_generic_unfinished_message(self):
+        from unittest.mock import MagicMock
+        browser=MagicMock();browser.__enter__.return_value=(None,MagicMock())
+        with patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='Synthetic'),patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC)]),patch('hh_web.load_full',side_effect=lambda page,vac:vac),patch('decide.hard_filters',return_value=None),patch('decide.score',side_effect=ValueError('matching_invalid_json')),patch('hh_web.apply') as apply:
+            run_web.main()
+            apply.assert_not_called()
+        rows=[json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()]
+        entry=next(r for r in rows if r.get('vacancy_id'))
+        self.assertEqual(entry['reason_code'],'matching_invalid_json')
+        self.assertIn('matching: matching_invalid_json',entry['reason'])

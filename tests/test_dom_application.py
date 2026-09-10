@@ -18,6 +18,8 @@ class DOMTests(unittest.TestCase):
         cls.pw.stop()
 
     def setUp(self):
+        catalog = patch('application._resume_catalog',return_value=[])
+        catalog.start(); self.addCleanup(catalog.stop)
         self.context = self.browser.new_context()
         self.context.route('**/*', lambda route: route.abort())
         self.page = self.context.new_page()
@@ -88,3 +90,295 @@ class DOMTests(unittest.TestCase):
         self.assertFalse(app._selected_resume(form,'aaaa'))
         self.assertFalse(app._choose_resume(form,'aaaa',{}))
 
+
+    def test_response_container_without_form_preserves_all_stages(self):
+        from playwright.sync_api import Route
+        for question in (False, True):
+            for toggle in ('add-cover-letter','vacancy-response-letter-toggle'):
+                with self.subTest(question=question,toggle=toggle):
+                    question_html = '<div><p>Какие проекты вы вели?</p><textarea required></textarea></div>' if question else ''
+                    html = '''<meta charset="utf-8"><a data-qa="vacancy-response-link-top" onclick="document.querySelector('section').hidden=false">Откликнуться</a>
+                    <section hidden>''' + question_html + '''<input type="hidden" name="resumeId" value="aaaa">
+                    <button type="button" data-qa="''' + toggle + '''" onclick="document.getElementById('letter').hidden=false">Добавить</button>
+                    <textarea id="letter" hidden data-qa="vacancy-response-popup-form-letter-input"></textarea>
+                    <button type="submit" data-qa="vacancy-response-submit-popup" onclick="const xhr=new XMLHttpRequest();xhr.open('POST','/applicant/vacancy_response',false);xhr.send('vacancyId=123456789&resumeId=aaaa');document.body.innerHTML='<p>Отклик отправлен</p>'">Откликнуться</button></section>'''
+                    submitted=[]
+                    def offline_continue(route, **kwargs):
+                        # Replace the transport itself: even the authorized POST never leaves this test.
+                        if route.request.method == 'GET':route.fulfill(status=200,content_type='text/html',body=html)
+                        else:submitted.append(True);route.fulfill(status=200,body='{}')
+                    with patch.object(Route,'continue_',offline_continue), patch.object(app.config,'DRY_RUN',False), patch('llm.generate',return_value=json.dumps({'answer':'Вёл проекты Alpha.', 'evidence':'Вёл проекты Alpha.'})) as model:
+                        result=app.apply(self.page,test_safe_mvp.VAC,'Письмо',resume_id='aaaa',dry_run=False,resume_text='Вёл проекты Alpha.',before_submit=lambda:None)
+                    self.assertEqual(result['application_status'],'applied_confirmed',result)
+                    self.assertEqual(len(submitted),1)
+                    self.assertEqual(model.call_count,int(question))
+                    if question:self.assertEqual(result['questions'][0]['fill_result'],'verified')
+
+    def test_relocation_without_dialog_routes_immediately(self):
+        self.page.set_content('''<div id="warning"><button data-qa="relocation-warning-confirm"
+          onclick="document.getElementById('warning').remove();document.querySelector('section').hidden=false">Всё равно откликнуться</button>
+          <button data-qa="relocation-warning-abort">Отмена</button></div>
+          <section hidden><button data-qa="add-cover-letter">Добавить</button>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></section>''')
+        warnings=[]
+        with patch.object(self.page,'wait_for_timeout',side_effect=AssertionError('recognized UI must not poll')):
+            scope,reason=app._wait_response_form(self.page,warnings,lambda:False,lambda:False)
+        self.assertIsNone(reason)
+        self.assertEqual(scope.evaluate('(el)=>el.tagName'),'SECTION')
+        self.assertEqual(warnings,[{'kind':'country_warning','action':'confirmed'}])
+
+    def test_unknown_dialog_still_stops(self):
+        self.page.set_content('<div role="dialog">Неизвестное предупреждение<button>Продолжить</button></div>')
+        scope,reason=app._wait_response_form(self.page,[],lambda:False,lambda:False)
+        self.assertIsNone(scope)
+        self.assertEqual(reason,'unsupported_form')
+
+    def test_radio_group_heading_and_placeholder_are_not_questions(self):
+        self.page.set_content('''<form>
+          <div><div>Есть ли у вас опыт с CMS?</div><div>
+            <label><input type="radio" name="cms" value="yes">Да</label>
+            <label><input type="radio" name="cms" value="no">Нет</label></div></div>
+          <div><div>Какие интеграции вы выполняли?</div>
+            <label>Писать тут<textarea placeholder="Писать тут" aria-label="Писать тут"></textarea></label></div>
+          </form>''')
+        fields=self.page.locator('form').evaluate(app.INSPECT_FORM)
+        self.assertEqual([f['question'] for f in fields],['Есть ли у вас опыт с CMS?','Какие интеграции вы выполняли?'])
+        self.assertEqual(fields[0]['options'],[{'value':'yes','label':'Да'},{'value':'no','label':'Нет'}])
+        with patch('llm.generate',return_value=json.dumps({'answer':'yes','evidence':'Работал с CMS.'})) as model:
+            answer=app.answer_question(fields[0],test_safe_mvp.VAC,'Работал с CMS.')
+        self.assertIn('Есть ли у вас опыт с CMS?',model.call_args.args[0])
+        app._fill_question(self.page.locator('form'),fields[0],answer)
+        self.assertEqual(answer['fill_result'],'verified')
+
+    def test_placeholder_alone_is_not_a_question(self):
+        self.page.set_content('<form><label>Ваш ответ<textarea placeholder="Писать тут"></textarea></label></form>')
+        question=self.page.locator('form').evaluate(app.INSPECT_FORM)[0]
+        self.assertEqual(question['question'],'')
+        with patch('llm.generate') as model, self.assertRaisesRegex(ValueError,'question_label_unknown'):
+            app.answer_question(question,test_safe_mvp.VAC,'Опыт')
+        model.assert_not_called()
+
+    def test_dropdown_without_heading(self):
+        self.page.set_content('''<div role="dialog"><div role="button" aria-controls="resumes"
+          onclick="document.getElementById('resumes').hidden=false"><a href="https://hh.ru/resume/bbbb">Другое</a></div>
+          <div role="listbox" id="resumes" hidden><div role="option"
+          onclick="document.querySelector('[role=button] a').href='https://hh.ru/resume/aaaa';this.parentElement.hidden=true">
+          <a href="https://hh.ru/resume/aaaa">Выбранное</a></div></div>
+          <button data-qa="add-cover-letter">Добавить</button><button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div>''')
+        form=self.page.locator('[role=dialog]');diag={}
+        self.assertTrue(app._choose_resume(form,'aaaa',diag))
+        self.assertEqual(diag['after']['selected_ids'],['aaaa'])
+        self.assertFalse(app._selected_resume(form,'cccc'))
+
+    def test_application_controls_take_priority_over_warning_like_text(self):
+        self.page.set_content('''<form><input name="search"></form><form></form>
+          <div role="dialog">Уровень языка ниже, возможен отказ.
+          <input type="hidden" name="resumeId" value="aaaa">
+          <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div>''')
+        with patch.object(self.page,'wait_for_timeout',side_effect=AssertionError('must route immediately')):
+            form,reason=app._wait_response_form(self.page,[],lambda:False,lambda:False)
+        self.assertIsNone(reason)
+        self.assertEqual(form.get_attribute('role'),'dialog')
+
+    def test_separate_unknown_dialog_is_not_bypassed(self):
+        self.page.set_content('''<div role="dialog"><textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div>
+          <div role="dialog">Неизвестное согласие<button>Продолжить</button></div>''')
+        form,reason=app._wait_response_form(self.page,[],lambda:False,lambda:False)
+        self.assertIsNone(form)
+        self.assertEqual(reason,'unsupported_form')
+
+    def test_zero_width_placeholders_and_unnamed_radio_groups(self):
+        self.page.set_content('''<form><div><p>Есть ли опыт с CMS?</p><div>
+          <label><input type="radio" value="yes">Да</label><label><input type="radio" value="no">Нет</label></div></div>
+          <div><p>Есть ли опыт с CRM?</p><div>
+          <label><input type="radio" value="yes">Да</label><label><input type="radio" value="no">Нет</label></div></div>
+          <div><p>Какие проекты вы вели?</p><div>\u200b<textarea placeholder="Писать тут" aria-label="\u200b"></textarea></div></div></form>''')
+        form=self.page.locator('form');fields=form.evaluate(app.INSPECT_FORM)
+        self.assertEqual([q['question'] for q in fields],['Есть ли опыт с CMS?','Есть ли опыт с CRM?','Какие проекты вы вели?'])
+        app._fill_question(form,fields[1],{'answer':'yes'})
+        self.assertFalse(self.page.locator('input').nth(0).is_checked())
+        self.assertTrue(self.page.locator('input').nth(2).is_checked())
+
+    def test_hh_drop_base_radio_portal(self):
+        self.page.set_content('''<div role="dialog" id="response"><div role="button" onclick="document.getElementById('popup').hidden=false">Выбрать</div>
+          <button data-qa="add-cover-letter">Добавить</button></div>
+          <div data-qa="drop-base" role="dialog" id="popup" hidden>
+          <label><input type="radio" name="choice" value="bbbb" checked>Другое</label>
+          <label><input type="radio" name="choice" value="aaaa" onchange="document.getElementById('popup').hidden=true">Нужное</label></div>''')
+        root=self.page.locator('#response');diag={}
+        self.assertTrue(app._choose_resume(root,'aaaa',diag))
+        self.assertEqual(diag['after']['selected_ids'],['aaaa'])
+        self.assertTrue(app._selected_resume(root,'aaaa'))
+        self.assertFalse(app._selected_resume(root,'cccc'))
+
+    def test_unknown_requiredness_with_valid_answer_is_filled(self):
+        self.page.set_content('<section><p>Какие проекты вы вели?</p><textarea></textarea></section>')
+        root=self.page.locator('section');question=root.evaluate(app.INSPECT_FORM)[0]
+        self.assertIsNone(question['required'])
+        with patch('llm.generate',return_value=json.dumps({'answer':'Вёл Alpha.', 'evidence':'Вёл Alpha.'})):
+            answer=app.answer_question(question,test_safe_mvp.VAC,'Вёл Alpha.')
+        app._fill_question(root,question,answer)
+        self.assertEqual(root.locator('textarea').input_value(),'Вёл Alpha.')
+
+    def test_disabled_submit_does_not_block_question_routing(self):
+        self.page.set_content('''<div role="dialog"><p>Опыт?</p><textarea></textarea>
+          <button disabled data-qa="vacancy-response-submit-popup">Откликнуться</button></div>''')
+        with patch.object(self.page,'wait_for_timeout',side_effect=AssertionError('no wait for ready UI')):
+            root,reason=app._wait_response_form(self.page,[],lambda:False,lambda:False)
+        self.assertIsNone(reason)
+        self.assertIsNotNone(root)
+
+    def test_delayed_letter_appearance_and_verification_failure(self):
+        self.page.set_content('''<div id="response"><button data-qa="add-cover-letter" onclick="setTimeout(()=>{this.insertAdjacentHTML('afterend','<textarea data-qa=vacancy-response-popup-form-letter-input></textarea>')},50)">Добавить</button></div>''')
+        self.assertIsNotNone(app._fill_letter(self.page.locator('#response'),'Письмо'))
+        self.assertEqual(self.page.locator('textarea').input_value(),'Письмо')
+        self.page.locator('textarea').evaluate("el => el.addEventListener('input',()=>el.value='changed')")
+        with self.assertRaisesRegex(ValueError,'cover_letter_verification_failed'):
+            app._fill_letter(self.page.locator('#response'),'Письмо')
+
+    def test_full_flow_warning_questions_portal_letter_async_confirmation(self):
+        from playwright.sync_api import Route
+        html = '''<meta charset="utf-8">
+        <a data-qa="vacancy-response-link-top" onclick="document.getElementById('warning').hidden=false">Откликнуться</a>
+        <div id="warning" hidden><button data-qa="relocation-warning-confirm" onclick="this.parentElement.remove();document.getElementById('response').hidden=false">Всё равно откликнуться</button></div>
+        <div role="dialog" id="response" hidden>
+          <div><p>Какие проекты вы вели?</p><div>\u200b<textarea placeholder="Писать тут"></textarea></div></div>
+          <div role="button" onclick="document.getElementById('popup').hidden=false">Резюме</div>
+          <button data-qa="add-cover-letter" onclick="document.getElementById('letter').hidden=false">Добавить</button>
+          <textarea hidden id="letter" data-qa="vacancy-response-popup-form-letter-input"></textarea>
+          <button type="submit" data-qa="vacancy-response-submit-popup" onclick="setTimeout(()=>fetch('/applicant/vacancy_response',{method:'POST',body:'vacancyId=123456789&resumeId='+document.querySelector('#popup input:checked').value}).then(()=>document.body.innerHTML='<p>Отклик отправлен</p>'),50)">Откликнуться</button>
+        </div>
+        <div role="dialog" data-qa="drop-base" id="popup" hidden>
+          <label><input name="resume-choice" type="radio" value="bbbb" checked>Другое</label>
+          <label><input name="resume-choice" type="radio" value="aaaa" onchange="document.getElementById('popup').hidden=true">Нужное</label>
+        </div>'''
+        journal=[];requests=[]
+        def offline(route,**kwargs):
+            if route.request.method == 'GET':route.fulfill(status=200,content_type='text/html',body=html)
+            else:
+                requests.append(route.request.post_data)
+                self.assertEqual(self.page.locator('#letter').input_value(),'Prepared letter')
+                self.assertEqual(self.page.locator('#response textarea').first.input_value(),'Вёл Alpha.')
+                route.fulfill(status=200,body='{}')
+        with patch.object(Route,'continue_',offline), patch.object(app.config,'DRY_RUN',False), patch('llm.generate',return_value=json.dumps({'answer':'Вёл Alpha.','evidence':'Вёл Alpha.'})) as model:
+            result=app.apply(self.page,test_safe_mvp.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,resume_text='Вёл Alpha.',before_submit=lambda:journal.append(True))
+        self.assertEqual(result['application_status'],'applied_confirmed',result)
+        self.assertEqual(result['warnings'],[{'kind':'country_warning','action':'confirmed'}])
+        self.assertEqual(journal,[True]);self.assertEqual(len(requests),1)
+        self.assertIn('resumeId=aaaa',requests[0]);model.assert_called_once()
+
+    def test_unique_local_catalog_identity_without_dom_id(self):
+        self.page.set_content('''<div id="response"><div role="button" aria-controls="choices"
+          onclick="document.getElementById('choices').hidden=false">Other role</div>
+          <div role="listbox" id="choices" hidden><div role="option"
+          onclick="document.querySelector('[role=button]').textContent='Target role';this.parentElement.hidden=true">Target role</div></div></div>''')
+        catalog=[{'resume_id':'aaaa','title':'Target role'},{'resume_id':'bbbb','title':'Other role'}]
+        with patch('application._resume_catalog',return_value=catalog):
+            self.assertTrue(app._choose_resume(self.page.locator('#response'),'aaaa',{}))
+            self.assertTrue(app._selected_resume(self.page.locator('#response'),'aaaa'))
+        with patch('application._resume_catalog',return_value=catalog+[{'resume_id':'cccc','title':'Target role'}]):
+            self.assertFalse(app._selected_resume(self.page.locator('#response'),'aaaa'))
+
+    def test_whole_native_form_not_just_resume_letter_footer(self):
+        self.page.set_content('''<form><div><p>Какие проекты вы вели?</p><textarea required></textarea></div>
+          <div><div>Резюме для отклика</div><input type="hidden" name="resumeId" value="aaaa">
+          <button data-qa="add-cover-letter">Добавить</button>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div></form>''')
+        root,reason=app._wait_response_form(self.page,[],lambda:False,lambda:False)
+        self.assertIsNone(reason);self.assertEqual(root.evaluate('(el)=>el.tagName'),'FORM')
+        fields=root.evaluate(app.INSPECT_FORM)
+        self.assertEqual(len(fields),1);self.assertEqual(fields[0]['question'],'Какие проекты вы вели?')
+
+    def test_questions_after_resume_heading_are_not_skipped(self):
+        self.page.set_content('''<form><div>Резюме для отклика</div><input type="hidden" name="resumeId" value="aaaa">
+          <div><p>Какие проекты вы вели?</p><textarea required></textarea></div></form>''')
+        fields=self.page.locator('form').evaluate(app.INSPECT_FORM)
+        self.assertEqual(len(fields),1)
+        self.assertEqual(fields[0]['question'],'Какие проекты вы вели?')
+
+    def test_hidden_auxiliary_textarea_does_not_hide_radio_question(self):
+        self.page.set_content('''<form><div><p>Есть ли у вас опыт?</p><div>
+          <label><input type="radio" name="experience" value="yes">Да</label>
+          <label><input type="radio" name="experience" value="no">Нет</label>
+          <label><input type="radio" name="experience" value="other">Другое</label>
+          <textarea hidden></textarea></div></div></form>''')
+        fields=self.page.locator('form').evaluate(app.INSPECT_FORM)
+        self.assertEqual(fields[0]['question'],'Есть ли у вас опыт?')
+        self.assertEqual(len(fields[0]['options']),3)
+
+    def test_fenced_question_json_preserves_evidence_validation(self):
+        question={'question':'С какими CMS/фреймворками вы работали?', 'type':'textarea','required':None,'options':[]}
+        with patch('llm.generate',return_value='```json\n'+json.dumps({'answer':'Работал с CMS.','evidence':'Работал с CMS.'})+'\n```'):
+            self.assertEqual(app.answer_question(question,test_safe_mvp.VAC,'Работал с CMS.')['answer'],'Работал с CMS.')
+        with patch('llm.generate',return_value='```json\n{"answer":"Invented","evidence":"Invented"}\n```'),self.assertRaisesRegex(ValueError,'question_evidence_missing'):
+            app.answer_question(question,test_safe_mvp.VAC,'Работал с CMS.')
+
+    def test_full_language_questions_safe_retry_and_no_retry_if_sent(self):
+        from playwright.sync_api import Route
+        for outcome in ('retry_success','maybe_sent','twice_failed'):
+            with self.subTest(outcome=outcome):
+                html='''<meta charset="utf-8"><script>let clicks=0;</script>
+                <a data-qa="vacancy-response-link-top" onclick="document.getElementById('warning').hidden=false">Откликнуться</a>
+                <div role="dialog" id="warning" hidden>Такой отклик может получить отказ. Уровень английского языка ниже уровня работодателя.
+                  <button onclick="this.parentElement.remove();document.getElementById('response').hidden=false">Откликнуться</button></div>
+                <form id="response" hidden onsubmit="return false"><div><p>С какими CMS вы работали?</p><textarea required></textarea></div>
+                <input type="hidden" name="resumeId" value="aaaa">
+                <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+                <div role="alert" id="error"></div>
+                <button type="submit" data-qa="vacancy-response-submit-popup" onclick="clicks++;HANDLER">Откликнуться</button></form>'''
+                send="const xhr=new XMLHttpRequest();xhr.open('POST','/applicant/vacancy_response/popup',false);xhr.send('vacancy_id=123456789&resume_hash=aaaa');"
+                transient="document.getElementById('error').textContent='Произошла ошибка, попробуйте ещё раз';"
+                if outcome=='retry_success': handler="if(clicks===1){"+transient+"}else{"+send+"document.body.innerHTML='<p>Отклик отправлен</p>'; }"
+                elif outcome=='maybe_sent':handler=send+transient
+                else:handler=transient
+                html=html.replace('HANDLER',handler)
+                released=[];journal=[]
+                def offline(route,**kwargs):
+                    if route.request.method=='GET':route.fulfill(status=200,content_type='text/html',body=html)
+                    else:released.append(True);route.fulfill(status=200,body='{}')
+                with patch.object(Route,'continue_',offline),patch.object(app.config,'DRY_RUN',False),patch('llm.generate',return_value=json.dumps({'answer':'Работал с CMS.','evidence':'Работал с CMS.'})):
+                    result=app.apply(self.page,test_safe_mvp.VAC,'Письмо',resume_id='aaaa',dry_run=False,resume_text='Работал с CMS.',before_submit=lambda:journal.append(True))
+                if outcome=='retry_success':
+                    self.assertEqual(result['application_status'],'applied_confirmed',result)
+                    self.assertEqual(result['retry_count'],1);self.assertEqual(released,[True]);self.assertEqual(journal,[True])
+                elif outcome=='maybe_sent':
+                    self.assertEqual(result['application_status'],'submission_unknown',result)
+                    self.assertEqual(result['reason_code'],'submission_maybe_sent_no_retry');self.assertEqual(released,[True])
+                    self.assertEqual(self.page.evaluate('clicks'),1)
+                else:
+                    self.assertEqual(result['reason_code'],'submit_transient_error_after_retry',result)
+                    self.assertEqual(self.page.evaluate('clicks'),2);self.assertEqual(released,[])
+
+    def test_disabled_question_then_unknown_live_request_and_success(self):
+        from playwright.sync_api import Route
+        html='''<meta charset="utf-8">
+        <a data-qa="vacancy-response-link-top" onclick="document.querySelector('form').hidden=false">Откликнуться</a>
+        <form hidden onsubmit="return false">
+          <label>Какие проекты вы вели?<textarea required oninput="setTimeout(()=>document.querySelector('button').disabled=false,100)"></textarea></label>
+          <input type="radio" name="resumeId" value="aaaa" checked hidden>
+          <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+          <button disabled data-qa="vacancy-response-submit-popup" onclick="fetch('/new-response-format',{method:'POST',body:'opaque'}).then(()=>document.body.innerHTML='<p>Отклик отправлен</p>')">Откликнуться</button>
+        </form>'''
+        requests=[]
+        def offline(route,**kwargs):
+            if route.request.method=='GET':route.fulfill(status=200,content_type='text/html',body=html)
+            else:
+                requests.append(route.request.url)
+                self.assertEqual(self.page.locator('textarea').first.input_value(),'Вёл Alpha.')
+                route.fulfill(status=200,body='{}')
+        with patch.object(Route,'continue_',offline),patch.object(app.config,'DRY_RUN',False),patch('llm.generate',return_value=json.dumps({'answer':'Вёл Alpha.','evidence':'Вёл Alpha.'})):
+            result=app.apply(self.page,test_safe_mvp.VAC,'Письмо',resume_id='aaaa',dry_run=False,resume_text='Вёл Alpha.',before_submit=lambda:None)
+        self.assertEqual(result['application_status'],'applied_confirmed',result)
+        self.assertEqual(len(requests),1)
+        self.assertEqual(result['resume_verification'],'dom_verified')
+        self.assertFalse(result['blocked_submission_request'])
+
+    def test_validation_diagnostics_never_include_values(self):
+        self.page.set_content('<form><input required><input type="email" value="private-invalid"><textarea required hidden></textarea></form>')
+        info=app._validation_diagnostics(self.page.locator('form'))
+        self.assertEqual(len(info['invalid_fields']),2)
+        self.assertTrue(info['invalid_fields'][0]['value_missing'])
+        self.assertTrue(info['invalid_fields'][1]['type_mismatch'])
+        self.assertNotIn('private',str(info))

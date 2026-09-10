@@ -117,3 +117,16 @@ class OptionalQuestionTests(unittest.TestCase):
             result=application.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal)
         self.assertEqual(result['reason'],'optional_field_not_cleared')
         submit.click.assert_not_called()
+
+    def test_failed_question_records_only_safe_error_code(self):
+        for error,code in [('question_label_unknown','question_text_not_found'),
+                           ('question_llm_invalid','question_llm_invalid_json'),
+                           ('question_evidence_missing','question_evidence_rejected'),
+                           ('question_choice_invalid','question_option_not_found'),
+                           ('secret@example.test','question_pipeline_error')]:
+            page,form,letter,submit,route,journal,order,fill,model=self.fixture(questions=[TEXT])
+            model.side_effect=ValueError(error)
+            result=application.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal)
+            self.assertEqual(result['questions'][0]['error_code'],code)
+            self.assertNotIn('secret@example.test',str(result))
+            submit.click.assert_not_called()

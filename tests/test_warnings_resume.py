@@ -19,7 +19,8 @@ class WarningResumeTests(unittest.TestCase):
         button=dialog.get_by_role.return_value
         button.count.return_value=1; button.is_enabled.return_value=True
         button.click.side_effect=lambda **kw:state.update(open=False)
-        page.locator.side_effect=lambda selector:forms if selector==application.FORM_SELECTOR else dialogs
+        empty=MagicMock(); empty.count.return_value=0
+        page.locator.side_effect=lambda selector: forms if selector==application.FORM_SELECTOR else dialogs if selector=='[role="dialog"]:visible, [data-qa="modal"]:visible' else empty
         return page,dialog,form,button
 
     def test_country_warning_then_form(self):
@@ -65,5 +66,5 @@ class WarningResumeTests(unittest.TestCase):
         form=MagicMock(); form.locator.return_value.count.return_value=0
         form.evaluate.side_effect=[{'verified':False,'candidates':[2]}, {'verified':True}]
         self.assertTrue(application._choose_resume(form,'aaaa'))
-        form.evaluate_handle.assert_called_once_with('(form,i) => form.elements[i]',2)
+        form.evaluate_handle.assert_called_once_with("(form,i) => (form.elements || form.querySelectorAll('input,select,textarea,button,fieldset,output'))[i]",2)
         form.evaluate_handle.return_value.as_element.return_value.check.assert_called_once()

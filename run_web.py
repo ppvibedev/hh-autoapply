@@ -227,7 +227,8 @@ def main():
                         counts["manual_review"] += 1
                         entry.update(_exception_details(error, stage))
                         entry.update(decision="needs_manual_review", error=_error_code(error),
-                                     reason="Анализ или письмо не завершены; требуется проверка.")
+                                     reason_code=_error_code(error),
+                                     reason=f"{stage}: {_error_code(error)}; требуется проверка.")
                     try:
                         _log(entry)
                     except ValueError:
