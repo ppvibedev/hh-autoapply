@@ -261,3 +261,119 @@ git diff --check без ошибок. Реальные HH/LLM не запуск�
 новых commit/push/merge не было. Новые проверки покрывают неизвестный payload/endpoint,
 ошибку observer, запрещённый payload-only resume, disabled→ответ→enabled→request→success,
 неопределённый результат без retry и точный matching_invalid_json в history.
+
+## Диагностика employer questions без изменения решений
+
+В `questions[].diagnostics` сохраняются тип/ключи parsed JSON, наличие ключа answer,
+типы/наличие/длины answer и evidence, точный parser_reason и evidence_validation_reason,
+а также очищенные варианты radio/select. Отказавшие answer, evidence, raw response,
+prompt и источники кандидата не сохраняются. Правила принятия и нормализации неизменны.
+Проверка: 2 теста `test_question_diagnostics.py`, только локальные имитации.
+
+Question prompt уточнён: evidence — дословный непрерывный фрагмент одного источника
+selected_resume/candidate_materials, без пересказа, склейки и префиксов; при отсутствии
+цитаты — пустая строка. Instructions остаются указаниями подачи, не новым источником
+фактов для validator. Строгая проверка не изменена. Один локальный тест подтверждает:
+перефразированный answer с точной цитатой проходит, перефразированная цитата — нет.
+
+## Локальные источники ответов и обязательное письмо
+
+Сохранены diagnostics/prompt fixes после checkpoint 80eea8a6. Question resolver
+(`question_sources.py`) сначала проверяет настройки текущего процесса/run: salary_min
+в RUB и фактические WORK_FORMAT_CODES поиска. AREA без ограничения означает только
+географию поиска; числовой ID региона не превращается в место проживания/гражданство.
+Неизвестный формат, gross/net/валюта или неоднозначные options требуют проверки.
+
+Заданные пользователем предпочтения хранятся локально в игнорируемом Git файле
+`private/application_preferences.json`: выход на работу, общение, тестовое, командировки,
+оформление, часовой пояс, собеседование, рекомендации, подтверждения резюме и мотивация.
+Классификация ограничена темами, не точными строками FAQ. Неизвестные документы,
+юридические/медицинские/банковские факты не угадываются и не наследуют простое согласие.
+Радиовариант выбирается только при единственном совпадении нормализованного текста
+или разрешённого синонима; неоднозначность/«Свой вариант» без надёжной поддержки — manual.
+
+Контакты доступны только из явно заданного локального файла
+`private/application_profile.json`, структура `resumes[resume_id].contacts` с ключами
+telegram/email/phone. Этот файл/контакты автоматически не создаются; из очищенного
+resume cache данные не восстанавливаются. При отсутствии контакта — manual.
+Контакт идёт напрямую в поле, readback выполняется, но значение не записывается в
+questions/history/diagnostics и не передаётся LLM.
+
+Профессиональные вопросы сохраняют LLM + exact evidence. Prompt допускает честный
+partial answer: подтверждённая часть и явно не подтверждённая оставшаяся часть.
+Отсутствие опыта в источниках больше не позволяет автоматически ответить «Нет» без
+evidence. Для мотивации LLM получает разрешённые предпочтения, без выдуманной истории
+увольнения. Технические radio IDs заменяются в prompt локальными aliases, затем
+восстанавливаются: финальная очистка телефонов не должна разрушать ID браузерного поля.
+
+Country warning распознаётся по известному заголовку и обрабатывается до выбора
+response scope, затем DOM определяется заново. Language popup с «Добавить
+сопроводительное» проходит через обычное заполнение/проверку письма. Добавлен fallback
+по точному доступному имени кнопки; root привязан к остающейся финальной кнопке, а не
+исчезающей кнопке Add. Письмо всегда проходит fill/readback перед финальным submit.
+Чтение закрывающегося language popup ограничено, чтобы не ждать 30 секунд после
+его исчезновения. No-question path, сетевой механизм, retry и правила HH success
+не перестроены. Required=null не блокирует найденный и проверенный ответ.
+
+Проверено 13 целевых тестов (resolver/diagnostics, no-question regression и три
+DOM-теста), без полного suite, реального HH и внешнего LLM. Новые проверки включают
+country/language/обычный popup с текстовой Add-кнопкой, письмо до POST, текущую
+зарплату/формат, preference, partial answer, неизвестный документ, контакт без утечки,
+radio IDs и required=null. Это локальные проверки, не подтверждение работы нового DOM
+на реальном HH.
+
+## Консервативное восстановление professional evidence
+
+Только при literal mismatch в professional LLM-ветке выполняется локальный поиск
+по тем же очищенным resume/context. Exact evidence проходит прежним путём; пустое
+и нестроковое evidence не восстанавливается. Vacancy/instructions не используются
+как дополнительные доказательства. Кандидаты — целые строки/предложения источника.
+Нужно минимум 5 токенов; все токены запроса должны присутствовать в исходном порядке,
+покрывая минимум 90% фрагмента. Дополнительными словами источника могут быть только
+«и»/«также». Регистр и разделительная пунктуация нормализуются; маркеры технологий,
+чисел и операторов сохраняются. Несколько различных подходящих цитат — отказ.
+Синонимы, перестановка фактов, новые технологии и отбрасывание отрицаний не разрешены.
+Найденный исходный текст снова проходит существующий literal gate.
+
+В diagnostics добавлены evidence_recovery_attempted и evidence_recovery_result
+(exact_not_needed/exact_source_recovered/no_match/ambiguous_match/below_threshold).
+Цитаты/источники не логируются. Проверены только 3 targeted теста восстановления,
+включая отрицательный/неоднозначный случай и повторный строгий gate; все прошли.
+Реальные HH/LLM не запускались, Git-записей не было.
+
+## Диагностика recovery и открытия resume dropdown
+
+Recovery сохраняет только metadata: recovery_candidates_count, recovery_best_token_count,
+recovery_best_coverage (отношение числа токенов запроса к длине фрагмента, как в gate),
+recovery_order_preserved, recovery_extra_tokens_count, recovery_extra_tokens_allowed,
+recovery_failure_reason. Ближайший кандидат для диагностики выбирается по покрытию
+токенов запроса, затем фрагмента; этот рейтинг не влияет на существующее принятие.
+Причины: too_few_tokens, query_tokens_missing, disallowed_extra_tokens,
+coverage_below_threshold, token_order_failed, ambiguous_best_match, no_candidate,
+strict_validator_failed. Тексты/токены источников не сохраняются.
+
+В resume_dropdown_diagnostics.dom_snapshots добавлены before_click,
+immediately_after_click, 500ms, 1500ms и wait_finished (около 3000ms при неоткрытии).
+Если варианты найдены раньше, ожидание не продлевается ради снимков. Снимки содержат
+trigger tag/role/aria-expanded/controls/owns, active element tag/role, visible counts
+listbox/menu/option/resume/dropdown/popup, overlay/dialog count, metadata ближайших
+контейнеров и новых изменённых контейнеров с интерактивными элементами, количество
+clickable option-like элементов, dom_changed и elapsed_wait_ms. MutationObserver
+фиксирует факт изменений; тексты и значения полей не экспортируются. Идентификаторы
+ограничены и проходят очистку. Observer отключается в finally.
+
+Пороги evidence, dropdown selectors/выбор/click и timeout не изменены. Диагностика
+использует прежний цикл ожидания. Проверяются только два целевых теста: причины recovery
+и отсутствие приватного текста в DOM metadata. Реальные HH/LLM и полный suite не запускаются.
+
+## Resume portal: один реальный DOM capture
+
+В RUSAL (137221148) после клика появился `data-qa=drop-base` с вложенным
+`role=listbox`, `data-qa=magritte-select-option-list`. Варианты —
+`label[role=option][data-magritte-select-option]`, точный ID находится в
+`data-qa=magritte-select-option-<resume_id>`. Добавлено распознавание единственного
+такого списка без двойного подсчёта внешнего popup и вложенного listbox,
+и чтение точного ID варианта. После выбора сохранена обязательная проверка
+отображаемого resume_id. Already-matched путь не изменён.
+Capture выполнен без письма/submit, все запросы записи были заблокированы.
+Это подтверждает структуру, но не доказывает причину отсутствия popup в старом run.

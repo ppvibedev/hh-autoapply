@@ -382,3 +382,76 @@ class DOMTests(unittest.TestCase):
         self.assertTrue(info['invalid_fields'][0]['value_missing'])
         self.assertTrue(info['invalid_fields'][1]['type_mismatch'])
         self.assertNotIn('private',str(info))
+
+    def test_known_warnings_text_add_letter_before_submit(self):
+        from playwright.sync_api import Route
+        for warning in ('language','country','none'):
+            with self.subTest(warning=warning):
+                intro=''
+                if warning=='language':intro='Такой отклик может получить отказ. Уровень языка в резюме ниже требования работодателя.'
+                country='''<div role="dialog" id="country" hidden>Вы откликаетесь на вакансию в другой стране
+                  <button onclick="this.parentElement.remove();document.getElementById('response').hidden=false">Все равно откликнуться</button></div>'''
+                target='country' if warning=='country' else 'response'
+                html=f'''<meta charset="utf-8"><a data-qa="vacancy-response-link-top" onclick="document.getElementById('{target}').hidden=false">Откликнуться</a>
+                {country if warning=='country' else ''}
+                <form role="dialog" id="response" hidden onsubmit="return false">{intro}
+                  <input type="radio" name="resumeId" value="aaaa" checked hidden>
+                  <button type="button" onclick="document.getElementById('letter').hidden=false;this.remove()">Добавить сопроводительное</button>
+                  <label>Сопроводительное письмо<textarea id="letter" hidden></textarea></label>
+                  <button type="submit" onclick="if(document.getElementById('letter').value!=='Prepared letter')throw Error('missing letter');fetch('/applicant/vacancy_response',{{method:'POST',body:'opaque'}}).then(()=>document.body.innerHTML='<p>Отклик отправлен</p>')">Откликнуться</button>
+                </form>'''
+                released=[]
+                def offline(route,**kwargs):
+                    if route.request.method=='GET':route.fulfill(status=200,content_type='text/html',body=html)
+                    else:
+                        self.assertEqual(self.page.locator('#letter').input_value(),'Prepared letter')
+                        released.append(True);route.fulfill(status=200,body='{}')
+                with patch.object(Route,'continue_',offline),patch.object(app.config,'DRY_RUN',False):
+                    result=app.apply(self.page,test_safe_mvp.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=lambda:None)
+                self.assertEqual(result['application_status'],'applied_confirmed',result)
+                self.assertEqual(released,[True])
+
+    def test_resume_metadata_snapshots_exclude_private_text(self):
+        self.page.set_content('''<form><button type="button" data-qa="resume-trigger" aria-expanded="false"
+          aria-controls="choices" onclick="this.setAttribute('aria-expanded','true');document.getElementById('choices').hidden=false">PRIVATE_RESUME_TEXT</button>
+          <div hidden id="choices" data-qa="dropdown-unrecognised" class="dropdown-shell"><button>person@example.test PRIVATE_RESUME_TEXT</button></div></form>''')
+        diag={}
+        with patch('application._custom_resume_state',return_value={'selected_ids':['bbbb'],'popup_found':False,'options':[]}):
+            self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diag))
+        snapshots=diag['dom_snapshots']
+        self.assertEqual([s['snapshot'] for s in snapshots],['before_click','immediately_after_click','500ms','1500ms','wait_finished'])
+        self.assertEqual(snapshots[0]['trigger']['aria_expanded'],'false')
+        self.assertEqual(snapshots[-1]['trigger']['aria_expanded'],'true')
+        self.assertTrue(snapshots[-1]['dom_changed'])
+        self.assertEqual(snapshots[-1]['visible_counts']['qa_dropdown'],1)
+        self.assertGreaterEqual(snapshots[-1]['elapsed_wait_ms'],2900)
+        self.assertNotIn('PRIVATE_RESUME_TEXT',json.dumps(diag))
+        self.assertNotIn('person@example.test',json.dumps(diag))
+
+    def _real_resume_portal(self, update):
+        self.page.set_content('''<form><section><div>Резюме для отклика</div>
+          <div id="trigger" role="button" data-resume-id="bbbb"
+            onclick="document.getElementById('portal').hidden=false">Synthetic</div>
+          </section></form><div id="portal" role="dialog" data-qa="drop-base" hidden>
+          <div role="listbox" data-qa="magritte-select-option-list">
+          <label role="option" data-magritte-select-option data-qa="magritte-select-option-bbbb">Synthetic B<input type="radio"></label>
+          <label id="target" role="option" data-magritte-select-option data-qa="magritte-select-option-aaaa">Synthetic A<input type="radio"></label>
+          </div></div>''')
+        self.page.locator('#target').evaluate('''(el, update)=>el.onclick=()=>{
+          if(update)document.getElementById('trigger').setAttribute('data-resume-id','aaaa');
+          document.getElementById('portal').hidden=true;
+        }''',update)
+
+    def test_real_resume_portal_exact_option_id(self):
+        self._real_resume_portal(True)
+        diag={}
+        self.assertTrue(app._custom_resume_choose(self.page.locator('form'),'aaaa',diag))
+        self.assertEqual(diag['after']['selected_ids'],['aaaa'])
+        self.assertEqual(diag['reason_code'],'resume_verified')
+
+    def test_real_resume_portal_click_without_changed_id_fails(self):
+        self._real_resume_portal(False)
+        diag={}
+        self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diag))
+        self.assertEqual(diag['after']['selected_ids'],['bbbb'])
+        self.assertEqual(diag['reason_code'],'resume_selection_not_changed')
