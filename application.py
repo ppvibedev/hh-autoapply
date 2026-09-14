@@ -719,7 +719,17 @@ CUSTOM_RESUME = r'''(form, action) => {
         block = block.parentElement;
         if (!block || !form.contains(block)) break;
     }
-    if (!block || triggers.length !== 1) return null;
+    if (!block) return null;
+    if (action.kind === 'trigger_diagnostics') {
+        const meta = el => ({tag:el.tagName.toLowerCase(),role:el.getAttribute('role') || '',
+            qa:el.getAttribute('data-qa') || '',aria_expanded:el.getAttribute('aria-expanded'),
+            aria_controls:el.getAttribute('aria-controls') || '',aria_owns:el.getAttribute('aria-owns') || '',
+            aria_haspopup:el.getAttribute('aria-haspopup') || '',disabled:el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',
+            class_name:[...el.classList].slice(0,8).join(' '),id_count:ids(el).length});
+        return {heading_found:!!heading,block:meta(block),candidate_trigger_count:triggers.length,
+            candidate_triggers:triggers.slice(0,6).map(meta)};
+    }
+    if (triggers.length !== 1) return null;
     const trigger = triggers[0];
     if (action.kind === 'trigger') return trigger;
     if (action.kind === 'combobox') return trigger.getAttribute('role') === 'combobox';
@@ -767,7 +777,7 @@ def _custom_resume_state(form):
     return value if isinstance(value,dict) else {}
 
 
-RESUME_DOM_OBSERVER = r'''trigger => {
+RESUME_DOM_OBSERVER = r'''(trigger, targetResumeId) => {
     let changed=false;
     const changedRoots=new Set();
     const remember=records=>{
@@ -783,6 +793,25 @@ RESUME_DOM_OBSERVER = r'''trigger => {
     const meta=el=>({tag:el?.tagName?.toLowerCase() || '',role:role(el),
         qa:ident(el?.getAttribute('data-qa')),
         class_name:[...(el?.classList || [])].slice(0,8).map(ident).join(' ')});
+    const hitMeta=el=>({...meta(el),aria_expanded:['true','false'].includes(el?.getAttribute('aria-expanded')) ? el.getAttribute('aria-expanded') : null,
+        aria_controls:ident(el?.getAttribute('aria-controls')),aria_owns:ident(el?.getAttribute('aria-owns')),
+        aria_haspopup:ident(el?.getAttribute('aria-haspopup')),aria_disabled:el?.getAttribute('aria-disabled') === 'true',
+        disabled:el?.matches?.(':disabled') || false});
+    const hitTest=()=>{
+        const rect=trigger.getBoundingClientRect();
+        const box={x:Math.round(rect.x),y:Math.round(rect.y),width:Math.round(rect.width),height:Math.round(rect.height)};
+        if (!rect.width || !rect.height) return {bounding_box:box,center:null,hit:null,relation:'no_visible_box'};
+        const center={x:Math.round(rect.left+rect.width/2),y:Math.round(rect.top+rect.height/2)};
+        const hit=document.elementFromPoint(center.x,center.y);
+        const relation=hit === trigger ? 'trigger' : trigger.contains(hit) ? 'trigger_descendant' : 'outside_resume_card';
+        const parents=[];
+        if (relation === 'outside_resume_card') for(let parent=hit?.parentElement,i=0;parent && i<4 && !['BODY','HTML'].includes(parent.tagName);parent=parent.parentElement,i++) parents.push(meta(parent));
+        return {bounding_box:box,center,hit:hitMeta(hit),relation,outside_resume_card_parents:parents};
+    };
+    const triggerControls=()=>[...trigger.querySelectorAll('button,[role],[tabindex],[aria-expanded],[aria-haspopup]')]
+        .filter(visible).slice(0,12).map(el=>({...meta(el),tabindex:ident(el.getAttribute('tabindex')),
+            aria_expanded:['true','false'].includes(el.getAttribute('aria-expanded')) ? el.getAttribute('aria-expanded') : null,
+            aria_haspopup:ident(el.getAttribute('aria-haspopup')),disabled:el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true'}));
     const selectors={listbox:'[role="listbox"]',menu:'[role="menu"]',option:'[role="option"]',
         qa_resume:'[data-qa*="resume"]',qa_dropdown:'[data-qa*="dropdown"]',qa_popup:'[data-qa*="popup"]'};
     return {
@@ -804,13 +833,20 @@ RESUME_DOM_OBSERVER = r'''trigger => {
             nearby.push(...groups.listbox,...groups.menu,...groups.qa_dropdown,...groups.qa_popup,...newContainers);
             const containers=[...new Set(nearby)].slice(0,10);
             const clickable=new Set(containers.flatMap(el=>[...el.querySelectorAll('button,[role="option"],[role="menuitem"],input[type="radio"],a')].filter(visible)));
+            const targetOptions=[...document.querySelectorAll('[data-qa]')].filter(el=>el.getAttribute('data-qa') === 'magritte-select-option-'+targetResumeId);
+            const visibleTarget=targetOptions.filter(visible);
+            const targetLocation=visibleTarget.length === 1 ? (trigger.contains(visibleTarget[0]) ? 'trigger_descendant' : trigger.parentElement?.contains(visibleTarget[0]) ? 'trigger_parent' : 'page_portal') : '';
             return {trigger:{...meta(trigger),connected:trigger.isConnected,
                 aria_expanded:['true','false'].includes(trigger.getAttribute('aria-expanded')) ? trigger.getAttribute('aria-expanded') : null,
                 aria_controls:ident(trigger.getAttribute('aria-controls')),aria_owns:ident(trigger.getAttribute('aria-owns'))},
                 active_element:{tag:document.activeElement?.tagName?.toLowerCase() || '',role:role(document.activeElement)},
                 visible_counts:Object.fromEntries(Object.entries(groups).map(([key,els])=>[key,els.length])),
                 visible_overlay_dialog_count:[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[data-qa*="overlay"],[data-qa*="popup"]')].filter(visible).length,
-                candidate_containers:containers.map(meta),clickable_option_like_count:clickable.size,dom_changed:changed};
+                candidate_containers:containers.map(meta),clickable_option_like_count:clickable.size,
+                trigger_descendant_controls:triggerControls(),exact_target_option_count:targetOptions.length,
+                exact_target_option_visible_count:visibleTarget.length,exact_target_option_location:targetLocation,
+                click_hit_test:hitTest(),
+                dom_changed:changed};
         },
         disconnect:()=>observer.disconnect()
     };
@@ -841,7 +877,13 @@ def _custom_resume_choose(form, resume_id, diagnostics):
     if before.get('selected_ids') == [resume_id]:
         diagnostics['after'] = before
         return _selected_resume(form,resume_id)
-    handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'trigger','catalog':_resume_catalog()})
+    catalog=_resume_catalog()
+    try:
+        trigger_diagnostics=form.evaluate(CUSTOM_RESUME, {'kind':'trigger_diagnostics','id':resume_id,'catalog':catalog})
+        if isinstance(trigger_diagnostics,dict): diagnostics['trigger_diagnostics']=trigger_diagnostics
+    except Exception as error:
+        diagnostics['trigger_diagnostic_error_type']=type(error).__name__
+    handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'trigger','catalog':catalog})
     observer=None
     snapshots=diagnostics.setdefault('dom_snapshots',[])
     try:
@@ -850,7 +892,7 @@ def _custom_resume_choose(form, resume_id, diagnostics):
             diagnostics['reason_code']='resume_trigger_not_found'
             return False
         try:
-            observer=trigger.evaluate_handle(RESUME_DOM_OBSERVER)
+            observer=trigger.evaluate_handle(RESUME_DOM_OBSERVER,resume_id)
             _resume_dom_snapshot(observer,snapshots,'before_click',time.monotonic())
         except Exception as error:
             diagnostics['dom_diagnostic_error_type']=type(error).__name__
@@ -1068,6 +1110,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
     verified_answers=[]
     retry_count=0
     language_confirmed=False
+    language_warning_after_submission=False
     def finish(**values):
         outcome = dict(result, **values)
         outcome.setdefault('stage',stage)
@@ -1328,6 +1371,13 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
                     try: warning_text=dialog.inner_text(timeout=300)
                     except Exception: continue  # The popup may close while HH renders success.
                     if _warning_kind(warning_text) != 'language_warning': continue
+                    # A write may already have created the response. Do not click another
+                    # "Откликнуться" control; wait only for HH's explicit confirmation.
+                    if sent:
+                        if not language_warning_after_submission:
+                            result['warnings'].append({'kind':'language_warning','action':'observed_after_possible_submission'})
+                            language_warning_after_submission=True
+                        break
                     add=_letter_add(dialog)
                     if any(add.nth(j).is_visible() for j in range(add.count())):
                         _fill_letter(dialog,letter)

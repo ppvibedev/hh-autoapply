@@ -78,6 +78,22 @@ class RequestVariants(unittest.TestCase):
         self.assertEqual(result['reason_code'],'submission_sent_confirmation_missing')
         submit.click.assert_called_once();route.abort.assert_not_called()
 
+    def test_language_warning_after_observed_submission_is_unknown_without_second_click(self):
+        page,form,letter,submit,route,journal,order,fill,model=self.fixture()
+        dialogs=MagicMock(); dialogs.count.return_value=1
+        dialog=dialogs.nth.return_value
+        dialog.inner_text.return_value='Уровень языка в резюме ниже требования работодателя, возможен отказ.'
+        dialog.locator.return_value.count.return_value=0
+        confirm=dialog.get_by_role.return_value
+        confirm.count.return_value=1; confirm.is_enabled.return_value=True
+        original=page.locator.side_effect
+        page.locator.side_effect=lambda selector: dialogs if selector=='[role="dialog"]:visible, [data-qa="modal"]:visible' else original(selector)
+        result=app.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal)
+        self.assertEqual(result['application_status'],'submission_unknown')
+        self.assertEqual(result['reason_code'],'submission_sent_confirmation_missing')
+        self.assertIn({'kind':'language_warning','action':'observed_after_possible_submission'},result['warnings'])
+        submit.click.assert_called_once(); confirm.click.assert_not_called()
+
     def test_observer_exception_does_not_block_live(self):
         page,form,letter,submit,route,journal,order,fill,model=self.fixture(signal='applied_confirmed')
         with patch('application._request_details',side_effect=ValueError('synthetic')):

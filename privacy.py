@@ -29,7 +29,7 @@ def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
     text = re.sub(
         r"(?im)^.*(?:домашний адрес|почтовый адрес|адрес проживания|home address|postal address|"
         r"mailing address|street address|^\s*адрес\s*:|^\s*address\s*:|"
-        r"телеграм\s*:|telegram\s*:|whatsapp\s*:|skype\s*:).*$", "[контакт удалён]", text)
+        r"(?:телеграм|telegram)(?:\s+для\s+связи)?\s*:|whatsapp\s*:|skype\s*:).*$", "[контакт удалён]", text)
     text = re.sub(r"(?im)^.*\b(?:ул\.|улица|проспект|переулок|street|avenue|road)\s+[^\n]*\d[^\n]*$",
                   "[адрес удалён]", text)
     text = re.sub(r"(?im)^.*\b\d+\s+[^\n,]{1,60}\s(?:street|avenue|road|st\.|rd\.)[^\n]*$",

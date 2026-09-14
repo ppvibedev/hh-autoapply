@@ -448,6 +448,12 @@ class DOMTests(unittest.TestCase):
         self.assertTrue(app._custom_resume_choose(self.page.locator('form'),'aaaa',diag))
         self.assertEqual(diag['after']['selected_ids'],['aaaa'])
         self.assertEqual(diag['reason_code'],'resume_verified')
+        self.assertEqual(diag['trigger_diagnostics']['candidate_trigger_count'],1)
+        self.assertEqual(diag['dom_snapshots'][-1]['exact_target_option_visible_count'],1)
+        self.assertEqual(diag['dom_snapshots'][-1]['exact_target_option_location'],'page_portal')
+        hit=diag['dom_snapshots'][0]['click_hit_test']
+        self.assertEqual(hit['relation'],'trigger')
+        self.assertGreater(hit['bounding_box']['width'],0)
 
     def test_real_resume_portal_click_without_changed_id_fails(self):
         self._real_resume_portal(False)
