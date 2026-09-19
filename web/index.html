@@ -234,6 +234,11 @@ const TAGS = {
   applied_no_letter:['t-nobtn','отклик БЕЗ письма'],
   below_threshold:['t-below','мимо'], reject:['t-reject','отбой'], no_button:['t-nobtn','нет кнопки'],
 };
+const ROLE_ALIGNMENT_LABELS = {
+  adjacent: 'смежное направление',
+  functional_mismatch: 'другая функция',
+  unclear: 'роль не ясна',
+};
 let cfgTouched = false;
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>cfgTouched=true));
 
@@ -347,11 +352,13 @@ async function refresh(){
       const detail = r.reason_code || r.reason;
       const extra = detail ? ` · ${detail}` : (r.why? ` · ${r.why}`:'');
       const sc = (r.score!=null)?`<span class="sc">${esc(r.score)}</span>`:'';
+      const role = r.role_alignment && r.role_alignment !== 'aligned'
+        ? `<div class="muted">Роль: ${esc(ROLE_ALIGNMENT_LABELS[r.role_alignment]||r.role_alignment)} · ${esc(r.role_alignment_reason||'требуется проверка')}</div>` : '';
       const isOpen = open.has(String(r.vid)) ? ' open' : '';
       const letter = r.letter ? `<details data-vid="${esc(r.vid)}"${isOpen} style="margin-top:6px"><summary class="muted" style="cursor:pointer">письмо</summary><div class="muted" style="white-space:pre-wrap;margin-top:6px">${esc(r.letter)}</div></details>` : '';
       return `<div class="item"><span class="tag ${cls}">${esc(label)}</span>
         <div style="flex:1"><div>${esc(r.title||'')}</div>
-          ${/^https:\/\/hh\.ru\/vacancy\/\d+$/.test(r.url||'') ? `<a href="${r.url}" target="_blank" rel="noopener noreferrer">Открыть вакансию HH</a>` : ''}<div class="muted">${esc(r.company||r.employer||'')}${esc(extra)}</div>${letter}</div>${sc}</div>`;
+          ${/^https:\/\/hh\.ru\/vacancy\/\d+$/.test(r.url||'') ? `<a href="${r.url}" target="_blank" rel="noopener noreferrer">Открыть вакансию HH</a>` : ''}<div class="muted">${esc(r.company||r.employer||'')}${esc(extra)}</div>${role}${letter}</div>${sc}</div>`;
     }).join('') || '<div class="muted">Пусто. Запусти прогон.</div>';
     feed.dataset.sig = sig;
   }

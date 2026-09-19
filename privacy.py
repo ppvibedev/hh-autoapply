@@ -52,7 +52,7 @@ def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
 def sanitize_record(value):
     """Очищать только содержательные текстовые поля, не технические метаданные."""
     text_fields = {"title", "company", "employer", "reason", "why", "letter", "matched",
-                   "missing", "risks", "remote_reason"}
+                   "missing", "risks", "remote_reason", "role_alignment_reason", "role_evidence"}
     def clean(text):
         if isinstance(text, str):
             import config
@@ -62,6 +62,10 @@ def sanitize_record(value):
         return text
     if isinstance(value, dict):
         result = {key: clean(item) if key in text_fields else item for key, item in value.items()}
+        if isinstance(result.get("vacancy_role"), dict):
+            result["vacancy_role"] = {key: clean(item) for key, item in result["vacancy_role"].items()}
+        if isinstance(result.get("matching_result"), dict):
+            result["matching_result"] = sanitize_record(result["matching_result"])
         if "questions" in result:
             result["questions"] = [{k: clean(v) if k in ("question", "answer") else v
                                     for k, v in q.items()} for q in result["questions"]]

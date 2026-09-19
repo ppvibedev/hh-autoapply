@@ -12,6 +12,7 @@ import config
 import decide
 import llm
 from llm_errors import LLMUnavailable
+from resume_metadata import selected_resume_title
 import hh_web
 from browser import browser_context, has_session
 from candidate_context import load_candidate_context
@@ -31,7 +32,8 @@ def _error_code(error):
              "resume_identity_not_verified", "resume_content_not_found", "resume_content_empty",
              "hh_session_missing", "invalid_run_settings", "matching_invalid_score",
              "matching_invalid_json", "matching_invalid_schema", "matching_inconsistent_decision",
-             "matching_invalid_remote_status", "matching_llm_unavailable", "letter_llm_unavailable",
+             "matching_invalid_remote_status", "matching_invalid_role_alignment", "matching_llm_unavailable", "letter_llm_unavailable",
+             "selected_resume_title_unavailable",
              "letter_invalid", "candidate_context_symlink_not_allowed", "candidate_context_path_not_allowed",
              "candidate_context_too_large_120000_chars", "llm_context_too_large_180000_chars",
              "vacancy_description_empty", "vacancy_description_not_found", "resume_cache_symlink_not_allowed"}
@@ -144,6 +146,7 @@ def main():
         seen_this_run = set()  # SAFE не использует и не меняет старый seen.json.
         with browser_context(on_stage=mark_stage) as (_, page):
             resume_text = _get_resume(page, resume_id, on_stage=mark_stage)
+            resume_title = selected_resume_title(resume_id)
             for page_num in range(config.PAGES_PER_RUN):
                 if _stop_requested or halt:
                     break
@@ -185,12 +188,22 @@ def main():
                             if _stop_requested:
                                 break
                             mark_stage("matching")
-                            result = decide.score(full, resume_text, materials, instructions)
+                            result = decide.score(full, resume_text, materials, instructions,
+                                                  search_query=config.SEARCH_QUERY, resume_title=resume_title or "")
                             entry.update(match_score=result["score"], score=result["score"],
                                 matched=result["matched"], missing=result["missing"], risks=result["risks"],
                                 reason=result["reason"], match_decision=result["decision"],
-                                remote_status=result["remote_status"], remote_reason=result["remote_reason"])
-                            if result["remote_status"] == "ineligible":
+                                remote_status=result["remote_status"], remote_reason=result["remote_reason"],
+                                capability_score=result["capability_score"], vacancy_role=result["vacancy_role"],
+                                role_alignment=result["role_alignment"],
+                                role_alignment_reason=result["role_alignment_reason"], role_evidence=result["role_evidence"],
+                                matching_result=result)
+                            if result["role_alignment"] != "aligned":
+                                counts["manual_review"] += 1
+                                entry.update(decision="needs_manual_review",
+                                    reason_code="role_" + result["role_alignment"],
+                                    reason=result["role_alignment_reason"])
+                            elif result["remote_status"] == "ineligible":
                                 counts["hard_rejected"] += 1
                                 entry.update(decision="rejected_remote", reason=result["remote_reason"])
                             elif result["remote_status"] == "unclear":
