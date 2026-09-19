@@ -783,10 +783,49 @@ def _custom_resume_state(form):
 RESUME_DOM_OBSERVER = r'''(trigger, targetResumeId) => {
     let changed=false;
     const changedRoots=new Set();
+    let phase='before_click', activationAt=null;
+    const mutationEvents=[], mutationKeys=new Set(), maxMutations=24;
+    const form=trigger.closest('form');
+    const classMarkers=el=>[...(el?.classList || [])].filter(value=>/magritte|select|drop|popup|modal|card|form|button/i.test(value))
+        .slice(0,8).map(ident).join(' ');
+    const relation=el=>el === trigger ? 'trigger' : el?.contains?.(trigger) ? 'trigger_ancestor'
+        : trigger.contains(el) ? 'trigger_descendant' : form?.contains(el) ? 'inside_current_form' : 'outside_current_form';
+    const nodeMeta=el=>({tag:el?.tagName?.toLowerCase() || '',role:role(el),qa:ident(el?.getAttribute('data-qa')),
+        class_name:classMarkers(el),relation:relation(el)});
+    const stateValue=(el,name)=>{
+        if (name === 'class') return classMarkers(el);
+        if (name === 'style') {
+            const style=getComputedStyle(el);
+            return {display:style.display,visibility:style.visibility,pointer_events:style.pointerEvents};
+        }
+        const value=el.getAttribute(name) || '';
+        if (['aria-expanded','aria-hidden','aria-disabled'].includes(name)) return ['true','false'].includes(value) ? value : '';
+        if (name === 'tabindex') return /^-?\d{1,3}$/.test(value) ? value : '';
+        if (name === 'role') return role(el);
+        return '';
+    };
+    const captureMutation=record=>{
+        if (mutationEvents.length >= maxMutations) return;
+        const target=nodeMeta(record.target);
+        let event={phase,type:record.type,elapsed_from_pointer_ms:activationAt === null ? null : Math.round(performance.now()-activationAt),target};
+        if (record.type === 'childList') {
+            const elements=nodes=>[...nodes].filter(node=>node.nodeType === 1);
+            const added=elements(record.addedNodes), removed=elements(record.removedNodes);
+            event={...event,added_node_count:added.length,removed_node_count:removed.length,
+                added_nodes:added.slice(0,4).map(nodeMeta),removed_nodes:removed.slice(0,4).map(nodeMeta)};
+        } else if (record.type === 'attributes' && ['aria-expanded','aria-hidden','aria-disabled','tabindex','role','class','style'].includes(record.attributeName)) {
+            event={...event,attribute_name:record.attributeName,state_value:stateValue(record.target,record.attributeName)};
+        } else return;
+        const key=JSON.stringify(event);
+        if (!mutationKeys.has(key)) { mutationKeys.add(key);mutationEvents.push(event); }
+    };
     const remember=records=>{
         if(records.length) changed=true;
-        for(const record of records) for(const node of [record.target,...record.addedNodes])
+        for(const record of records) {
+            captureMutation(record);
+            for(const node of [record.target,...record.addedNodes])
             if(node.nodeType===1 && changedRoots.size<30) changedRoots.add(node);
+        }
     };
     const observer=new MutationObserver(remember);
     observer.observe(document.documentElement,{subtree:true,childList:true,attributes:true,characterData:true});
@@ -839,24 +878,69 @@ RESUME_DOM_OBSERVER = r'''(trigger, targetResumeId) => {
             const targetOptions=[...document.querySelectorAll('[data-qa]')].filter(el=>el.getAttribute('data-qa') === 'magritte-select-option-'+targetResumeId);
             const visibleTarget=targetOptions.filter(visible);
             const targetLocation=visibleTarget.length === 1 ? (trigger.contains(visibleTarget[0]) ? 'trigger_descendant' : trigger.parentElement?.contains(visibleTarget[0]) ? 'trigger_parent' : 'page_portal') : '';
-            return {trigger:{...meta(trigger),connected:trigger.isConnected,
+            const currentForm=form || document;
+            const active=document.activeElement;
+            const activeMeta={...meta(active),aria_disabled:active?.getAttribute('aria-disabled') === 'true',
+                tabindex:ident(active?.getAttribute('tabindex'))};
+            const dropBases=[...document.querySelectorAll('[data-qa="drop-base"],.magritte-drop-base')].filter(visible);
+            const resumeOptions=[...document.querySelectorAll('label[role="option"][data-magritte-select-option]')].filter(visible);
+            const triggerStyle=getComputedStyle(trigger);
+            const recentMutations=mutationEvents.splice(0,mutationEvents.length);
+            return {trigger:{...meta(trigger),connected:trigger.isConnected,visible:visible(trigger),
+                enabled:!(trigger.matches(':disabled') || trigger.getAttribute('aria-disabled') === 'true'),
+                tabindex:ident(trigger.getAttribute('tabindex')),
+                aria_disabled:trigger.getAttribute('aria-disabled') === 'true',aria_haspopup:ident(trigger.getAttribute('aria-haspopup')),
+                class_markers:classMarkers(trigger),interaction_state:{display:triggerStyle.display,visibility:triggerStyle.visibility,pointer_events:triggerStyle.pointerEvents},
                 aria_expanded:['true','false'].includes(trigger.getAttribute('aria-expanded')) ? trigger.getAttribute('aria-expanded') : null,
                 aria_controls:ident(trigger.getAttribute('aria-controls')),aria_owns:ident(trigger.getAttribute('aria-owns'))},
-                active_element:{tag:document.activeElement?.tagName?.toLowerCase() || '',role:role(document.activeElement)},
+                active_element:activeMeta,
+                magritte_select_layout_count:[...document.querySelectorAll('magritte-select-layout')].filter(visible).length,
+                drop_base_count:dropBases.length,listbox_count:groups.listbox.length,menu_count:groups.menu.length,
+                resume_option_count:resumeOptions.length,dialog_count:[...document.querySelectorAll('[role="dialog"],[aria-modal="true"]')].filter(visible).length,
+                form_count:[...document.querySelectorAll('form')].filter(visible).length,
+                resume_card_count:[...currentForm.querySelectorAll('[role="button"].magritte-card')].filter(visible).length,
+                url_path:location.pathname || '',navigation_type:(performance.getEntriesByType('navigation')[0] || {}).type || '',
                 visible_counts:Object.fromEntries(Object.entries(groups).map(([key,els])=>[key,els.length])),
                 visible_overlay_dialog_count:[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[data-qa*="overlay"],[data-qa*="popup"]')].filter(visible).length,
                 candidate_containers:containers.map(meta),clickable_option_like_count:clickable.size,
                 trigger_descendant_controls:triggerControls(),exact_target_option_count:targetOptions.length,
                 exact_target_option_visible_count:visibleTarget.length,exact_target_option_location:targetLocation,
                 click_hit_test:hitTest(),
-                dom_changed:changed};
+                dom_changed:changed,mutation_event_count:recentMutations.length,mutation_events:recentMutations};
         },
+        set_phase:value=>{ phase=value;if(value === 'pointer_click') activationAt=performance.now(); },
         disconnect:()=>observer.disconnect()
     };
 }'''
 
 
-def _resume_dom_snapshot(observer, snapshots, label, started):
+def _safe_url_path(url):
+    """Keep only a path in diagnostics; query parameters can carry private state."""
+    try:
+        return urlparse(url).path or ''
+    except (TypeError, ValueError):
+        return ''
+
+
+def _resume_dom_snapshot(observer, snapshots, label, started, page=None, navigation=None, initial_path='', form=None):
+    technical = {
+        'snapshot': label,
+        'elapsed_wait_ms': round((time.monotonic() - started) * 1000),
+    }
+    if page is not None:
+        current_path = _safe_url_path(page.url)
+        technical.update(
+            url_path=current_path,
+            url_path_changed=bool(initial_path and current_path != initial_path),
+            navigation_or_reload_observed=bool((navigation or {}).get('observed')),
+        )
+    if form is not None:
+        try:
+            state = _custom_resume_state(form)
+            selected_ids = state.get('selected_ids', [])
+            technical['displayed_resume_id'] = selected_ids[0] if len(selected_ids) == 1 else None
+        except Exception as error:
+            technical['displayed_resume_id_diagnostic_error_type'] = type(error).__name__
     try:
         snapshot=observer.evaluate('(observer)=>observer.snapshot()')
         # Identifiers only; additionally remove anything resembling configured secrets/contacts.
@@ -868,10 +952,11 @@ def _resume_dom_snapshot(observer, snapshots, label, started):
             if isinstance(value,dict): return {key:clean(item) for key,item in value.items()}
             return value
         snapshot=clean(snapshot)
-        snapshot.update(snapshot=label,elapsed_wait_ms=round((time.monotonic()-started)*1000))
+        snapshot.update(technical)
         snapshots.append(snapshot)
     except Exception as error:
-        snapshots.append({'snapshot':label,'diagnostic_error_type':type(error).__name__})
+        technical['diagnostic_error_type'] = type(error).__name__
+        snapshots.append(technical)
 
 
 def _custom_resume_choose(form, resume_id, diagnostics):
@@ -889,6 +974,13 @@ def _custom_resume_choose(form, resume_id, diagnostics):
     handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'trigger','catalog':catalog})
     observer=None
     snapshots=diagnostics.setdefault('dom_snapshots',[])
+    page=form.page
+    initial_path=_safe_url_path(page.url)
+    navigation={'observed':False}
+    def note_navigation(frame):
+        if frame == page.main_frame:
+            navigation['observed'] = True
+    page.on('framenavigated',note_navigation)
     try:
         trigger = handle.as_element()
         if trigger is None:
@@ -896,24 +988,33 @@ def _custom_resume_choose(form, resume_id, diagnostics):
             return False
         try:
             observer=trigger.evaluate_handle(RESUME_DOM_OBSERVER,resume_id)
-            _resume_dom_snapshot(observer,snapshots,'before_click',time.monotonic())
+            diagnostics['displayed_resume_id_before_click'] = (
+                before['selected_ids'][0] if len(before.get('selected_ids',[])) == 1 else None)
+            _resume_dom_snapshot(observer,snapshots,'before_click',time.monotonic(),page,navigation,initial_path,form)
         except Exception as error:
             diagnostics['dom_diagnostic_error_type']=type(error).__name__
+        if observer is not None:
+            try: observer.evaluate("(observer)=>observer.set_phase('pointer_click')")
+            except Exception as error: diagnostics['dom_phase_diagnostic_error_type']=type(error).__name__
         trigger.click(timeout=3000)
         started=time.monotonic()
         deadline = started + 3
-        if observer is not None: _resume_dom_snapshot(observer,snapshots,'immediately_after_click',started)
-        checkpoints=iter((0.5,1.5))
+        diagnostics['activation']='pointer'
+        if observer is not None: _resume_dom_snapshot(observer,snapshots,'immediately_after_click',started,page,navigation,initial_path,form)
+        checkpoints=iter((0.1,0.5,1.5))
         checkpoint=next(checkpoints,None)
         diagnostics['opened'] = _custom_resume_state(form)
-        while not diagnostics['opened'].get('options') and time.monotonic() < deadline:
-            form.page.wait_for_timeout(50)
-            diagnostics['opened'] = _custom_resume_state(form)
-            elapsed=time.monotonic()-started
-            if checkpoint is not None and elapsed>=checkpoint:
-                if observer is not None: _resume_dom_snapshot(observer,snapshots,str(round(checkpoint*1000))+'ms',started)
-                checkpoint=next(checkpoints,None)
-        if observer is not None: _resume_dom_snapshot(observer,snapshots,'wait_finished',started)
+        def wait_for_options(until):
+            nonlocal checkpoint
+            while not diagnostics['opened'].get('options') and time.monotonic() < until:
+                form.page.wait_for_timeout(50)
+                diagnostics['opened'] = _custom_resume_state(form)
+                elapsed=time.monotonic()-started
+                if checkpoint is not None and elapsed>=checkpoint:
+                    if observer is not None: _resume_dom_snapshot(observer,snapshots,str(round(checkpoint*1000))+'ms',started,page,navigation,initial_path,form)
+                    checkpoint=next(checkpoints,None)
+        wait_for_options(deadline)
+        if observer is not None: _resume_dom_snapshot(observer,snapshots,'3000ms',started,page,navigation,initial_path,form)
     finally:
         if observer is not None:
             try: observer.evaluate('(observer)=>observer.disconnect()')
@@ -921,6 +1022,8 @@ def _custom_resume_choose(form, resume_id, diagnostics):
             try: observer.dispose()
             except Exception: pass
         handle.dispose()
+        try: page.remove_listener('framenavigated',note_navigation)
+        except Exception: pass
     handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'option','id':resume_id,'catalog':_resume_catalog()})
     try:
         option = handle.as_element()

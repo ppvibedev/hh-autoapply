@@ -412,21 +412,31 @@ class DOMTests(unittest.TestCase):
                 self.assertEqual(released,[True])
 
     def test_resume_metadata_snapshots_exclude_private_text(self):
-        self.page.set_content('''<form><button type="button" data-qa="resume-trigger" aria-expanded="false"
-          aria-controls="choices" onclick="this.setAttribute('aria-expanded','true');document.getElementById('choices').hidden=false">PRIVATE_RESUME_TEXT</button>
-          <div hidden id="choices" data-qa="dropdown-unrecognised" class="dropdown-shell"><button>person@example.test PRIVATE_RESUME_TEXT</button></div></form>''')
+        self.page.set_content('''<form><magritte-select-layout><div role="button" tabindex="0" class="magritte-card" data-qa="resume-trigger" aria-expanded="false"
+          aria-controls="choices" onclick="this.setAttribute('aria-expanded','true');document.getElementById('choices').hidden=false">PRIVATE_RESUME_TEXT</div></magritte-select-layout>
+          <div hidden id="choices" data-qa="dropdown-unrecognised" class="dropdown-shell"><input value="TOP_SECRET_VALUE"><button>person@example.test PRIVATE_RESUME_TEXT</button></div></form>''')
         diag={}
         with patch('application._custom_resume_state',return_value={'selected_ids':['bbbb'],'popup_found':False,'options':[]}):
             self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diag))
         snapshots=diag['dom_snapshots']
-        self.assertEqual([s['snapshot'] for s in snapshots],['before_click','immediately_after_click','500ms','1500ms','wait_finished'])
+        self.assertEqual([s['snapshot'] for s in snapshots],['before_click','immediately_after_click','100ms','500ms','1500ms','3000ms'])
+        self.assertEqual(diag['reason_code'],'resume_popup_not_opened')
         self.assertEqual(snapshots[0]['trigger']['aria_expanded'],'false')
+        self.assertTrue(snapshots[0]['trigger']['visible'])
+        self.assertTrue(snapshots[0]['trigger']['enabled'])
+        self.assertEqual(snapshots[0]['magritte_select_layout_count'],1)
+        self.assertEqual(snapshots[0]['resume_card_count'],1)
+        self.assertIn('displayed_resume_id',snapshots[0])
+        self.assertIn('navigation_or_reload_observed',snapshots[0])
         self.assertEqual(snapshots[-1]['trigger']['aria_expanded'],'true')
         self.assertTrue(snapshots[-1]['dom_changed'])
         self.assertEqual(snapshots[-1]['visible_counts']['qa_dropdown'],1)
         self.assertGreaterEqual(snapshots[-1]['elapsed_wait_ms'],2900)
+        self.assertTrue(any(snapshot['mutation_event_count'] for snapshot in snapshots))
+        self.assertTrue(any(event['type'] == 'attributes' for snapshot in snapshots for event in snapshot['mutation_events']))
         self.assertNotIn('PRIVATE_RESUME_TEXT',json.dumps(diag))
         self.assertNotIn('person@example.test',json.dumps(diag))
+        self.assertNotIn('TOP_SECRET_VALUE',json.dumps(diag))
 
     def _real_resume_portal(self, update):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>
