@@ -8,6 +8,10 @@ class PrivacyError(ValueError):
 
 def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
     text = str(text or "")
+    # Include disabled and fallback credentials too; never redact only the active key.
+    from llm_connections import credentials
+    forbidden_values = tuple(forbidden_values) + credentials()
+
     # Не пытаться интерпретировать файлы с credentials как профессиональный текст.
     secret = (
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
@@ -22,7 +26,7 @@ def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
         r"https?://[^\s/:]+:[^\s/@]+@|"
         r"[?&](?:api[_-]?key|token|access_token|signature|password|secret)="
     )
-    if re.search(secret, text, re.I) or any(v and len(v) >= 8 and v in text for v in forbidden_values):
+    if re.search(secret, text, re.I) or any(v and v in text for v in forbidden_values):
         raise PrivacyError("technical_secret_detected")
     text = re.sub(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+", "[email удалён]", text)
     # Явно подписанные адреса и контактные каналы, не строки «город/страна».

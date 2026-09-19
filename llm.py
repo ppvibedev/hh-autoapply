@@ -1,93 +1,79 @@
-"""Клиент ИИ для генерации писем и оценки. Claude / OpenAI / YandexGPT / Gemini по ключу.
-
-Ключ и провайдер — в .env (LLM_PROVIDER, LLM_API_KEY, LLM_MODEL). Без SDK,
-чтобы не тянуть зависимости. Если ключа нет или провайдер none — вернёт None,
-вызывающий код должен обработать отсутствие результата.
-"""
-from __future__ import annotations
-
-import requests
-
+"""Shared LLM facade: stable task contract, run-scoped deterministic failover."""
+import time
+import requests  # Compatibility for existing offline patches of llm.requests.post.
 import config
+from llm_connections import DEFAULT_MODEL, load_connections, ConnectionConfigError
+from llm_errors import LLMUnavailable
+from llm_provider import execute
 from privacy import sanitize_candidate_text
 
-DEFAULT_MODEL = {
-    "anthropic": "claude-haiku-4-5-20251001",
-    "openai": "gpt-4o-mini",
-    "yandex": "yandexgpt-lite",
-    "gemini": "gemini-1.5-flash",
-}
+RATE_RETRIES = 1
+DEFAULT_RETRY_DELAY = 2.0
+MAX_RETRY_DELAY = 30.0
+TASKS = frozenset({'matching', 'cover_letter', 'question', 'text'})
 
 
-def generate(prompt: str, max_tokens: int = 600) -> str | None:
-    # Последний барьер для всех существующих путей обращения к модели.
-    prompt = sanitize_candidate_text(prompt, (config.LLM_API_KEY, config.ACCESS_TOKEN))
-    prov = config.LLM_PROVIDER
-    key = config.LLM_API_KEY
-    if prov == "none" or not key:
-        return None
-    model = config.LLM_MODEL or DEFAULT_MODEL.get(prov, "")
+class Router:
+    def __init__(self, connections, sleep=None):
+        self.connections = tuple(connections)
+        self.unavailable = set()
+        self.active = None
+        self.failures = []
+        self.sleep = sleep or time.sleep
 
-    if prov == "anthropic":
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()["content"][0]["text"].strip()
+    def generate(self, prompt, max_tokens=600, task='text'):
+        if task not in TASKS:
+            raise ValueError('llm_task_unsupported')
+        prompt = sanitize_candidate_text(prompt, tuple(c.credential for c in self.connections) + (config.ACCESS_TOKEN,))
+        while True:
+            candidates = [c for c in self.connections if c.usable and c.id not in self.unavailable]
+            if self.active is not None:
+                same = [c for c in candidates if (c.provider, c.model) == (self.active.provider, self.active.model)]
+                candidates = same + [c for c in candidates if c not in same]
+                candidates.sort(key=lambda c: c.id != self.active.id)
+            if not candidates:
+                raise LLMUnavailable(self.failures)
+            connection = candidates[0]
+            self.active = connection
+            for attempt in range(RATE_RETRIES + 1):
+                text, failure = execute(connection, prompt, max_tokens)
+                if failure is None:
+                    return sanitize_candidate_text(text, tuple(c.credential for c in self.connections))
+                self.failures.append(dict(connection_id=connection.id, provider=connection.provider,
+                    task=task, attempt=attempt + 1, **failure.public()))
+                if failure.category not in ('rate_limit_requests', 'rate_limit_tokens', 'rate_limit_unknown') or attempt == RATE_RETRIES:
+                    break
+                delay = failure.retry_delay if failure.retry_delay is not None else DEFAULT_RETRY_DELAY
+                # Never retry earlier than a provider's long delay merely to cap our wait.
+                if delay > MAX_RETRY_DELAY:
+                    break
+                self.sleep(max(1.0, delay))
+            self.unavailable.add(connection.id)
 
-    if prov == "openai":
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
 
-    if prov == "yandex":
-        folder = config.YANDEX_FOLDER_ID
-        model_name = config.LLM_MODEL or DEFAULT_MODEL["yandex"]
-        r = requests.post(
-            "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
-            headers={"Authorization": f"Api-Key {key}", "Content-Type": "application/json"},
-            json={
-                "modelUri": f"gpt://{folder}/{model_name}/latest",
-                "completionOptions": {"stream": False, "temperature": 0.4, "maxTokens": str(max_tokens)},
-                "messages": [{"role": "user", "text": prompt}],
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()["result"]["alternatives"][0]["message"]["text"].strip()
+_router = None
 
-    if prov == "gemini":
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            params={"key": key},
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4},
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-    return None
+def reset_runtime():
+    """A new run starts fresh; persisted enabled flags are never mutated by routing."""
+    global _router
+    _router = None
+
+
+def start_runtime():
+    """Freeze the connection list at run start, before loading private task data."""
+    global _router
+    if _router is None:
+        invalid = False
+        try:
+            connections = load_connections()
+        except ConnectionConfigError:
+            invalid = True
+        if invalid:
+            raise LLMUnavailable([{'provider_error_category': 'connection_config_invalid'}])
+        _router = Router(connections)
+
+
+def generate(prompt: str, max_tokens: int = 600, *, task='text') -> str:
+    start_runtime()
+    return _router.generate(prompt, max_tokens, task)

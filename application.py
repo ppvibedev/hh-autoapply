@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urljoin
 
 import config
+from llm_errors import LLMUnavailable
 from privacy import sanitize_candidate_text, sanitize_exception_message
 
 # Diagnostics retain technical metadata and bounded warning prose, never field values or session data.
@@ -302,7 +303,9 @@ def answer_question(question, vacancy, resume, context='', instructions='', *, d
         'В остальных случаях неподтверждённый ответ=null. Вопрос:\n'
     ) + json.dumps(prompt_question, ensure_ascii=False) + '\n' + decide._context(vacancy, resume, context, instructions)
     try:
-        raw = llm.generate(prompt, max_tokens=650)
+        raw = llm.generate(prompt, max_tokens=650, task="question")
+    except LLMUnavailable:
+        raise
     except Exception:
         raise ValueError('llm_error') from None
     try:
@@ -1230,6 +1233,8 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
             question_diagnostics = {}
             try:
                 answer = answer_question(field,vacancy,resume_text,candidate_text,instructions,diagnostics=question_diagnostics,resume_id=resume_id)
+            except LLMUnavailable:
+                raise
             except Exception as error:
                 codes = {'question_label_unknown':'question_text_not_found',
                          'llm_error':'llm_error',
@@ -1404,6 +1409,8 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
             page.wait_for_timeout(250)
         return finish(application_status='submission_unknown' if sent or not retry_count else 'needs_manual_review',
                     reason='submission_sent_confirmation_missing' if sent else ('submit_transient_error_after_retry' if _transient_error(page,form) else 'submit_retry_request_not_seen') if retry_count else 'submit_request_not_observed')
+    except LLMUnavailable:
+        raise
     except Exception as error:
         return finish(application_status='submission_unknown' if sent else 'needs_manual_review',
                     reason=str(error) if str(error) in ('cover_letter_control_not_found','cover_letter_open_failed','cover_letter_fill_failed','cover_letter_verification_failed') else 'application_flow_error',stage=stage,

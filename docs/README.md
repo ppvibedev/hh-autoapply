@@ -403,3 +403,88 @@ private_answer fill/readback, без записи значения в history и
 контакт из старого кэша не уходил в LLM. Кэш и локальные личные файлы не изменены.
 Проверены два targeted теста на искусственных данных: локальное заполнение без
 утечки и manual при отсутствии контакта у выбранного резюме. HH/LLM не запускались.
+
+## Подключения ИИ и failover (17 сентября 2026)
+
+Общий путь: `decide.score` / `decide.cover_letter` / `application.answer_question`
+→ `llm.generate` → run-scoped `Router` → `llm_provider.execute`.
+Prompts, score/JSON и evidence gates остаются в task modules. Локальные ответы,
+включая Telegram выбранного резюме, по-прежнему обходятся без LLM.
+
+В блоке «Подключения ИИ» доступны список, добавление и включение/выключение.
+После сохранения поле ключа очищается; API возвращает только `credential_configured`.
+Изменения применяются со следующего прогона. Редактирование/удаление/перестановка
+в UI пока отсутствуют; заменить подключение можно добавлением нового и отключением старого.
+
+Хранилище — `private/llm_connections.json`, версия 1, массив `connections`.
+Каждая запись: стабильный `id`, `provider`, `model`, `enabled`, `credential`, `folder_id`.
+Порядок массива задаёт приоритет; новые подключения добавляются в конец.
+Ключи локальны, файл не шифруется, записывается атомарно с правами 0600;
+symlink в пути отвергается. `private/` уже исключён из Git. Runtime-недоступность
+никогда не записывается как `enabled=false`. Не включать этот файл в архивы/публикации.
+
+Если файла нет, `LLM_PROVIDER`, `LLM_MODEL`, `LLM_API_KEY`, `YANDEX_FOLDER_ID`
+представляются одним connection `legacy`. Первое сохранение в новом UI переносит
+его в список и добавляет новую запись, не изменяя `.env`. После этого список —
+источник LLM-настроек; изменения старых LLM-полей `.env` его не переопределяют.
+Явно пустой список не возвращает legacy автоматически. Повреждённый список
+блокирует загрузку router; ключи и сырой JSON не включаются в ошибку.
+
+Routing: текущее доступное подключение → оставшиеся с тем же provider/model
+→ остальные по сохранённому порядку. Disabled, пустой credential и Yandex без
+folder ID пропускаются. Сохранены HTTP-контракты Gemini, Anthropic, OpenAI, YandexGPT.
+Используются только существующие текстовые adapters; работоспособность конкретного
+имени модели и качество другого provider offline-тестами не подтверждаются.
+Все прежние task validation gates остаются обязательными. Невалидный matching JSON
+не является основанием ослабить validation или автоматически перебрать провайдеров.
+
+Gemini HTTP 429 классифицируется по `google.rpc.QuotaFailure.violations[].quotaId`:
+известные GenerateRequests PerDay / PerMinute и GenerateContentInputTokens PerDay /
+PerMinute (с известными FreeTier/PaidTier суффиксами). Дневной тип имеет приоритет
+при нескольких нарушениях. Неизвестные идентификаторы/форматы и human-readable
+message не используются как доказательство дневной квоты; результат — unknown.
+В диагностике остаются нормализованные `quota_types`, а не произвольные идентификаторы,
+quota dimensions, response body, URL или headers. Основа формата:
+[Google RPC error details](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto),
+[Gemini rate limits](https://ai.google.dev/gemini-api/docs/rate-limits).
+
+Централизованная policy в `llm.py`:
+
+- Подтверждённая дневная квота: 0 повторов, unavailable до конца прогона, failover.
+- RPM, TPM и unknown 429: максимум 1 повтор (2 попытки всего на подключение).
+- Без retry metadata: задержка 2 секунды.
+- `RetryInfo.retryDelay` и `Retry-After`: выбирается большая корректная задержка;
+  минимум ожидания 1 секунда, максимум 30 секунд.
+- Если provider просит более 30 секунд, не повторяем раньше срока: сразу failover,
+  подключение unavailable до конца прогона. Reset timestamp не выдумывается.
+- 401/403, 5xx, прочие HTTP, transport и malformed provider envelope различаются;
+  для них дополнительных повторов нет, используется failover.
+
+После исчерпания usable connections возникает `LLMUnavailable`. Она проходит через
+matching, письмо и вопросы (включая optional) до run control. Прогон получает
+`STOPPED / llm_infrastructure_unavailable`, текущая вакансия — manual review;
+следующие вакансии не обрабатываются. В terminal-диагностике есть безопасные
+provider/category/status/task/attempt metadata. После нового прогона availability
+сбрасывается. Сохранённые enabled-флаги не меняются.
+
+Privacy boundary учитывает все загруженные credentials, включая disabled и резервные,
+и проверяет вход/выход общего LLM facade. Сырые requests exceptions не передаются
+в terminal exception. На завершении HTTP-ветки остаётся только безопасная классификация.
+
+Проверки: новые `test_llm_connections`, `test_llm_ui` и связанные targeted task tests
+используют искусственные credentials, временное storage, подмену HTTP/HH и локальный
+Chromium без внешних запросов. Старые optional-тесты
+`test_honest_no_allowed_only_for_experience_question` и
+`test_radio_and_text_before_resume_letter_submit_with_optional_warning` имеют
+воспроизводимые baseline failures на `application.py` из HEAD f43b722; их поведение
+не менялось в этой задаче. Реальные provider calls и HH не запускались.
+
+Безопасная ручная проверка: открыть настройки без запуска прогона, увидеть legacy A,
+добавить B, проверить отметку «ключ сохранён» и пустое поле ключа, отключить/включить B
+и перезагрузить страницу. Это проверяет persistence без расходов API. Даже SAFE-прогон
+может обращаться к LLM: для проверки только настроек его запускать не нужно.
+
+Подключения, routing, privacy boundary и UI покрыты offline-тестами с
+искусственными credentials, HTTP и локальным Chromium. Реальный provider failover
+между сохранёнными подключениями пока не подтверждён и требует отдельного
+контролируемого прогона.

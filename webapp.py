@@ -209,6 +209,31 @@ def api_state():
     })
 
 
+@app.get("/api/llm-connections")
+def api_llm_connections():
+    import llm_connections as connections
+    try:
+        items = connections.load_connections(envfile.read_env())
+        return jsonify({"connections": connections.public_connections(items)})
+    except connections.ConnectionConfigError:
+        return jsonify({"error": "Не удалось прочитать настройки подключений"}), 400
+
+
+@app.post("/api/llm-connections")
+@app.patch("/api/llm-connections/<connection_id>")
+def api_llm_connection_save(connection_id=None):
+    import llm_connections as connections
+    # Same-origin JSON only: no form submissions and no credential reflection.
+    if (not request.is_json or (request.headers.get("Origin")
+            and request.headers["Origin"].rstrip("/") != request.host_url.rstrip("/"))):
+        return jsonify({"error": "Ожидаются настройки подключения"}), 400
+    try:
+        items = connections.save_change(request.get_json(silent=True), envfile.read_env(), connection_id)
+        return jsonify({"ok": True, "connections": items})
+    except (connections.ConnectionConfigError, ValueError, TypeError):
+        return jsonify({"error": "Проверьте провайдера, модель и настройки подключения"}), 400
+
+
 @app.post("/api/config")
 def api_config():
     payload = request.get_json(force=True) or {}

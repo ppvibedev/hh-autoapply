@@ -181,20 +181,25 @@
       <span id="resumesHint" class="muted"></span>
     </div>
 
-    <h2 style="margin-top:20px">ИИ для сопроводительных писем</h2>
-    <div class="grid2">
-      <div><label>Провайдер (LLM_PROVIDER)</label>
-        <select id="LLM_PROVIDER">
-          <option value="yandex">YandexGPT (РФ, без VPN)</option>
-          <option value="gemini">Gemini (Google)</option>
-          <option value="anthropic">Claude (Anthropic)</option>
-          <option value="openai">OpenAI</option>
-          <option value="none">Без ИИ (шаблон)</option>
+    <h2 style="margin-top:20px">Подключения ИИ</h2>
+    <p class="muted">Для анализа вакансий, писем и ответов. Изменения применяются со следующего прогона.
+      Сначала используется первое включённое подключение; при сбое — та же модель того же провайдера, затем остальные по порядку.</p>
+    <div id="llmConnections" class="muted">Загрузка подключений…</div>
+    <button type="button" onclick="document.getElementById('connectionForm').hidden=false">Добавить подключение</button>
+    <div id="connectionForm" hidden style="margin-top:12px">
+      <div class="grid2">
+        <div><label for="connectionProvider">Провайдер</label><select id="connectionProvider" onchange="connectionProviderChanged()">
+          <option value="gemini">Gemini</option><option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option><option value="yandex">YandexGPT</option>
         </select></div>
-      <div><label>Модель (LLM_MODEL) — пусто = дефолт</label><input id="LLM_MODEL" placeholder="yandexgpt-lite / claude-haiku-4-5 / gpt-4o-mini"></div>
-      <div><label>Folder ID (только для YandexGPT)</label><input id="YANDEX_FOLDER_ID" placeholder="b1g..."></div>
-      <div style="grid-column:1/3"><label>API-ключ (LLM_API_KEY)</label>
-        <input id="LLM_API_KEY" type="password" autocomplete="off" placeholder="вставь свой ключ"></div>
+        <div><label for="connectionModel">Модель — пусто = стандартная</label><input id="connectionModel" autocomplete="off"></div>
+        <div><label for="connectionCredential">API-ключ</label><input id="connectionCredential" type="password" autocomplete="off"></div>
+        <div id="connectionFolderRow" hidden><label for="connectionFolder">Folder ID для YandexGPT</label><input id="connectionFolder" autocomplete="off"></div>
+      </div>
+      <p class="muted">Добавляйте только API-доступ. Подписка на чат сама по себе не даёт API-квоту.
+      Два ключа одного проекта могут использовать общую квоту. Другие модели и провайдеры могут отвечать иначе; проверки ответов сохраняются.</p>
+      <button type="button" id="connectionSave" onclick="saveConnection()">Сохранить подключение</button>
+      <button type="button" onclick="clearConnectionForm()">Отмена</button>
     </div>
     <div class="row" style="margin-top:14px">
       <button class="primary" onclick="saveCfg()">Сохранить</button>
@@ -331,8 +336,7 @@ async function refresh(){
       const el = document.getElementById(k); if(el) el.value = v;
     }
   }
-  const keyEl = document.getElementById('LLM_API_KEY');
-  keyEl.placeholder = s.llm_key_set ? 'ключ сохранён — оставь пустым, чтобы не менять' : 'вставь свой ключ';
+
 
   const feed = document.getElementById('feed');
   const sig = JSON.stringify(s.decisions.map(r=>[r.run_id,r.vid,r.decision,r.ts]));
@@ -355,11 +359,68 @@ async function refresh(){
   document.getElementById('runlog').textContent = s.run_log || '—';
 }
 
+function connectionProviderChanged(){
+  document.getElementById('connectionFolderRow').hidden = document.getElementById('connectionProvider').value !== 'yandex';
+}
+function clearConnectionForm(){
+  for(const name of ['Model','Credential','Folder']) document.getElementById('connection'+name).value='';
+  document.getElementById('connectionForm').hidden=true;
+}
+function renderConnections(items){
+  const root=document.getElementById('llmConnections'); root.replaceChildren();
+  if(!items.length) root.textContent='Подключений пока нет.';
+  for(const item of items){
+    const row=document.createElement('div'); row.className='row'; row.style.marginBottom='10px';
+    const label=document.createElement('span'); label.style.flex='1'; label.style.minWidth='180px';
+    label.textContent=`${item.order+1}. ${item.provider} / ${item.model} · ключ ${item.credential_configured?'сохранён':'не задан'}${item.provider==='yandex'&&!item.folder_id?' · нужен Folder ID':''}`;
+    const toggle=document.createElement('input'); toggle.type='checkbox'; toggle.checked=item.enabled;
+    toggle.style.width='auto'; toggle.style.margin='0';
+    toggle.setAttribute('aria-label',`Включить подключение ${item.order+1}`);
+    toggle.onchange=async()=>{
+      toggle.disabled=true;
+      try {
+        const response=await fetch('/api/llm-connections/'+encodeURIComponent(item.id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:toggle.checked})});
+        const data=await response.json(); if(!response.ok) throw new Error();
+        renderConnections(data.connections); showToast('Подключение сохранено; применяется со следующего прогона');
+      } catch { toggle.checked=item.enabled; showToast('Не удалось сохранить подключение','err'); }
+      finally { toggle.disabled=false; }
+    };
+    const state=document.createElement('span'); state.textContent=item.enabled?'Включено':'Отключено';
+    const control=document.createElement('label'); control.style.cssText='display:inline-flex;align-items:center;gap:8px;margin:0';
+    control.append(toggle,state); row.append(label,control); root.append(row);
+  }
+}
+async function loadConnections(){
+  try {
+    const response=await fetch('/api/llm-connections'); const data=await response.json();
+    if(!response.ok) throw new Error(); renderConnections(data.connections);
+  } catch { document.getElementById('llmConnections').textContent='Не удалось прочитать подключения.'; }
+}
+async function saveConnection(){
+  const button=document.getElementById('connectionSave'); button.disabled=true;
+  const secret=document.getElementById('connectionCredential');
+  try {
+    const provider=document.getElementById('connectionProvider').value;
+    if(!secret.value.trim() || (provider==='yandex'&&!document.getElementById('connectionFolder').value.trim())) {
+      showToast('Укажите API-ключ и необходимые настройки провайдера','err'); return;
+    }
+    const pending=fetch('/api/llm-connections',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      provider,model:document.getElementById('connectionModel').value.trim(),credential:secret.value.trim(),
+      folder_id:provider==='yandex'?document.getElementById('connectionFolder').value.trim():'',enabled:true
+    })});
+    secret.value='';
+    const response=await pending; const data=await response.json();
+    if(!response.ok) throw new Error();
+    renderConnections(data.connections); clearConnectionForm(); showToast('Подключение сохранено');
+  } catch { showToast('Не удалось сохранить подключение. Проверьте поля.','err'); }
+  finally { secret.value=''; button.disabled=false; }
+}
+loadConnections();
+
 async function postForm(silent){
   const body = {};
-  document.querySelectorAll('input,select').forEach(el=>{ if(el.id) body[el.id]=el.value; });
+  document.querySelectorAll('input,select').forEach(el=>{ if(el.id && !el.id.startsWith('connection')) body[el.id]=el.value; });
   const d = await postAction('/api/config', silent?null:'Настройки сохранены', body);
-  document.getElementById('LLM_API_KEY').value = '';  // не держим ключ в поле
   cfgTouched = false;
   return d;
 }

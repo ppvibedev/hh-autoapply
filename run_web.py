@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import config
 import decide
+import llm
+from llm_errors import LLMUnavailable
 import hh_web
 from browser import browser_context, has_session
 from candidate_context import load_candidate_context
@@ -46,9 +48,12 @@ def _exception_details(error, stage):
         frames.append({"filename": Path(code.co_filename).name,
                        "line_number": tb.tb_lineno, "function_name": code.co_name})
         tb = tb.tb_next
-    return {"stage": stage,
+    details = {"stage": stage,
             "error_type": type(error).__module__ + "." + type(error).__qualname__,
             "error_message": sanitize_exception_message(error), "traceback_frames": frames}
+    if isinstance(error, LLMUnavailable):
+        details["llm_failures"] = error.failures
+    return details
 
 
 def _log(entry):
@@ -89,6 +94,7 @@ def _get_resume(page, resume_id, on_stage=None):
 def main():
     global _stop_requested
     _stop_requested = False
+    llm.reset_runtime()
     mode = "SAFE" if config.DRY_RUN else "LIVE"
     run_id = uuid4().hex
     counts = {"scanned": 0, "hard_rejected": 0, "score_rejected": 0,
@@ -105,6 +111,7 @@ def main():
         stage = value
 
     try:
+        llm.start_runtime()
         resume_id = hh_web.resume_id_from_url(config.RESUME_URL)
         if not has_session():
             raise ValueError("hh_session_missing")
@@ -223,6 +230,12 @@ def main():
                                         run_status = "STOPPED"
                                     if counts["applied_confirmed"] >= config.TARGET_APPLICATIONS_PER_RUN:
                                         halt, stop_reason = True, "target_reached"
+                    except LLMUnavailable as error:
+                        halt, run_status, stop_reason = True, "STOPPED", "llm_infrastructure_unavailable"
+                        entry.update(_exception_details(error, stage))
+                        entry.update(decision="needs_manual_review", error=stop_reason,
+                                     reason_code=stop_reason, reason="LLM infrastructure unavailable")
+                        counts["manual_review"] += 1
                     except Exception as error:
                         counts["manual_review"] += 1
                         entry.update(_exception_details(error, stage))
@@ -241,6 +254,10 @@ def main():
                     print(f"{mode}: обработано {counts['scanned']}, подготовлено {counts['safe_ready']}", flush=True)
         if _stop_requested:
             run_status, stop_reason = "STOPPED", "user_stop"
+    except LLMUnavailable as error:
+        run_status, stop_reason = "STOPPED", "llm_infrastructure_unavailable"
+        _log(dict(event="run_error", run_id=run_id, reason_code=stop_reason,
+                  **_exception_details(error, stage)))
     except Exception as error:
         run_status, stop_reason = "FAILED", _error_code(error)
         diagnostic = dict(event="run_error", run_id=run_id, **_exception_details(error, stage))
