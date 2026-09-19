@@ -1,6 +1,8 @@
 """Offline HTML only: no HH session, network or external LLM."""
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 import test_safe_mvp
 import application as app
@@ -18,8 +20,6 @@ class DOMTests(unittest.TestCase):
         cls.pw.stop()
 
     def setUp(self):
-        catalog = patch('application._resume_catalog',return_value=[])
-        catalog.start(); self.addCleanup(catalog.stop)
         self.context = self.browser.new_context()
         self.context.route('**/*', lambda route: route.abort())
         self.page = self.context.new_page()
@@ -269,17 +269,28 @@ class DOMTests(unittest.TestCase):
         self.assertEqual(journal,[True]);self.assertEqual(len(requests),1)
         self.assertIn('resumeId=aaaa',requests[0]);model.assert_called_once()
 
-    def test_unique_local_catalog_identity_without_dom_id(self):
-        self.page.set_content('''<div id="response"><div role="button" aria-controls="choices"
-          onclick="document.getElementById('choices').hidden=false">Other role</div>
-          <div role="listbox" id="choices" hidden><div role="option"
-          onclick="document.querySelector('[role=button]').textContent='Target role';this.parentElement.hidden=true">Target role</div></div></div>''')
-        catalog=[{'resume_id':'aaaa','title':'Target role'},{'resume_id':'bbbb','title':'Other role'}]
-        with patch('application._resume_catalog',return_value=catalog):
-            self.assertTrue(app._choose_resume(self.page.locator('#response'),'aaaa',{}))
-            self.assertTrue(app._selected_resume(self.page.locator('#response'),'aaaa'))
-        with patch('application._resume_catalog',return_value=catalog+[{'resume_id':'cccc','title':'Target role'}]):
-            self.assertFalse(app._selected_resume(self.page.locator('#response'),'aaaa'))
+    def test_title_only_resume_never_verifies_identity(self):
+        cases = [
+            # Exact selected title in a unique local catalog entry.
+            ('Target role', [{'resume_id':'aaaa','title':'Target role'}, {'resume_id':'bbbb','title':'Other role'}]),
+            # A visible title that maps uniquely to another local resume.
+            ('Other role', [{'resume_id':'aaaa','title':'Target role'}, {'resume_id':'bbbb','title':'Other role'}]),
+            # An ambiguous local title.
+            ('Target role', [{'resume_id':'aaaa','title':'Target role'}, {'resume_id':'bbbb','title':'Target role'}]),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Path(directory) / 'resumes.json'
+            with patch.object(app.config, 'RESUMES_FILE', str(catalog)):
+                for visible_title, rows in cases:
+                    catalog.write_text(json.dumps(rows), encoding='utf-8')
+                    self.page.set_content(f'''<div id="response"><div role="button" aria-controls="choices"
+                      onclick="document.getElementById('choices').hidden=false">{visible_title}</div>
+                      <div role="listbox" id="choices" hidden><div role="option"
+                      onclick="document.querySelector('[role=button]').textContent='Target role';this.parentElement.hidden=true">Target role</div></div></div>''')
+                    root=self.page.locator('#response')
+                    self.assertFalse(app._selected_resume(root,'aaaa'))
+                    self.assertFalse(app._choose_resume(root,'aaaa',{}))
+                    self.assertFalse(app._selected_resume(root,'aaaa'))
 
     def test_whole_native_form_not_just_resume_letter_footer(self):
         self.page.set_content('''<form><div><p>Какие проекты вы вели?</p><textarea required></textarea></div>

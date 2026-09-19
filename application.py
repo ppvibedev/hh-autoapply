@@ -2,7 +2,6 @@
 import json
 import re
 import time
-from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urljoin
 
 import config
@@ -703,11 +702,7 @@ CUSTOM_RESUME = r'''(form, action) => {
         const optionId = node.matches('label[role="option"][data-magritte-select-option]')
             ? (node.getAttribute('data-qa') || '').match(/^magritte-select-option-([0-9a-f]+)$/i) : null;
         if (optionId) return [optionId[1]];
-        const direct = directIds(node);
-        if (direct.length) return direct;
-        const text = (node.type === 'radio' ? [...(node.labels || [])].map(label => label.innerText).join(' ') : node.innerText || node.textContent || '').replace(/\s+/g,' ').trim();
-        const matches = (action.catalog || []).filter(item => item.title === text);
-        return matches.length === 1 ? [matches[0].resume_id] : [];
+        return directIds(node);
     };
     let block = heading ? heading.parentElement : form, triggers = [];
     while (block) {
@@ -763,20 +758,8 @@ CUSTOM_RESUME = r'''(form, action) => {
 }'''
 
 
-def _resume_catalog():
-    """Existing locally loaded HH list only; duplicate titles are never identity evidence."""
-    try:
-        rows = json.loads(Path(config.RESUMES_FILE).read_text())
-        if not isinstance(rows,list): return []
-        valid = [dict(resume_id=row['resume_id'],title=' '.join(row['title'].split()))
-                 for row in rows if isinstance(row,dict) and isinstance(row.get('title'),str)
-                 and isinstance(row.get('resume_id'),str) and re.fullmatch(r'[0-9a-f]+',row['resume_id'])]
-        return [row for row in valid if row['title'] and sum(other['title'] == row['title'] for other in valid) == 1]
-    except (OSError,ValueError,AttributeError): return []
-
-
 def _custom_resume_state(form):
-    value = form.evaluate(CUSTOM_RESUME, {'kind':'probe','catalog':_resume_catalog()})
+    value = form.evaluate(CUSTOM_RESUME, {'kind':'probe'})
     return value if isinstance(value,dict) else {}
 
 
@@ -965,13 +948,12 @@ def _custom_resume_choose(form, resume_id, diagnostics):
     if before.get('selected_ids') == [resume_id]:
         diagnostics['after'] = before
         return _selected_resume(form,resume_id)
-    catalog=_resume_catalog()
     try:
-        trigger_diagnostics=form.evaluate(CUSTOM_RESUME, {'kind':'trigger_diagnostics','id':resume_id,'catalog':catalog})
+        trigger_diagnostics=form.evaluate(CUSTOM_RESUME, {'kind':'trigger_diagnostics','id':resume_id})
         if isinstance(trigger_diagnostics,dict): diagnostics['trigger_diagnostics']=trigger_diagnostics
     except Exception as error:
         diagnostics['trigger_diagnostic_error_type']=type(error).__name__
-    handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'trigger','catalog':catalog})
+    handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'trigger'})
     observer=None
     snapshots=diagnostics.setdefault('dom_snapshots',[])
     page=form.page
@@ -1024,7 +1006,7 @@ def _custom_resume_choose(form, resume_id, diagnostics):
         handle.dispose()
         try: page.remove_listener('framenavigated',note_navigation)
         except Exception: pass
-    handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'option','id':resume_id,'catalog':_resume_catalog()})
+    handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'option','id':resume_id})
     try:
         option = handle.as_element()
         if option is None:
