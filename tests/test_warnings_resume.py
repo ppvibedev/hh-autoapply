@@ -15,11 +15,22 @@ class WarningResumeTests(unittest.TestCase):
         dialogs.count.side_effect=lambda:int(state['open'])
         dialogs.nth.return_value=dialog
         dialog.inner_text.return_value=text
-        dialog.locator.return_value.count.return_value=0
+        dialog_empty=MagicMock(); dialog_empty.count.return_value=0
+        dialog.locator.return_value=dialog_empty
+        empty=MagicMock(); empty.count.return_value=0
         button=dialog.get_by_role.return_value
         button.count.return_value=1; button.is_enabled.return_value=True
         button.click.side_effect=lambda **kw:state.update(open=False)
-        empty=MagicMock(); empty.count.return_value=0
+        # get_by_role is also used to look for an optional cover-letter toggle.
+        # Only the exact, known warning confirmation control exists in this fixture.
+        def get_by_role(role, *, name=None, exact=False):
+            if role != 'button': return empty
+            if text == COUNTRY and hasattr(name,'fullmatch') and name.fullmatch('Все равно откликнуться'):
+                return button
+            if text == LANGUAGE and name == 'Откликнуться' and exact:
+                return button
+            return empty
+        dialog.get_by_role.side_effect=get_by_role
         page.locator.side_effect=lambda selector: forms if selector==application.FORM_SELECTOR else dialogs if selector=='[role="dialog"]:visible, [data-qa="modal"]:visible' else empty
         return page,dialog,form,button
 

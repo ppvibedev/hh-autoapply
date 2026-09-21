@@ -41,7 +41,14 @@ class LiveTests(unittest.TestCase):
                 prompt=model.call_args.args[0]
                 for text in (Q['question'],VAC['description'],'Опыт 3 года','Кейс','Инструкции'):
                     self.assertIn(text,prompt)
-                for option in options: self.assertIn(option['value'],prompt)
+                if kind in ('radio','select-one'):
+                    # Raw DOM values are employer-controlled.  The prompt receives aliases
+                    # and answer_question restores the exact value only after validation.
+                    for i, option in enumerate(options):
+                        self.assertIn('__hh_option_'+str(i),prompt)
+                        self.assertNotIn('"value": "'+option['value']+'"',prompt)
+                else:
+                    for option in options: self.assertIn(option['value'],prompt)
 
     def test_unknown_required_answer_and_llm_errors(self):
         for raw in (None, 'garbage', '{}', '{"answer":null}',json.dumps({'answer':'10','evidence':'invented'})):

@@ -47,13 +47,12 @@ class OptionalQuestionTests(unittest.TestCase):
                 self.assertEqual(stages,(['warning'] if warning_text else [])+['question','question','resume','letter'])
                 submit.click.assert_called_once()
 
-    def test_honest_no_allowed_only_for_experience_question(self):
+    def test_unsupported_no_without_evidence_blocks(self):
         raw=json.dumps({'answer':'no','basis':'experience_not_confirmed','evidence':''})
-        with patch('llm.generate',return_value=raw):
-            result=application.answer_question(RADIO,test_live.VAC,test_live.FACT)
-            self.assertEqual(result['answer'],'no')
-            with self.assertRaises(ValueError):
-                application.answer_question(dict(RADIO,question='Есть ли у вас разрешение на работу?'),test_live.VAC,test_live.FACT)
+        with patch('llm.generate',return_value=raw), self.assertRaisesRegex(ValueError,'question_evidence_missing'):
+            application.answer_question(RADIO,test_live.VAC,test_live.FACT)
+        with patch('llm.generate',return_value=raw), self.assertRaisesRegex(ValueError,'personal_fact_unavailable'):
+            application.answer_question(dict(RADIO,question='Есть ли у вас разрешение на работу?'),test_live.VAC,test_live.FACT)
         with patch('llm.generate',return_value=json.dumps({'answer':'yes','basis':'experience_not_confirmed','evidence':''})), self.assertRaises(ValueError):
             application.answer_question(RADIO,test_live.VAC,test_live.FACT)
 

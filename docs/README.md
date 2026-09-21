@@ -479,13 +479,11 @@ Privacy boundary учитывает все загруженные credentials, �
 и проверяет вход/выход общего LLM facade. Сырые requests exceptions не передаются
 в terminal exception. На завершении HTTP-ветки остаётся только безопасная классификация.
 
-Проверки: новые `test_llm_connections`, `test_llm_ui` и связанные targeted task tests
+Проверки: `test_llm_connections`, `test_llm_ui` и связанные targeted task tests
 используют искусственные credentials, временное storage, подмену HTTP/HH и локальный
-Chromium без внешних запросов. Старые optional-тесты
-`test_honest_no_allowed_only_for_experience_question` и
-`test_radio_and_text_before_resume_letter_submit_with_optional_warning` имеют
-воспроизводимые baseline failures на `application.py` из HEAD f43b722; их поведение
-не менялось в этой задаче. Реальные provider calls и HH не запускались.
+Chromium без внешних запросов. Fixtures вопросов требуют exact evidence, а варианты
+radio/select передают в LLM только защищённые aliases вместо raw DOM values. Реальные
+provider calls и HH не запускаются.
 
 Безопасная ручная проверка: открыть настройки без запуска прогона, увидеть legacy A,
 добавить B, проверить отметку «ключ сохранён» и пустое поле ключа, отключить/включить B
