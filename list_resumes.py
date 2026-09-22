@@ -3,12 +3,12 @@
 Запускается дашбордом по кнопке «Обновить список резюме». Нужна сохранённая сессия.
 """
 import json
-import os
 import sys
 import time
 
 import config
 from browser import browser_context, has_session
+from resume_metadata import write_resume_metadata
 
 
 def main() -> int:
@@ -46,9 +46,7 @@ def main() -> int:
             seen.add(rid)
             out.append({"resume_id": rid, "url": f"https://hh.ru/resume/{rid}", "title": title})
 
-    os.makedirs("state", exist_ok=True)
-    with open(config.RESUMES_FILE, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False)
+    write_resume_metadata(out)
     print(f"Резюме найдено: {len(out)}")
     return 0
 

@@ -18,7 +18,7 @@ from hh_client import HHClient
 import llm
 import run_web
 from privacy import sanitize_candidate_text, PrivacyError
-from resume_metadata import selected_resume_title
+from resume_metadata import selected_resume_title, write_resume_metadata
 
 RESULT = dict(
     score=85, capability_score=85, decision='possible_match',
@@ -69,16 +69,92 @@ class SafeTests(unittest.TestCase):
                     client.negotiate(vacancy_id='1', resume_id='aaaa', message='test')
             post.assert_not_called()
 
-    def test_cache_is_by_resume_id(self):
+    def test_selected_resume_refreshes_same_id_once_and_replaces_stale_cache(self):
         folder = Path(config.RESUME_CACHE_DIR); folder.mkdir()
-        (folder/'bbbb.txt').write_text('Commercial director')
-        with patch('hh_web.load_resume_text', return_value='Project manager') as read:
-            self.assertEqual(run_web._get_resume(None, 'aaaa'), 'Project manager')
+        (folder/'aaaa.txt').write_text('Stale project manager')
+        with patch('hh_web.load_resume_text', return_value='Current project manager') as read:
+            self.assertEqual(run_web._get_resume(None, 'aaaa'), 'Current project manager')
             read.assert_called_once()
-        with patch.object(config, 'RESUME_URL', 'https://hh.ru/resume/bbbb'), patch('hh_web.load_resume_text') as read:
-            self.assertEqual(run_web._get_resume(None, 'bbbb'), 'Commercial director')
-            read.assert_not_called()
-        self.assertEqual((folder/'aaaa.txt').read_text(), 'Project manager')
+        self.assertEqual((folder/'aaaa.txt').read_text(), 'Current project manager')
+
+    def test_resume_metadata_replacement_never_exposes_partial_final_file(self):
+        catalog = Path(config.RESUMES_FILE)
+        old = [{'title': 'Old title', 'url': config.RESUME_URL}]
+        new = [{'title': 'New title', 'url': config.RESUME_URL}]
+        catalog.write_text(json.dumps(old), encoding='utf-8')
+        real_replace = os.replace
+
+        def replace_after_reader(temporary, target):
+            self.assertEqual(json.loads(catalog.read_text(encoding='utf-8')), old)
+            self.assertEqual(Path(temporary).parent, catalog.parent)
+            real_replace(temporary, target)
+
+        with patch('resume_metadata.os.replace', side_effect=replace_after_reader):
+            write_resume_metadata(new)
+        self.assertEqual(json.loads(catalog.read_text(encoding='utf-8')), new)
+
+    def test_missing_selected_resume_metadata_stops_before_scan_or_matching(self):
+        Path(config.RESUMES_FILE).write_text('[]', encoding='utf-8')
+        rows = []
+        with patch('run_web.has_session', return_value=True), \
+             patch('run_web.browser_context') as browser, \
+             patch('hh_web.search_page') as search, \
+             patch('decide.score') as score, \
+             patch('run_web._log', side_effect=rows.append):
+            self.assertEqual(run_web.main(), 1)
+        browser.assert_not_called(); search.assert_not_called(); score.assert_not_called()
+        error = next(row for row in rows if row.get('event') == 'run_error')
+        self.assertEqual(error['stage'], 'resume_metadata_preflight')
+        self.assertEqual(error['reason_code'], 'selected_resume_title_unavailable')
+
+    def test_selected_resume_content_failure_stops_before_scan_or_matching(self):
+        browser = MagicMock(); browser.__enter__.return_value = (None, MagicMock())
+        rows = []
+        with patch('run_web.has_session', return_value=True), \
+             patch('run_web.browser_context', return_value=browser), \
+             patch('hh_web.load_resume_text', side_effect=ValueError('resume_content_empty')), \
+             patch('hh_web.search_page') as search, \
+             patch('decide.score') as score, \
+             patch('run_web._log', side_effect=rows.append):
+            self.assertEqual(run_web.main(), 1)
+        search.assert_not_called(); score.assert_not_called()
+        error = next(row for row in rows if row.get('event') == 'run_error')
+        self.assertEqual(error['stage'], 'resume_refresh')
+        self.assertEqual(error['reason_code'], 'resume_content_empty')
+
+    def test_run_keeps_selected_metadata_snapshot_after_catalog_refresh(self):
+        browser = MagicMock(); browser.__enter__.return_value = (None, MagicMock())
+
+        def refreshed_resume(*_args, **_kwargs):
+            Path(config.RESUMES_FILE).write_text(json.dumps([
+                {'title': 'Changed title', 'url': config.RESUME_URL}
+            ]), encoding='utf-8')
+            return 'Current resume facts'
+
+        with patch('run_web.has_session', return_value=True), \
+             patch('run_web.browser_context', return_value=browser), \
+             patch('run_web._get_resume', side_effect=refreshed_resume), \
+             patch('hh_web.search_page', return_value=[dict(VAC)]), \
+             patch('hh_web.load_full', side_effect=lambda page, vac: vac), \
+             patch('decide.hard_filters', return_value=None), \
+             patch('decide.score', return_value=RESULT) as score, \
+             patch('decide.cover_letter', return_value='Letter'):
+            self.assertEqual(run_web.main(), 0)
+        self.assertEqual(score.call_args.kwargs['resume_title'], 'Project Manager')
+
+    def test_selected_resume_refreshes_once_before_all_vacancies(self):
+        browser = MagicMock(); browser.__enter__.return_value = (None, MagicMock())
+        second = dict(VAC, id='987654321')
+        with patch('run_web.has_session', return_value=True), \
+             patch('run_web.browser_context', return_value=browser), \
+             patch('run_web._get_resume', return_value='Current resume facts') as resume, \
+             patch('hh_web.search_page', return_value=[dict(VAC), second]), \
+             patch('hh_web.load_full', side_effect=lambda page, vac: vac), \
+             patch('decide.hard_filters', return_value=None), \
+             patch('decide.score', return_value=RESULT), \
+             patch('decide.cover_letter', return_value='Letter'):
+            self.assertEqual(run_web.main(), 0)
+        resume.assert_called_once()
 
     def test_missing_context_matching(self):
         with patch.object(candidate_context, 'CONTEXT_DIR', self.root/'absent'):

@@ -5,6 +5,7 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import secrets
 from pathlib import Path
@@ -153,17 +154,15 @@ def _log(entry):
 
 def _get_resume(page, resume_id, on_stage=None):
     if on_stage:
-        on_stage("resume_cache_read")
+        on_stage("resume_refresh")
     if hh_web.resume_id_from_url(config.RESUME_URL) != resume_id:
         raise ValueError("resume_identity_mismatch")
     folder = Path(config.RESUME_CACHE_DIR)
     path = folder / f"{resume_id}.txt"
     if folder.is_symlink() or path.is_symlink():
         raise ValueError("resume_cache_symlink_not_allowed")
-    if path.exists():
-        text = path.read_text(encoding="utf-8").strip()
-        if text:
-            return sanitize_candidate_text(text, (config.LLM_API_KEY, config.ACCESS_TOKEN))
+    # A same-ID HH resume can be edited. Refresh exactly once at run preflight;
+    # the returned in-memory value is the immutable snapshot for this run.
     text = hh_web.load_resume_text(page, config.RESUME_URL, on_stage=on_stage)
     if not text.strip():
         raise ValueError("resume_content_empty")
@@ -171,7 +170,19 @@ def _get_resume(page, resume_id, on_stage=None):
         on_stage("resume_cache_write")
     folder.mkdir(parents=True, exist_ok=True)
     text = sanitize_candidate_text(text, (config.LLM_API_KEY, config.ACCESS_TOKEN))
-    path.write_text(text, encoding="utf-8")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
     return text
 
 
@@ -205,6 +216,10 @@ def main():
             raise ValueError("invalid_run_settings")
         if config.PAUSE_SECONDS < 0 or config.TARGET_APPLICATIONS_PER_RUN < 1:
             raise ValueError("invalid_run_settings")
+        mark_stage("resume_metadata_preflight")
+        resume_title = selected_resume_title(resume_id)
+        if not resume_title:
+            raise ValueError("selected_resume_title_unavailable")
         instructions, materials = load_candidate_context()
         if mode == "LIVE" and Path(config.DECISIONS_LOG).exists():
             for line in Path(config.DECISIONS_LOG).read_text(encoding="utf-8").splitlines():
@@ -237,7 +252,6 @@ def main():
         seen_this_run = set()  # SAFE не использует и не меняет старый seen.json.
         with browser_context(on_stage=mark_stage) as (_, page):
             resume_text = _get_resume(page, resume_id, on_stage=mark_stage)
-            resume_title = selected_resume_title(resume_id)
             for page_num in range(config.PAGES_PER_RUN):
                 if _stop_requested or halt:
                     break
@@ -364,7 +378,8 @@ def main():
                   **_exception_details(error, stage)))
     except Exception as error:
         run_status, stop_reason = "FAILED", _error_code(error)
-        diagnostic = dict(event="run_error", run_id=run_id, **_exception_details(error, stage))
+        diagnostic = dict(event="run_error", run_id=run_id, reason_code=stop_reason,
+                          **_exception_details(error, stage))
         _log(diagnostic)
         print(json.dumps(diagnostic, ensure_ascii=False), flush=True)
         print("Прогон остановлен:", stop_reason, flush=True)

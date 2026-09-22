@@ -2,12 +2,33 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
 import config
 from privacy import sanitize_candidate_text
+
+
+def write_resume_metadata(rows: list[dict], path: str | None = None) -> None:
+    """Publish a complete resume catalog in one filesystem replacement."""
+    target = Path(path or config.RESUMES_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(rows, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _resume_id(url: object) -> str | None:
