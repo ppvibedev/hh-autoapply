@@ -484,20 +484,24 @@ quota dimensions, response body, URL или headers. Основа формата
 
 - Подтверждённая дневная квота: 0 повторов, unavailable до конца прогона, failover.
 - RPM, TPM и unknown 429: максимум 1 повтор (2 попытки всего на подключение).
+- `provider_server_error` (включая HTTP 503), `provider_transport_timeout` и
+  `provider_transport_connection`: максимум 1 повтор на том же подключении.
 - Без retry metadata: задержка 2 секунды.
 - `RetryInfo.retryDelay` и `Retry-After`: выбирается большая корректная задержка;
   минимум ожидания 1 секунда, максимум 30 секунд.
 - Если provider просит более 30 секунд, не повторяем раньше срока: сразу failover,
   подключение unavailable до конца прогона. Reset timestamp не выдумывается.
-- 401/403, 5xx, прочие HTTP, transport и malformed provider envelope различаются;
-  для них дополнительных повторов нет, используется failover.
+- 401/403, прочие HTTP, общий `provider_transport_error` и malformed provider
+  envelope не получают дополнительный повтор, используется failover.
 
 После исчерпания usable connections возникает `LLMUnavailable`. Она проходит через
 matching, письмо и вопросы (включая optional) до run control. Прогон получает
 `STOPPED / llm_infrastructure_unavailable`, текущая вакансия — manual review;
 следующие вакансии не обрабатываются. В terminal-диагностике есть безопасные
-provider/category/status/task/attempt metadata. После нового прогона availability
-сбрасывается. Сохранённые enabled-флаги не меняются.
+provider/category/status/task/attempt metadata, признак запланированного повтора и
+его безопасная задержка. Успешное восстановление сохраняется в записи вакансии как
+`llm_routing`: без prompt, ответа, credentials и private data. После нового прогона
+availability сбрасывается. Сохранённые enabled-флаги не меняются.
 
 Privacy boundary учитывает все загруженные credentials, включая disabled и резервные,
 и проверяет вход/выход общего LLM facade. Сырые requests exceptions не передаются
@@ -516,8 +520,8 @@ provider calls и HH не запускаются.
 
 Подключения, routing, privacy boundary и UI покрыты offline-тестами с
 искусственными credentials, HTTP и локальным Chromium. Реальный provider failover
-между сохранёнными подключениями пока не подтверждён и требует отдельного
-контролируемого прогона.
+между сохранёнными подключениями подтверждён отдельными LIVE-прогонами; повторная
+обработка transient failure также покрыта offline-тестами.
 
 ## Role alignment matching (18 сентября 2026)
 

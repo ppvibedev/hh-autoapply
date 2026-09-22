@@ -392,6 +392,9 @@ def main():
                         entry.update(decision="needs_manual_review", error=_error_code(error),
                                      reason_code=_error_code(error),
                                      reason=f"{stage}: {_error_code(error)}; требуется проверка.")
+                    routing_events = llm.consume_routing_events()
+                    if routing_events:
+                        entry["llm_routing"] = routing_events
                     try:
                         _log(entry)
                     except ValueError:
