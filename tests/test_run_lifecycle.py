@@ -32,6 +32,8 @@ class RunLifecycleTests(unittest.TestCase):
         with patch.object(webapp, "_proc", proc):
             result = webapp._kill_all_runs()
         self.assertEqual(result["status"], "in_memory_stop_requested")
+        self.assertEqual(result["delivery_path"], "in_memory_process")
+        self.assertTrue(result["delivery_accepted"])
         self.assertTrue(result["stopped"])
         proc.terminate.assert_called_once()
 
@@ -44,6 +46,7 @@ class RunLifecycleTests(unittest.TestCase):
         with patch.object(webapp, "_proc", None), patch("webapp._pid_alive", return_value=True), patch("webapp.os.kill") as kill:
             result = webapp._kill_all_runs()
         self.assertEqual(result["status"], "recovered_stop_requested")
+        self.assertEqual(result["delivery_path"], "authenticated_control_socket")
         self.assertTrue(result["stopped"])
         self.assertTrue(run_web._stop_requested)
         kill.assert_not_called()
@@ -119,3 +122,42 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["status"], "worker_identity_not_verified")
         self.assertFalse(response.get_json()["stopped"])
+
+    def test_stop_api_persists_safe_receipt_and_delivery_events(self):
+        state = self.state(token="TOP_SECRET_CONTROL_TOKEN_12345678901234567890")
+        self.write_state(state)
+        proc = MagicMock(); proc.poll.return_value = None
+        with patch.object(webapp, "_proc", proc):
+            response = webapp.app.test_client().post("/api/stop")
+        self.assertEqual(response.status_code, 200)
+        rows = [json.loads(line) for line in Path(config.DECISIONS_LOG).read_text(encoding="utf-8").splitlines()]
+        events = [row for row in rows if row.get("event", "").startswith("stop_")]
+        self.assertEqual([row["event"] for row in events], [
+            "stop_requested_by_user", "stop_api_received", "stop_delivery_path", "stop_delivery_result"])
+        self.assertTrue(events[1]["in_memory_process_exists"])
+        self.assertTrue(events[-1]["delivery_accepted"])
+        self.assertNotIn("TOP_SECRET_CONTROL_TOKEN", json.dumps(events))
+
+    def test_worker_acknowledgement_and_observation_are_durable(self):
+        captured = []
+        previous = (run_web._active_run_id, run_web._active_stage,
+                    run_web._worker_stop_ack_logged, run_web._worker_stop_observed_logged,
+                    run_web._stop_requested)
+        self.addCleanup(lambda: setattr(run_web, "_active_run_id", previous[0]))
+        self.addCleanup(lambda: setattr(run_web, "_active_stage", previous[1]))
+        self.addCleanup(lambda: setattr(run_web, "_worker_stop_ack_logged", previous[2]))
+        self.addCleanup(lambda: setattr(run_web, "_worker_stop_observed_logged", previous[3]))
+        self.addCleanup(lambda: setattr(run_web, "_stop_requested", previous[4]))
+        run_web._active_run_id = "b" * 32; run_web._active_stage = "matching"
+        run_web._worker_stop_ack_logged = False; run_web._worker_stop_observed_logged = False
+        run_web._stop_requested = False
+        with patch("run_web._log", side_effect=captured.append):
+            run_web._request_stop()
+            self.assertTrue(run_web._observe_stop())
+        self.assertEqual([row["event"] for row in captured], ["worker_stop_acknowledged", "worker_stop_observed"])
+        self.assertTrue(all(row["run_id"] == "b" * 32 for row in captured))
+
+    def test_stop_ui_reports_request_not_completion(self):
+        source = Path("web/index.html").read_text(encoding="utf-8")
+        self.assertIn("Остановка запрошена; ожидаю завершения прогона", source)
+        self.assertNotIn("postAction('/api/stop','Прогон остановлен')", source)

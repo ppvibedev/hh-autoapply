@@ -23,6 +23,10 @@ from candidate_context import load_candidate_context
 from privacy import sanitize_candidate_text, sanitize_record, sanitize_exception_message
 
 _stop_requested = False
+_active_run_id = None
+_active_stage = "run_setup"
+_worker_stop_ack_logged = False
+_worker_stop_observed_logged = False
 
 
 class _RunControl:
@@ -78,6 +82,7 @@ class _RunControl:
                         continue
                     if request["action"] == "stop":
                         _request_stop()
+                        _worker_stop_acknowledged("authenticated_control_socket")
                         connection.sendall(b'{"ok":true,"status":"stop_requested"}')
                     else:
                         connection.sendall(b'{"ok":true,"status":"active"}')
@@ -107,6 +112,27 @@ def _write_run_state(path, run_id, token):
 def _request_stop(*_):
     global _stop_requested
     _stop_requested = True
+
+
+def _worker_stop_acknowledged(source="worker_signal"):
+    global _worker_stop_ack_logged
+    if _worker_stop_ack_logged or not _active_run_id:
+        return
+    _worker_stop_ack_logged = True
+    _log({"event": "worker_stop_acknowledged", "run_id": _active_run_id,
+          "stage": _active_stage, "source": source})
+
+
+def _observe_stop():
+    global _worker_stop_observed_logged
+    if not _stop_requested:
+        return False
+    _worker_stop_acknowledged()
+    if not _worker_stop_observed_logged and _active_run_id:
+        _worker_stop_observed_logged = True
+        _log({"event": "worker_stop_observed", "run_id": _active_run_id,
+              "stage": _active_stage})
+    return True
 
 
 def _error_code(error):
@@ -187,11 +213,15 @@ def _get_resume(page, resume_id, on_stage=None):
 
 
 def main():
-    global _stop_requested
+    global _stop_requested, _active_run_id, _active_stage, _worker_stop_ack_logged, _worker_stop_observed_logged
     _stop_requested = False
     llm.reset_runtime()
     mode = "SAFE" if config.DRY_RUN else "LIVE"
     run_id = uuid4().hex
+    _active_run_id = run_id
+    _active_stage = "run_setup"
+    _worker_stop_ack_logged = False
+    _worker_stop_observed_logged = False
     counts = {"scanned": 0, "hard_rejected": 0, "score_rejected": 0,
               "safe_ready": 0, "manual_review": 0, "applied_confirmed": 0,
               "apply_failed": 0, "submission_unknown": 0, "already_applied": 0, "apply_attempted": 0}
@@ -205,7 +235,9 @@ def main():
     stage = "run_setup"
     def mark_stage(value):
         nonlocal stage
+        global _active_stage
         stage = value
+        _active_stage = value
 
     try:
         llm.start_runtime()
@@ -253,7 +285,7 @@ def main():
         with browser_context(on_stage=mark_stage) as (_, page):
             resume_text = _get_resume(page, resume_id, on_stage=mark_stage)
             for page_num in range(config.PAGES_PER_RUN):
-                if _stop_requested or halt:
+                if _observe_stop() or halt:
                     break
                 mark_stage("search_start")
                 vacs = hh_web.search_page(page, text=config.SEARCH_QUERY, area=config.AREA,
@@ -263,7 +295,7 @@ def main():
                     stop_reason = "no_results_or_page_not_recognized"
                     break
                 for vac in vacs:
-                    if _stop_requested:
+                    if _observe_stop():
                         break
                     vid = str(vac.get("id", ""))
                     if not vid.isdigit() or vid in seen_this_run:
@@ -290,7 +322,7 @@ def main():
                         else:
                             mark_stage("vacancy_open")
                             full = hh_web.load_full(page, vac)
-                            if _stop_requested:
+                            if _observe_stop():
                                 break
                             mark_stage("matching")
                             result = decide.score(full, resume_text, materials, instructions,
@@ -317,7 +349,7 @@ def main():
                             elif result["score"] < config.SCORE_THRESHOLD:
                                 counts["score_rejected"] += 1
                                 entry["decision"] = "rejected_score"
-                            elif not _stop_requested:
+                            elif not _observe_stop():
                                 mark_stage("cover_letter")
                                 entry["letter"] = decide.cover_letter(full, resume_text, materials, instructions)
                                 if mode == "SAFE":
@@ -334,7 +366,7 @@ def main():
                                     outcome = hh_web.apply(page, full, entry["letter"], dry_run=False,
                                         resume_url=config.RESUME_URL, resume_text=resume_text,
                                         candidate_text=materials, instructions=instructions,
-                                        stopped=lambda: _stop_requested, before_submit=before_submit)
+                                        stopped=_observe_stop, before_submit=before_submit)
                                     entry.update(outcome)
                                     status = outcome["application_status"]
                                     entry["decision"] = status
@@ -370,7 +402,7 @@ def main():
                     if halt:
                         break
                     print(f"{mode}: обработано {counts['scanned']}, подготовлено {counts['safe_ready']}", flush=True)
-        if _stop_requested:
+        if _observe_stop():
             run_status, stop_reason = "STOPPED", "user_stop"
     except LLMUnavailable as error:
         run_status, stop_reason = "STOPPED", "llm_infrastructure_unavailable"
@@ -395,6 +427,8 @@ def main():
             pass
         if control is not None:
             control.close()
+        _active_run_id = None
+        _active_stage = "run_setup"
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
     return 1 if run_status == "FAILED" else 0

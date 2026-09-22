@@ -440,7 +440,14 @@ async function run(){
   if(d) showToast('Настройки применены к этому прогону', 'ok');
   refresh();
 }
-async function stop(){ await postAction('/api/stop','Прогон остановлен'); refresh(); }
+async function stop(){
+  const d = await postAction('/api/stop', null);
+  if(!d) return;
+  if(d.status === 'already_stopped') showToast('Прогон уже остановлен', 'ok');
+  else if(d.delivery_accepted) showToast('Остановка запрошена; ожидаю завершения прогона…');
+  else showToast('Не удалось передать запрос остановки', 'err');
+  refresh();
+}
 async function reset(){
   if(!confirm('Очистить историю: ленту решений и список уже просмотренных вакансий?')) return;
   await postAction('/api/reset','История очищена'); refresh();

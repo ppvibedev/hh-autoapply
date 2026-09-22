@@ -1177,11 +1177,41 @@ def _validation_diagnostics(form):
     """Only structural validity flags; never field values or browser messages."""
     return form.evaluate(r'''root => ({invalid_fields:
         [...root.querySelectorAll('input,textarea,select')]
-        .filter(el=>el.getClientRects().length && !el.disabled && !el.checkValidity())
+        .filter(el=>!el.disabled && !el.checkValidity())
         .map(el=>({tag:el.tagName.toLowerCase(),type:el.type,required:el.required,
-                  value_missing:el.validity.valueMissing,pattern_mismatch:el.validity.patternMismatch,
-                  too_long:el.validity.tooLong,type_mismatch:el.validity.typeMismatch})),
+                  checked:['checkbox','radio'].includes(el.type) ? el.checked : null,
+                  disabled:el.disabled,visible:el.getClientRects().length > 0,readonly:el.readOnly,
+                  name_category:el.name ? (/^resume(?:Id|_id)?$/i.test(el.name) ? 'resume' : 'named') : 'unnamed',
+                  belongs_to_application_form:root.contains(el),
+                  value_missing:el.validity.valueMissing,type_mismatch:el.validity.typeMismatch,
+                  pattern_mismatch:el.validity.patternMismatch,too_long:el.validity.tooLong,
+                  too_short:el.validity.tooShort,range_underflow:el.validity.rangeUnderflow,
+                  range_overflow:el.validity.rangeOverflow,step_mismatch:el.validity.stepMismatch,
+                  bad_input:el.validity.badInput,custom_error:el.validity.customError,valid:el.validity.valid})),
         visible_error_count:root.querySelectorAll('[aria-invalid="true"], [data-qa="vacancy-response-error"]').length})''')
+
+
+def _form_scope_diagnostics(form, parsed_question_count, candidate_response_form_count):
+    """Counts only; no labels, values, answers or arbitrary DOM text."""
+    data = form.evaluate(r'''(root, input) => {
+        const fields=[...root.querySelectorAll('input,textarea,select')];
+        const visible=el=>el.getClientRects().length>0;
+        const isResume=el=>['resumeId','resume_id','resume'].includes(el.name)
+            || (el.type==='radio' && [...(el.labels||[])].some(label=>label.querySelector('a[href*="/resume/"]')));
+        const isLetter=el=>el.matches('[data-qa="vacancy-response-popup-form-letter-input"]');
+        const questionLike=fields.filter(el=>!el.disabled&&!isResume(el)&&!isLetter(el));
+        return {selected_scope_tag:root.tagName.toLowerCase(),candidate_response_form_count:input.candidates,
+            parsed_question_count:input.parsed,question_block_count:root.querySelectorAll('[data-qa*="question"],fieldset').length,
+            input_count:root.querySelectorAll('input').length,textarea_count:root.querySelectorAll('textarea').length,
+            select_count:root.querySelectorAll('select').length,checkbox_count:root.querySelectorAll('input[type="checkbox"]').length,
+            radio_count:root.querySelectorAll('input[type="radio"]').length,
+            required_control_count:fields.filter(el=>el.required||el.getAttribute('aria-required')==='true').length,
+            invalid_control_count:fields.filter(el=>!el.disabled&&!el.checkValidity()).length,
+            question_like_control_count:questionLike.length,
+            question_like_controls_unparsed:questionLike.length>0&&input.parsed===0,
+            visible_question_like_control_count:questionLike.filter(visible).length};
+    }''', {'parsed': parsed_question_count, 'candidates': candidate_response_form_count})
+    return data if isinstance(data, dict) else {}
 
 
 def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidate_text='',
@@ -1312,6 +1342,8 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         if comboboxes and not (comboboxes == 1 and form.evaluate(CUSTOM_RESUME,{'kind':'combobox'}) is True):
             return finish(reason='unsupported_custom_control')
         fields = form.evaluate(INSPECT_FORM)
+        result['form_scope_diagnostics'] = _form_scope_diagnostics(
+            form, len(fields), page.locator(FORM_SELECTOR).count())
         for field in fields:
             if stopped(): return finish(reason='user_stop_before_submit')
             safe_question = sanitize_candidate_text(field.get('question',''),(config.LLM_API_KEY,config.ACCESS_TOKEN))
@@ -1377,8 +1409,19 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         stage = 'apply_validate'
         if form.locator('iframe:visible').count() or page.locator('[data-qa*="captcha"]:visible').count():
             return finish(reason='captcha_or_external_form')
-        if not _selected_resume(form,resume_id) or not form.evaluate("(form) => form.checkValidity ? form.checkValidity() : [...form.querySelectorAll('input,textarea,select')].every(el => el.checkValidity())"):
-            return finish(reason='required_fields_or_resume_invalid',validation_diagnostics=_validation_diagnostics(form))
+        resume_matches_at_validation = _selected_resume(form, resume_id)
+        form_check_validity = form.evaluate("(form) => form.checkValidity ? form.checkValidity() : [...form.querySelectorAll('input,textarea,select')].every(el => el.checkValidity())") is True
+        result['validation_predicates'] = {"resume_matches_at_validation": resume_matches_at_validation,
+                                           "form_check_validity": form_check_validity}
+        if not resume_matches_at_validation or not form_check_validity:
+            if not resume_matches_at_validation and not form_check_validity:
+                validation_reason = 'resume_and_form_invalid_at_validation'
+            elif not resume_matches_at_validation:
+                validation_reason = 'resume_invalid_at_validation'
+            else:
+                validation_reason = 'form_invalid_at_validation'
+            return finish(reason='required_fields_or_resume_invalid',validation_reason_code=validation_reason,
+                          validation_diagnostics=_validation_diagnostics(form))
         if letters.input_value() != letter: return finish(reason='letter_changed')
         submit = form.locator(SUBMIT_SELECTOR)
         if submit.count() == 0:

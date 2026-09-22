@@ -160,6 +160,32 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(result['application_status'],'needs_manual_review'); submit.click.assert_not_called()
         self.assertEqual(order,[])
 
+    def test_apply_validate_records_each_predicate_and_blocks_submit(self):
+        for resume_ok, form_ok, expected in (
+            (True, True, None),
+            (False, True, 'resume_invalid_at_validation'),
+            (True, False, 'form_invalid_at_validation'),
+            (False, False, 'resume_and_form_invalid_at_validation'),
+        ):
+            with self.subTest(resume_ok=resume_ok, form_ok=form_ok):
+                page,form,letter,submit,route,journal,order,fill,model=self.fixture(signal='applied_confirmed')
+                def evaluate(js,*args):
+                    if js == application.INSPECT_FORM: return []
+                    if 'form.checkValidity' in js: return form_ok
+                    return True
+                form.evaluate.side_effect=evaluate
+                with patch('application._selected_resume',return_value=resume_ok), \
+                     patch('application._validation_diagnostics',return_value={'invalid_fields':[]}):
+                    result=application.apply(page,VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal)
+                if expected is None:
+                    self.assertEqual(result['application_status'],'applied_confirmed')
+                else:
+                    self.assertEqual(result['reason_code'],'required_fields_or_resume_invalid')
+                    self.assertEqual(result['validation_reason_code'],expected)
+                    self.assertEqual(result['validation_predicates'],{
+                        'resume_matches_at_validation':resume_ok,'form_check_validity':form_ok})
+                    submit.click.assert_not_called()
+
     def test_safe_does_not_touch_browser(self):
         page=MagicMock()
         result=application.apply(page,VAC,'letter',resume_id='aaaa',dry_run=True)

@@ -389,10 +389,20 @@ class DOMTests(unittest.TestCase):
     def test_validation_diagnostics_never_include_values(self):
         self.page.set_content('<form><input required><input type="email" value="private-invalid"><textarea required hidden></textarea></form>')
         info=app._validation_diagnostics(self.page.locator('form'))
-        self.assertEqual(len(info['invalid_fields']),2)
+        self.assertEqual(len(info['invalid_fields']),3)
         self.assertTrue(info['invalid_fields'][0]['value_missing'])
         self.assertTrue(info['invalid_fields'][1]['type_mismatch'])
+        self.assertFalse(info['invalid_fields'][2]['visible'])
         self.assertNotIn('private',str(info))
+
+    def test_form_scope_diagnostics_show_unparsed_question_like_controls_without_text(self):
+        self.page.set_content('<form><fieldset><textarea required></textarea><input type="checkbox" required></fieldset><input name="resumeId" value="aaaa"></form>')
+        info=app._form_scope_diagnostics(self.page.locator('form'), 0, 1)
+        self.assertEqual(info['selected_scope_tag'],'form')
+        self.assertEqual(info['parsed_question_count'],0)
+        self.assertTrue(info['question_like_controls_unparsed'])
+        self.assertEqual(info['required_control_count'],2)
+        self.assertNotIn('aaaa',str(info))
 
     def test_known_warnings_text_add_letter_before_submit(self):
         from playwright.sync_api import Route

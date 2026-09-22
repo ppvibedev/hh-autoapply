@@ -14,6 +14,7 @@ import re
 import socket
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -69,6 +70,21 @@ def _read_decisions(limit: int = 100) -> list[dict]:
 _pending_after_run = None
 _display_run_id = None
 _active_mode = "SAFE"
+
+
+def _log_stop_telemetry(event, *, run_id=None, **fields):
+    """Durable, technical-only stop lifecycle evidence; never includes control tokens."""
+    entry = {"event": event, "ts": datetime.now(timezone.utc).isoformat()}
+    if isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id):
+        entry["run_id"] = run_id
+    entry.update(fields)
+    entry = sanitize_record(entry)
+    path = Path(config.DECISIONS_LOG)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _current_run_rows():
@@ -203,29 +219,37 @@ def _kill_all_runs() -> dict:
     if _running():
         try:
             _proc.terminate()
-            return {"ok": True, "stopped": True, "status": "in_memory_stop_requested"}
+            return {"ok": True, "stopped": True, "status": "in_memory_stop_requested",
+                    "delivery_path": "in_memory_process", "delivery_accepted": True}
         except ProcessLookupError:
-            return {"ok": True, "stopped": False, "status": "already_stopped"}
+            return {"ok": True, "stopped": False, "status": "already_stopped",
+                    "delivery_path": "already_dead", "delivery_accepted": False}
     state = _read_run_state()
     if state is None:
         legacy_pid = _legacy_run_pid()
         if legacy_pid is not None and _pid_alive(legacy_pid):
-            return {"ok": False, "stopped": False, "status": "worker_identity_not_verified"}
+            return {"ok": False, "stopped": False, "status": "worker_identity_not_verified",
+                    "delivery_path": "no_verified_worker", "delivery_accepted": False}
         if os.path.exists(config.RUN_PID_FILE):
             _remove_run_state()
-        return {"ok": True, "stopped": False, "status": "already_stopped"}
+        return {"ok": True, "stopped": False, "status": "already_stopped",
+                "delivery_path": "already_dead", "delivery_accepted": False}
     if not _pid_alive(state["pid"]):
         _remove_run_state(state)
-        return {"ok": True, "stopped": False, "status": "already_stopped"}
+        return {"ok": True, "stopped": False, "status": "already_stopped",
+                "delivery_path": "already_dead", "delivery_accepted": False}
     response = _control_request(state, "stop")
     if response.get("ok") is True and response.get("status") == "stop_requested":
-        return {"ok": True, "stopped": True, "status": "recovered_stop_requested"}
+        return {"ok": True, "stopped": True, "status": "recovered_stop_requested",
+                "delivery_path": "authenticated_control_socket", "delivery_accepted": True}
     # A live PID without token-authenticated control may be unrelated or an old worker.
     # Preserve it rather than risking a signal to an arbitrary process.
     if not _pid_alive(state["pid"]):
         _remove_run_state(state)
-        return {"ok": True, "stopped": False, "status": "already_stopped"}
-    return {"ok": False, "stopped": False, "status": "worker_identity_not_verified"}
+        return {"ok": True, "stopped": False, "status": "already_stopped",
+                "delivery_path": "already_dead", "delivery_accepted": False}
+    return {"ok": False, "stopped": False, "status": "worker_identity_not_verified",
+            "delivery_path": "no_verified_worker", "delivery_accepted": False}
 
 
 def _login_running() -> bool:
@@ -446,7 +470,17 @@ def api_reset():
 @app.post("/api/stop")
 def api_stop():
     """Request a graceful stop only from a known or authenticated worker."""
+    state = _read_run_state()
+    run_id = state.get("run_id") if state else None
+    _log_stop_telemetry("stop_requested_by_user", run_id=run_id)
+    _log_stop_telemetry("stop_api_received", run_id=run_id,
+                        in_memory_process_exists=_running(), durable_worker_state_exists=state is not None)
     result = _kill_all_runs()
+    _log_stop_telemetry("stop_delivery_path", run_id=run_id,
+                        delivery_path=result.get("delivery_path", "other"))
+    _log_stop_telemetry("stop_delivery_result", run_id=run_id,
+                        delivery_status=result.get("status", "other"),
+                        delivery_accepted=result.get("delivery_accepted") is True)
     if not result["ok"]:
         return jsonify({"ok": False, "stopped": False,
                         "error": "Нельзя безопасно подтвердить фоновый прогон; сигнал не отправлен",
