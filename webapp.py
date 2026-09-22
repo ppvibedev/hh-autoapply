@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
+from pathlib import Path
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
@@ -114,20 +117,66 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _run_pid() -> int | None:
-    """PID активного прогона из PID-файла, если процесс реально жив. Стейл-файл чистим."""
-    if not os.path.exists(config.RUN_PID_FILE):
-        return None
+def _read_run_state():
+    """Read v2 durable state. Legacy/invalid state is never process identity."""
+    path = Path(config.RUN_PID_FILE)
     try:
-        pid = int(open(config.RUN_PID_FILE, encoding="utf-8").read().strip())
-    except (ValueError, OSError):
+        raw = path.read_text(encoding="utf-8")
+        if len(raw) > 2048:
+            return None
+        state = json.loads(raw)
+    except (OSError, ValueError, TypeError):
         return None
-    if _pid_alive(pid):
-        return pid
-    try:  # мёртвый PID — убрать стейл-файл
-        os.remove(config.RUN_PID_FILE)
+    if not isinstance(state, dict):
+        return None
+    pid, run_id, token = state.get("pid"), state.get("run_id"), state.get("control_token")
+    if (state.get("version") != 2 or not isinstance(pid, int) or pid <= 1
+            or not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id)
+            or not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token)):
+        return None
+    return {"pid": pid, "run_id": run_id, "control_token": token}
+
+
+def _legacy_run_pid():
+    """A numeric pre-v2 PID is liveness-only state, never proof of ownership."""
+    try:
+        raw = Path(config.RUN_PID_FILE).read_text(encoding="utf-8")
+        return int(raw) if re.fullmatch(r"[1-9][0-9]{0,9}", raw) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _remove_run_state(state=None):
+    """Only remove the exact durable v2 state we previously read."""
+    path = Path(config.RUN_PID_FILE)
+    try:
+        if state is None:
+            path.unlink()
+            return True
+        current = _read_run_state()
+        if current == state:
+            path.unlink()
+            return True
     except OSError:
         pass
+    return False
+
+
+def _run_pid() -> int | None:
+    """A live PID blocks a new run; dead or invalid state is safely discarded."""
+    state = _read_run_state()
+    if state is None:
+        # A live legacy PID cannot be authenticated, but must not be cleared while
+        # it could still belong to a genuine pre-v2 worker.
+        legacy_pid = _legacy_run_pid()
+        if legacy_pid is not None and _pid_alive(legacy_pid):
+            return legacy_pid
+        if os.path.exists(config.RUN_PID_FILE):
+            _remove_run_state()
+        return None
+    if _pid_alive(state["pid"]):
+        return state["pid"]
+    _remove_run_state(state)
     return None
 
 
@@ -136,10 +185,47 @@ def _any_run_alive() -> bool:
     return _run_pid() is not None
 
 
-def _kill_all_runs() -> None:
-    """Остановить только свой процесс: он завершит текущую операцию и сохранит итог."""
+def _control_request(state, action):
+    """A successful response proves the current worker holds this state's token."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.75)
+            client.connect(config.RUN_CONTROL_SOCKET)
+            client.sendall(json.dumps({"action": action, "token": state["control_token"]}).encode("utf-8"))
+            response = json.loads(client.recv(1024).decode("utf-8"))
+        return response if isinstance(response, dict) else {}
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return {}
+
+
+def _kill_all_runs() -> dict:
+    """Stop in-memory worker or an authenticated recovered worker; never signal PID state."""
     if _running():
-        _proc.terminate()
+        try:
+            _proc.terminate()
+            return {"ok": True, "stopped": True, "status": "in_memory_stop_requested"}
+        except ProcessLookupError:
+            return {"ok": True, "stopped": False, "status": "already_stopped"}
+    state = _read_run_state()
+    if state is None:
+        legacy_pid = _legacy_run_pid()
+        if legacy_pid is not None and _pid_alive(legacy_pid):
+            return {"ok": False, "stopped": False, "status": "worker_identity_not_verified"}
+        if os.path.exists(config.RUN_PID_FILE):
+            _remove_run_state()
+        return {"ok": True, "stopped": False, "status": "already_stopped"}
+    if not _pid_alive(state["pid"]):
+        _remove_run_state(state)
+        return {"ok": True, "stopped": False, "status": "already_stopped"}
+    response = _control_request(state, "stop")
+    if response.get("ok") is True and response.get("status") == "stop_requested":
+        return {"ok": True, "stopped": True, "status": "recovered_stop_requested"}
+    # A live PID without token-authenticated control may be unrelated or an old worker.
+    # Preserve it rather than risking a signal to an arbitrary process.
+    if not _pid_alive(state["pid"]):
+        _remove_run_state(state)
+        return {"ok": True, "stopped": False, "status": "already_stopped"}
+    return {"ok": False, "stopped": False, "status": "worker_identity_not_verified"}
 
 
 def _login_running() -> bool:
@@ -359,10 +445,13 @@ def api_reset():
 
 @app.post("/api/stop")
 def api_stop():
-    """Попросить свой процесс завершиться с сохранением истории."""
-    was_alive = _running()
-    _kill_all_runs()
-    return jsonify({"ok": True, "stopped": was_alive})
+    """Request a graceful stop only from a known or authenticated worker."""
+    result = _kill_all_runs()
+    if not result["ok"]:
+        return jsonify({"ok": False, "stopped": False,
+                        "error": "Нельзя безопасно подтвердить фоновый прогон; сигнал не отправлен",
+                        "status": result["status"]}), 409
+    return jsonify(result)
 
 
 @app.get("/api/areas")

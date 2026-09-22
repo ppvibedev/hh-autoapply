@@ -3,7 +3,10 @@ import json
 import os
 import re
 import signal
+import socket
 import sys
+import threading
+import secrets
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -19,6 +22,85 @@ from candidate_context import load_candidate_context
 from privacy import sanitize_candidate_text, sanitize_record, sanitize_exception_message
 
 _stop_requested = False
+
+
+class _RunControl:
+    """Authenticated local control endpoint; it never exposes run data."""
+    def __init__(self, path, token):
+        self.path = Path(path)
+        self.token = token
+        self.server = None
+        self.thread = None
+        self.closed = False
+
+    def start(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # macOS has a small sun_path limit. Refuse before durable state is written.
+        if len(os.fsencode(str(self.path.resolve()))) >= 100:
+            raise ValueError("run_control_socket_path_too_long")
+        # A socket can only be left by an already-dead worker: the exclusive run
+        # state is created immediately afterwards, before work begins.
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.server.bind(str(self.path))
+        except OSError:
+            self.server.close()
+            self.server = None
+            raise
+        self.path.chmod(0o600)
+        self.server.listen(2)
+        self.server.settimeout(0.2)
+        self.thread = threading.Thread(target=self._serve, name="run-control", daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while not self.closed:
+            try:
+                connection, _ = self.server.accept()
+            except (TimeoutError, socket.timeout):
+                continue
+            except OSError:
+                return
+            with connection:
+                try:
+                    raw = connection.recv(1024)
+                    request = json.loads(raw.decode("utf-8"))
+                    allowed = (isinstance(request, dict)
+                               and secrets.compare_digest(str(request.get("token", "")), self.token)
+                               and request.get("action") in ("probe", "stop"))
+                    if not allowed:
+                        connection.sendall(b'{"ok":false}')
+                        continue
+                    if request["action"] == "stop":
+                        _request_stop()
+                        connection.sendall(b'{"ok":true,"status":"stop_requested"}')
+                    else:
+                        connection.sendall(b'{"ok":true,"status":"active"}')
+                except (OSError, UnicodeError, ValueError, TypeError):
+                    try: connection.sendall(b'{"ok":false}')
+                    except OSError: pass
+
+    def close(self):
+        self.closed = True
+        if self.server is not None:
+            try: self.server.close()
+            except OSError: pass
+        if self.thread is not None:
+            self.thread.join(timeout=0.5)
+        try: self.path.unlink()
+        except FileNotFoundError: pass
+
+
+def _write_run_state(path, run_id, token):
+    state = {"version": 2, "pid": os.getpid(), "run_id": run_id, "control_token": token}
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(state, stream, separators=(",", ":"))
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _request_stop(*_):
@@ -104,6 +186,8 @@ def main():
               "apply_failed": 0, "submission_unknown": 0, "already_applied": 0, "apply_attempted": 0}
     stop_reason, run_status = "pages_exhausted", "COMPLETED"
     pid_path = Path(config.RUN_PID_FILE)
+    control = None
+    token = None
     previous_handlers = {}
     blocked_vacancies = {}
     halt = False
@@ -134,10 +218,17 @@ def main():
                     blocked_vacancies[str(previous.get("vacancy_id"))] = status
                 # Unknown submissions stay blocked even if later records look benign.
 
-        pid_path.parent.mkdir(parents=True, exist_ok=True)
-        # Один процесс; не перезаписывать файл чужого активного прогона.
-        with pid_path.open("x", encoding="utf-8") as stream:
-            stream.write(str(os.getpid()))
+        # The socket starts before durable state becomes visible. A recovered
+        # dashboard can therefore authenticate the worker without signalling a PID.
+        token = secrets.token_urlsafe(32)
+        control = _RunControl(config.RUN_CONTROL_SOCKET, token)
+        control.start()
+        try:
+            _write_run_state(pid_path, run_id, token)
+        except Exception:
+            control.close()
+            control = None
+            raise
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous_handlers[sig] = signal.signal(sig, _request_stop)
         _log({"event": "run_started", "run_id": run_id, "mode": mode,
@@ -280,8 +371,15 @@ def main():
     finally:
         _log({"event": "run_finished", "run_id": run_id, "mode": mode, "status": run_status,
               "stop_reason": stop_reason, "counts": counts})
-        if pid_path.exists() and pid_path.read_text().strip() == str(os.getpid()):
-            pid_path.unlink()
+        try:
+            if pid_path.exists():
+                state = json.loads(pid_path.read_text(encoding="utf-8"))
+                if token and isinstance(state, dict) and state.get("pid") == os.getpid() and state.get("control_token") == token:
+                    pid_path.unlink()
+        except (OSError, ValueError, TypeError):
+            pass
+        if control is not None:
+            control.close()
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
     return 1 if run_status == "FAILED" else 0

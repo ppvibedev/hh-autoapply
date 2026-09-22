@@ -36,6 +36,8 @@ class SafeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] / 'work')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.control_socket = f"/tmp/hh-autoapply-{os.getpid()}-{id(self)}.sock"
+        self.addCleanup(lambda: Path(self.control_socket).unlink(missing_ok=True))
         storage = patch('llm_connections.STORAGE_PATH', self.root/'llm_connections.json')
         storage.start(); self.addCleanup(storage.stop)
         llm.reset_runtime(); self.addCleanup(llm.reset_runtime)
@@ -43,6 +45,7 @@ class SafeTests(unittest.TestCase):
             RESUMES_FILE=str(self.root/'resume-list.json'),
             RESUME_URL='https://hh.ru/resume/aaaa', RESUME_CACHE_DIR=str(self.root/'resumes'),
             DECISIONS_LOG=str(self.root/'history.jsonl'), RUN_PID_FILE=str(self.root/'run.pid'),
+            RUN_CONTROL_SOCKET=self.control_socket,
             PAGES_PER_RUN=1, PAUSE_SECONDS=0, TARGET_APPLICATIONS_PER_RUN=1, SCORE_THRESHOLD=80)
         self.settings.start(); self.addCleanup(self.settings.stop)
         Path(config.RESUMES_FILE).write_text(
@@ -206,6 +209,7 @@ class SafeTests(unittest.TestCase):
         self.assertEqual(decisions[0]['url'],VAC['url']); self.assertEqual(decisions[0]['vacancy_id'],VAC['id'])
         self.assertTrue(all(r['application_status']=='safe_not_sent' for r in decisions))
         self.assertFalse(Path(config.RUN_PID_FILE).exists())
+        self.assertFalse(Path(config.RUN_CONTROL_SOCKET).exists())
 
     def test_non_aligned_role_is_manual_and_keeps_original_matching_result(self):
         mismatch = dict(RESULT, role_alignment='functional_mismatch',

@@ -85,7 +85,8 @@ RESUMES_FILE = "state/resumes.json"    # список твоих резюме с
 
 # Браузерная автоматизация (Playwright)
 SESSION_FILE = "state/session.json"    # сохранённая залогиненная сессия hh.ru
-RUN_PID_FILE = "state/run.pid"         # PID активного прогона (точная проверка «идёт ли»)
+RUN_PID_FILE = "state/run.pid"         # Durable JSON state active run (ignored runtime data).
+RUN_CONTROL_SOCKET = "state/r.sock"  # Authenticated local stop channel for the active worker.
 HEADLESS = os.getenv("HEADLESS", "0") == "1"  # 0 = видимый браузер (нужно для капчи)
 PAGES_PER_RUN = _int("PAGES_PER_RUN", 3)      # сколько страниц выдачи разбирать
 PAUSE_SECONDS = _int("PAUSE_SECONDS", 6)      # пауза между действиями (антибот)
