@@ -525,6 +525,20 @@ provider/category/status/task/attempt metadata, признак запланир�
 `llm_routing`: без prompt, ответа, credentials и private data. После нового прогона
 availability сбрасывается. Сохранённые enabled-флаги не меняются.
 
+Каждая LLM-операция дополнительно пишет безопасные timing events в общий JSONL:
+начало/завершение операции и provider attempt, фактическую длительность attempt,
+плановую и фактическую длительность retry wait, failover либо exhaustion. События
+связаны случайным `operation_id`, `run_id` и безопасным `vacancy_context_id`; в них
+есть только task, connection/provider/model и нормализованная ошибка. Prompt, ответ
+модели, резюме, вакансия, письмо, employer answer, headers и credentials не пишутся.
+Ошибка записи timing event игнорируется и не меняет результат LLM-вызова.
+
+Текущий `requests` получает scalar `timeout=60`. Это одно значение для connect и
+read timeout, а не общий 60-секундный deadline всей операции или полного ответа:
+read timeout ограничивает интервал ожидания данных от сокета. Диагностика различает
+`connect`, `read` и общий timeout, сохраняя прежнюю retry-категорию
+`provider_transport_timeout` и не меняя timeout/retry policy.
+
 Privacy boundary учитывает все загруженные credentials, включая disabled и резервные,
 и проверяет вход/выход общего LLM facade. Сырые requests exceptions не передаются
 в terminal exception. На завершении HTTP-ветки остаётся только безопасная классификация.

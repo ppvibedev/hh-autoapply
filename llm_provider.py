@@ -12,10 +12,14 @@ def execute(connection, prompt, max_tokens):
         return text, None
     except requests.HTTPError as error:
         failure = classify_http(connection.provider, error.response) if error.response is not None else ProviderFailure('provider_http_error')
+    except requests.ConnectTimeout:
+        failure = ProviderFailure('provider_transport_timeout', transport_phase='connect')
+    except requests.ReadTimeout:
+        failure = ProviderFailure('provider_transport_timeout', transport_phase='read')
     except requests.Timeout:
-        failure = ProviderFailure('provider_transport_timeout')
+        failure = ProviderFailure('provider_transport_timeout', transport_phase='generic')
     except requests.ConnectionError:
-        failure = ProviderFailure('provider_transport_connection')
+        failure = ProviderFailure('provider_transport_connection', transport_phase='connection')
     except requests.RequestException:
         failure = ProviderFailure('provider_transport_error')
     except (ValueError, KeyError, IndexError, TypeError, AttributeError):

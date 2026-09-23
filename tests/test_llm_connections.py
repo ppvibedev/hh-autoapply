@@ -42,6 +42,17 @@ def connection(index=1, provider='gemini', model='model-x', enabled=True, folder
     return Connection(f'{index:032x}', provider, model, enabled, f'SECRET_{chr(64+index)}', folder_id)
 
 
+class FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
 class ConnectionTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
@@ -65,6 +76,134 @@ class ConnectionTests(unittest.TestCase):
         with patch('llm.requests.post', return_value=response()) as post:
             router.generate('facts'); router.generate('facts')
             self.assertEqual([c.kwargs['params']['key'] for c in post.call_args_list], ['SECRET_A']*2)
+
+    def test_first_attempt_success_has_operation_and_attempt_timing(self):
+        clock=FakeClock(); events=[]
+        router=llm.Router([connection()],clock=clock,telemetry=events.append,
+                          operation_id_factory=lambda:'operation-1')
+        private_response='PRIVATE_MODEL_RESPONSE'
+        def request(*_args,**_kwargs):
+            clock.advance(0.125)
+            return response(body={'candidates':[{'content':{'parts':[{'text':private_response}]}}]})
+        with patch('llm.requests.post',side_effect=request):
+            self.assertEqual(router.generate('PRIVATE_RESUME_TEXT',task='matching'),private_response)
+        self.assertEqual([event['event'] for event in events],[
+            'llm_operation_started','llm_attempt_started','llm_attempt_finished','llm_operation_finished'])
+        attempt=events[2]; finished=events[3]
+        self.assertEqual(attempt['duration_ms'],125)
+        self.assertEqual(attempt['outcome'],'success')
+        self.assertEqual(attempt['model'],'model-x')
+        self.assertEqual(finished['duration_ms'],125)
+        self.assertEqual(finished['total_provider_attempt_count'],1)
+        self.assertEqual(finished['final_connection_id'],connection().id)
+        public=json.dumps(events)
+        for private in ('PRIVATE_RESUME_TEXT',private_response,'SECRET_A','?key='):
+            self.assertNotIn(private,public)
+
+    def test_503_retry_timing_separates_provider_and_wait(self):
+        clock=FakeClock(); events=[]; replies=[response(503),response()]
+        def request(*_args,**_kwargs):
+            clock.advance(0.1 if len(replies)==2 else 0.2)
+            return replies.pop(0)
+        def sleep(delay):
+            self.assertEqual(delay,2.0)
+            clock.advance(2.25)
+        router=llm.Router([connection()],clock=clock,sleep=sleep,telemetry=events.append,
+                          operation_id_factory=lambda:'operation-2')
+        with patch('llm.requests.post',side_effect=request):
+            self.assertEqual(router.generate('facts'),'OK')
+        attempts=[event for event in events if event['event']=='llm_attempt_finished']
+        self.assertEqual([(event['attempt'],event['outcome'],event['duration_ms']) for event in attempts],
+                         [(1,'failure',100),(2,'success',200)])
+        self.assertTrue(attempts[0]['retry_allowed'])
+        started=next(event for event in events if event['event']=='llm_retry_wait_started')
+        finished=next(event for event in events if event['event']=='llm_retry_wait_finished')
+        self.assertEqual(started['requested_delay_ms'],2000)
+        self.assertEqual(finished['requested_delay_ms'],2000)
+        self.assertEqual(finished['actual_duration_ms'],2250)
+        operation=next(event for event in events if event['event']=='llm_operation_finished')
+        self.assertEqual(operation['duration_ms'],2550)
+        self.assertEqual(operation['total_provider_attempt_count'],2)
+
+    def test_timeout_retry_timing_distinguishes_transport_phase(self):
+        cases=((requests.ConnectTimeout(),'connect'),(requests.ReadTimeout(),'read'),
+               (requests.Timeout(),'generic'))
+        for error,phase in cases:
+            with self.subTest(phase=phase):
+                clock=FakeClock(); events=[]; calls=0
+                def request(*_args,**_kwargs):
+                    nonlocal calls
+                    calls+=1; clock.advance(0.3)
+                    if calls==1: raise error
+                    return response()
+                router=llm.Router([connection()],clock=clock,sleep=lambda delay:clock.advance(delay),
+                                  telemetry=events.append)
+                with patch('llm.requests.post',side_effect=request):
+                    self.assertEqual(router.generate('facts'),'OK')
+                attempts=[event for event in events if event['event']=='llm_attempt_finished']
+                self.assertEqual(len(attempts),2)
+                self.assertEqual(attempts[0]['provider_error_category'],'provider_transport_timeout')
+                self.assertEqual(attempts[0]['transport_phase'],phase)
+                self.assertTrue(attempts[0]['retry_allowed'])
+                self.assertEqual(attempts[1]['outcome'],'success')
+
+    def test_timing_records_exhaustion_failover_and_success(self):
+        clock=FakeClock(); events=[]; replies=[response(503),response(503),response()]
+        def request(*_args,**_kwargs):
+            clock.advance(0.05)
+            return replies.pop(0)
+        router=llm.Router([connection(),connection(2)],clock=clock,
+                          sleep=lambda delay:clock.advance(delay),telemetry=events.append)
+        with patch('llm.requests.post',side_effect=request) as post:
+            self.assertEqual(router.generate('facts'),'OK')
+        self.assertEqual([call.kwargs['params']['key'] for call in post.call_args_list],
+                         ['SECRET_A','SECRET_A','SECRET_B'])
+        failover=next(event for event in events if event['event']=='llm_failover')
+        self.assertEqual(failover['previous_connection_id'],connection().id)
+        self.assertEqual(failover['next_connection_id'],connection(2).id)
+        self.assertEqual(failover['reason_category'],'provider_server_error')
+        operation=next(event for event in events if event['event']=='llm_operation_finished')
+        self.assertEqual(operation['outcome'],'success')
+        self.assertEqual(operation['total_provider_attempt_count'],3)
+        self.assertEqual(operation['final_connection_id'],connection(2).id)
+
+    def test_timing_all_connections_exhausted_finishes_unavailable(self):
+        clock=FakeClock(); events=[]
+        router=llm.Router([connection(),connection(2)],clock=clock,
+                          sleep=lambda delay:clock.advance(delay),telemetry=events.append)
+        with patch('llm.requests.post',side_effect=lambda *_args,**_kwargs:(clock.advance(0.05),response(503))[1]):
+            with self.assertRaises(LLMUnavailable):
+                router.generate('facts')
+        exhausted=next(event for event in events if event['event']=='llm_connections_exhausted')
+        self.assertEqual(exhausted['last_connection_id'],connection(2).id)
+        self.assertEqual(exhausted['reason_category'],'provider_server_error')
+        operation=next(event for event in events if event['event']=='llm_operation_finished')
+        self.assertEqual(operation['outcome'],'unavailable')
+        self.assertEqual(operation['total_provider_attempt_count'],4)
+        self.assertEqual(operation['final_connection_id'],connection(2).id)
+        self.assertEqual(len([event for event in events if event['event']=='llm_failover']),1)
+
+    def test_telemetry_failure_does_not_change_provider_success(self):
+        def broken_telemetry(_event):
+            raise OSError('diagnostic write failed')
+        router=llm.Router([connection()],telemetry=broken_telemetry)
+        with patch('llm.requests.post',return_value=response()) as post:
+            self.assertEqual(router.generate('facts'),'OK')
+        post.assert_called_once()
+
+    def test_blocked_private_prompt_finishes_without_persisting_content(self):
+        from privacy import PrivacyError
+        events=[]; router=llm.Router([connection()],telemetry=events.append,
+                                    operation_id_factory=lambda:'operation-private')
+        private='API_KEY=artificial-private-value'
+        with patch('llm.requests.post') as post, self.assertRaises(PrivacyError):
+            router.generate(private,task='question')
+        post.assert_not_called()
+        self.assertEqual([event['event'] for event in events],
+                         ['llm_operation_started','llm_operation_finished'])
+        self.assertEqual(events[-1]['outcome'],'deterministic_failure')
+        self.assertEqual(events[-1]['total_provider_attempt_count'],0)
+        self.assertNotIn(private,json.dumps(events))
 
     def test_daily_zero_retries_and_sticky_failover(self):
         router = llm.Router([connection(), connection(2)], sleep=MagicMock())
@@ -192,6 +331,10 @@ class ConnectionTests(unittest.TestCase):
                     self.assertEqual(router.generate('facts'),'OK')
                 self.assertEqual([call.kwargs['params']['key'] for call in post.call_args_list],expected_calls)
                 self.assertEqual(router.failures[0]['provider_error_category'],expected_category)
+                if expected_category == 'provider_transport_timeout':
+                    self.assertEqual(router.failures[0]['transport_phase'],'read')
+                elif expected_category == 'provider_transport_connection':
+                    self.assertEqual(router.failures[0]['transport_phase'],'connection')
                 if expected_category == 'provider_transport_error':
                     sleep.assert_not_called()
                 else:
@@ -368,7 +511,15 @@ class RunTerminalTests(unittest.TestCase):
         self.assertEqual(event['event'],'llm_routing_recovered')
         self.assertEqual(event['recovery'],'same_connection_retry')
         self.assertEqual(event['failures'][0]['retry_delay'],2.0)
-        public=json.dumps(entry)
+        timing=[row for row in rows if row.get('event','').startswith('llm_')]
+        self.assertEqual([row['event'] for row in timing],[
+            'llm_operation_started','llm_attempt_started','llm_attempt_finished',
+            'llm_retry_wait_started','llm_retry_wait_finished','llm_attempt_started',
+            'llm_attempt_finished','llm_operation_finished'])
+        self.assertTrue(all(row['run_id']==entry['run_id'] for row in timing))
+        self.assertTrue(all(row['vacancy_context_id']==test_safe_mvp.VAC['id'] for row in timing))
+        self.assertTrue(all('vacancy_id' not in row for row in timing))
+        public=json.dumps(rows)
         for private in ('SECRET_A','SECRET_B','private prompt','?key='):
             self.assertNotIn(private,public)
 

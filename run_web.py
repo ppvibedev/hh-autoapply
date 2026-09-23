@@ -250,14 +250,21 @@ def main():
     blocked_vacancies = {}
     halt = False
     stage = "run_setup"
+    current_vacancy_id = None
     def mark_stage(value):
         nonlocal stage
         global _active_stage
         stage = value
         _active_stage = value
 
+    def record_llm_timing(event):
+        row = dict(event, run_id=run_id)
+        if current_vacancy_id is not None:
+            row["vacancy_context_id"] = current_vacancy_id
+        _log(row)
+
     try:
-        llm.start_runtime()
+        llm.start_runtime(telemetry=record_llm_timing)
         resume_id = hh_web.resume_id_from_url(config.RESUME_URL)
         if not has_session():
             raise ValueError("hh_session_missing")
@@ -318,6 +325,7 @@ def main():
                     if not vid.isdigit() or vid in seen_this_run:
                         continue
                     seen_this_run.add(vid)
+                    current_vacancy_id = vid
                     counts["scanned"] += 1
                     entry = {"run_id": run_id, "vacancy_id": vid, "vid": vid,
                         "title": vac.get("name", ""), "company": (vac.get("employer") or {}).get("name", ""),
