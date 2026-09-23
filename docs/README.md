@@ -127,7 +127,7 @@ Prompt/evidence, scoring и модель подтверждения отправ
 | Ответ/LLM/evidence/option/fill | Сохранены проверки, добавлены безопасные error codes |
 | Resume heading/native select отсутствуют | Поддержаны drop-base/menu/listbox и radio с exact HH ID; title резюме не является доказательством identity |
 | Popup/selected value появляются асинхронно | Ограниченное ожидание фактического появления, без выжидания остатка timeout |
-| Письмо | Уже видимое поле или оба toggle; ожидание появления, заполнение, точное чтение обратно; отдельные cover_letter_* ошибки |
+| Письмо | Уже видимое поле или оба toggle; после DOM-перехода scope/editor находятся заново; fill и точное чтение обратно ограничены 3 секундами; допустима одна безопасная повторная попытка fill; отдельные cover_letter_* ошибки |
 | Captcha/внешний iframe, required validity | Защиты сохранены; iframe и старые field errors проверяются внутри response scope |
 | Submit и request identity | Точный resume/vacancy payload и durable journal сохранены |
 | Асинхронный запрос после click | Цикл ждёт фактический запрос; успех допустим лишь после него и явного HH confirmation |

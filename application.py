@@ -6,6 +6,7 @@ from urllib.parse import urlparse, parse_qs, urljoin
 
 import config
 from llm_errors import LLMUnavailable
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from privacy import sanitize_candidate_text, sanitize_exception_message
 
 # Diagnostics retain technical metadata and bounded warning prose, never field values or session data.
@@ -17,6 +18,7 @@ FORM_SELECTOR += ', ' + QUESTION_FORM_SELECTOR
 SUBMIT_SELECTOR = '[data-qa="vacancy-response-submit-popup"], button[data-qa="vacancy-response-submit"]'
 SUCCESS_SELECTOR = ':text-matches("^(Ваш )?отклик (успешно )?отправлен[.!]?$", "i")'
 ALREADY_SELECTOR = '[data-qa="vacancy-response-link-view-topic"]'
+COVER_LETTER_TIMEOUT_MS = 3000
 
 INSPECT_FORM = r'''form => {
     const controls = [...(form.elements || form.querySelectorAll('input,select,textarea,button,fieldset,output'))];
@@ -1315,9 +1317,11 @@ def _fill_letter(form, letter):
         elif letters.count() == 0:
             letters = form.get_by_label(re.compile(r'^Сопроводительное письмо',re.I))
     if letters.count() != 1: raise ValueError('cover_letter_control_not_found')
-    try: letters.fill(letter,timeout=3000)
+    try: letters.fill(letter,timeout=COVER_LETTER_TIMEOUT_MS)
     except Exception: raise ValueError('cover_letter_fill_failed') from None
-    if letters.input_value() != letter: raise ValueError('cover_letter_verification_failed')
+    try: actual = letters.input_value(timeout=COVER_LETTER_TIMEOUT_MS)
+    except PlaywrightTimeoutError: raise ValueError('cover_letter_readback_timeout') from None
+    if actual != letter: raise ValueError('cover_letter_readback_mismatch')
     return letters
 
 
@@ -1333,6 +1337,56 @@ def _visible_letter_editor(root):
         return labelled
     visible = [labelled.nth(i) for i in range(labelled.count()) if labelled.nth(i).is_visible()]
     return visible[0] if len(visible) == 1 else None
+
+
+def _cover_letter_event(diagnostics, stage, started=None, **details):
+    event = {'stage':stage, **details}
+    if started is not None:
+        event['duration_ms'] = max(0,round((time.perf_counter()-started)*1000))
+    diagnostics.setdefault('events',[]).append(event)
+
+
+def _current_cover_letter_editor(page, fallback):
+    # Prefer a fresh page-level scope.  A still-connected scope is safe for
+    # simplified/non-standard response forms that the global detector cannot name.
+    current = _current_or_fallback_scope(page,fallback)
+    if current is None:
+        raise ValueError('cover_letter_editor_lost')
+    editor = _visible_letter_editor(current)
+    if editor is None:
+        raise ValueError('cover_letter_editor_lost')
+    return current, editor
+
+
+def _verify_cover_letter_readback(page, form, letter, diagnostics, checkpoint):
+    """Read the current modal editor with a hard timeout and exact comparison."""
+    started = time.perf_counter()
+    _cover_letter_event(diagnostics,'readback_started',checkpoint=checkpoint,
+                        timeout_ms=COVER_LETTER_TIMEOUT_MS)
+    try:
+        form, editor = _current_cover_letter_editor(page,form)
+    except ValueError:
+        _cover_letter_event(diagnostics,'readback_failed',started,checkpoint=checkpoint,
+                            category='editor_lost')
+        raise
+    try:
+        actual = editor.input_value(timeout=COVER_LETTER_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        _cover_letter_event(diagnostics,'readback_timeout',started,checkpoint=checkpoint,
+                            timeout_ms=COVER_LETTER_TIMEOUT_MS,category='timeout')
+        raise ValueError('cover_letter_readback_timeout') from None
+    except Exception:
+        _cover_letter_event(diagnostics,'readback_failed',started,checkpoint=checkpoint,
+                            category='editor_lost')
+        raise ValueError('cover_letter_editor_lost') from None
+    if actual != letter:
+        _cover_letter_event(diagnostics,'readback_completed',started,checkpoint=checkpoint,
+                            category='mismatch',exact_match=False)
+        raise ValueError('cover_letter_readback_mismatch')
+    _cover_letter_event(diagnostics,'readback_completed',started,checkpoint=checkpoint,
+                        category='verified',exact_match=True)
+    diagnostics['readback_verified'] = True
+    return form, editor
 
 
 def _ensure_cover_letter_editor(page, form, letter, diagnostics):
@@ -1352,7 +1406,7 @@ def _ensure_cover_letter_editor(page, form, letter, diagnostics):
         if len(visible) != 1:
             raise ValueError('cover_letter_trigger_missing')
         try:
-            visible[0].click(timeout=3000)
+            visible[0].click(timeout=COVER_LETTER_TIMEOUT_MS)
         except Exception:
             raise ValueError('cover_letter_trigger_click_failed') from None
         deadline = time.monotonic() + 3
@@ -1371,14 +1425,35 @@ def _ensure_cover_letter_editor(page, form, letter, diagnostics):
             raise ValueError('cover_letter_editor_not_appeared')
         form = current
         diagnostics.update(state='editor_opened',response_scope_reacquired=True)
-    try:
-        editor.fill(letter,timeout=3000)
-    except Exception:
-        raise ValueError('cover_letter_fill_failed') from None
-    if editor.input_value() != letter:
-        raise ValueError('cover_letter_verification_failed')
-    diagnostics['readback_verified'] = True
-    return form, editor
+    diagnostics['fill_retry_count'] = 0
+    for attempt in (1,2):
+        started = time.perf_counter()
+        _cover_letter_event(diagnostics,'fill_started',attempt=attempt,
+                            timeout_ms=COVER_LETTER_TIMEOUT_MS)
+        if attempt == 2:
+            diagnostics['fill_retry_count'] = 1
+            try:
+                form, editor = _current_cover_letter_editor(page,form)
+            except ValueError:
+                _cover_letter_event(diagnostics,'fill_failed',started,attempt=attempt,
+                                    category='editor_lost')
+                raise
+        try:
+            editor.fill(letter,timeout=COVER_LETTER_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            _cover_letter_event(diagnostics,'fill_timeout',started,attempt=attempt,
+                                timeout_ms=COVER_LETTER_TIMEOUT_MS,category='timeout')
+            if attempt == 1:
+                continue
+            raise ValueError('cover_letter_fill_timeout') from None
+        except Exception:
+            _cover_letter_event(diagnostics,'fill_failed',started,attempt=attempt,
+                                category='fill_error')
+            raise ValueError('cover_letter_fill_failed') from None
+        _cover_letter_event(diagnostics,'fill_completed',started,attempt=attempt,
+                            category='completed')
+        break
+    return _verify_cover_letter_readback(page,form,letter,diagnostics,'after_fill')
 
 
 def _transient_error(page, form):
@@ -1661,7 +1736,8 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
                 validation_reason = 'form_invalid_at_validation'
             return finish(reason='required_fields_or_resume_invalid',validation_reason_code=validation_reason,
                           validation_diagnostics=_validation_diagnostics(form))
-        if letters.input_value() != letter: return finish(reason='letter_changed')
+        form, letters = _verify_cover_letter_readback(
+            page,form,letter,result['cover_letter_diagnostics'],'after_validation')
         submit = form.locator(SUBMIT_SELECTOR)
         if submit.count() == 0:
             submit = form.get_by_role('button',name='Откликнуться',exact=True)
@@ -1688,7 +1764,8 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         if prior_error.count() and prior_error.first.is_visible():
             return finish(reason='form_error_before_submit')
         if not _selected_resume(form,resume_id,resume_evidence,str(vacancy['id'])): return finish(reason='resume_selection_ambiguous')
-        if letters.input_value()!=letter: return finish(reason='letter_changed')
+        form, letters = _verify_cover_letter_readback(
+            page,form,letter,result['cover_letter_diagnostics'],'before_submit')
         if not _answers_verified(form,verified_answers): return finish(reason='question_fill_failed')
         stage = 'apply_submit'
         try: before_submit()
@@ -1717,9 +1794,14 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
                 if retry_count:
                     page.wait_for_timeout(100)
                     continue
+                try:
+                    form, letters = _verify_cover_letter_readback(
+                        page,form,letter,result['cover_letter_diagnostics'],'before_retry')
+                except ValueError as error:
+                    return finish(reason=str(error),stage=stage)
                 if (stopped() or _signal(page,str(vacancy['id']),before=True) or _signal(page,str(vacancy['id']))
                     or not submit.is_visible() or not submit.is_enabled()
-                    or not _selected_resume(form,resume_id,resume_evidence,str(vacancy['id'])) or letters.input_value()!=letter
+                    or not _selected_resume(form,resume_id,resume_evidence,str(vacancy['id']))
                     or not letter.strip() or not _answers_verified(form,verified_answers)
                     or not form.evaluate("(root) => root.checkValidity ? root.checkValidity() : [...root.querySelectorAll('input,textarea,select')].every(el=>el.checkValidity())")):
                     return finish(reason='submit_transient_error')
@@ -1783,7 +1865,9 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
                     reason=str(error) if str(error) in ('cover_letter_control_not_found','cover_letter_open_failed',
                         'cover_letter_trigger_missing','cover_letter_trigger_click_failed','cover_letter_editor_not_appeared',
                         'response_scope_unavailable','resume_chooser_not_closed','cover_letter_fill_failed',
-                        'cover_letter_verification_failed') else 'application_flow_error',stage=stage,
+                        'cover_letter_verification_failed','cover_letter_fill_timeout',
+                        'cover_letter_readback_timeout','cover_letter_readback_mismatch',
+                        'cover_letter_editor_lost') else 'application_flow_error',stage=stage,
                     error_type=type(error).__module__+'.'+type(error).__qualname__,
                     error_message=sanitize_exception_message(error))
     finally:

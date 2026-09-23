@@ -235,7 +235,7 @@ class DOMTests(unittest.TestCase):
         self.assertIsNotNone(app._fill_letter(self.page.locator('#response'),'Письмо'))
         self.assertEqual(self.page.locator('textarea').input_value(),'Письмо')
         self.page.locator('textarea').evaluate("el => el.addEventListener('input',()=>el.value='changed')")
-        with self.assertRaisesRegex(ValueError,'cover_letter_verification_failed'):
+        with self.assertRaisesRegex(ValueError,'cover_letter_readback_mismatch'):
             app._fill_letter(self.page.locator('#response'),'Письмо')
 
     def test_full_flow_warning_questions_portal_letter_async_confirmation(self):
@@ -540,6 +540,20 @@ class DOMTests(unittest.TestCase):
         self.assertEqual(self.page.evaluate('addClicks'),0)
         self.assertEqual(editor.input_value(),'Letter')
         self.assertEqual(scope.get_attribute('id'),'response')
+
+    def test_cover_letter_stays_inside_current_response_scope(self):
+        self.page.set_content('''<textarea id="unrelated" data-qa="vacancy-response-popup-form-letter-input">Keep</textarea>
+          <div role="dialog" id="response"><textarea id="letter" data-qa="vacancy-response-popup-form-letter-input"></textarea>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div>''')
+        diagnostics={}
+        scope,editor=app._ensure_cover_letter_editor(
+            self.page,self.page.locator('#response'),'Letter',diagnostics)
+        self.assertEqual(scope.get_attribute('id'),'response')
+        self.assertEqual(editor.get_attribute('id'),'letter')
+        self.assertEqual(self.page.locator('#letter').input_value(),'Letter')
+        self.assertEqual(self.page.locator('#unrelated').input_value(),'Keep')
+        self.assertEqual([event['stage'] for event in diagnostics['events']],
+                         ['fill_started','fill_completed','readback_started','readback_completed'])
 
     def test_cover_letter_reacquires_replaced_scope(self):
         self.page.set_content('''<div role="dialog" id="response"><button data-qa="add-cover-letter"

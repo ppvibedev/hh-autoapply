@@ -204,6 +204,101 @@ class LiveTests(unittest.TestCase):
              self.assertRaisesRegex(ValueError,'cover_letter_trigger_click_failed'):
             application._ensure_cover_letter_editor(page,form,'Prepared letter',{})
 
+    def test_cover_letter_fill_detach_reacquires_once_then_verifies(self):
+        page=MagicMock(); stale_form=MagicMock(); current_form=MagicMock()
+        stale_editor=MagicMock(); fresh_editor=MagicMock(); readback_editor=MagicMock()
+        stale_editor.fill.side_effect=application.PlaywrightTimeoutError('synthetic detach')
+        readback_editor.input_value.return_value='Prepared letter'
+        diagnostics={}
+        with patch('application._visible_letter_editor',side_effect=[stale_editor,fresh_editor,readback_editor]), \
+             patch('application._reacquire_response_scope',return_value=current_form) as reacquire:
+            form,editor=application._ensure_cover_letter_editor(
+                page,stale_form,'Prepared letter',diagnostics)
+        self.assertIs(form,current_form); self.assertIs(editor,readback_editor)
+        stale_editor.fill.assert_called_once_with('Prepared letter',timeout=3000)
+        fresh_editor.fill.assert_called_once_with('Prepared letter',timeout=3000)
+        readback_editor.input_value.assert_called_once_with(timeout=3000)
+        self.assertEqual(diagnostics['fill_retry_count'],1)
+        self.assertGreaterEqual(reacquire.call_count,2)
+        self.assertNotIn('Prepared letter',repr(diagnostics))
+
+    def test_cover_letter_repeated_fill_timeout_is_specific_and_bounded(self):
+        page=MagicMock(); form=MagicMock(); fresh_form=MagicMock()
+        first=MagicMock(); second=MagicMock()
+        first.fill.side_effect=application.PlaywrightTimeoutError('synthetic timeout')
+        second.fill.side_effect=application.PlaywrightTimeoutError('synthetic timeout')
+        diagnostics={}
+        with patch('application._visible_letter_editor',side_effect=[first,second]), \
+             patch('application._reacquire_response_scope',return_value=fresh_form), \
+             self.assertRaisesRegex(ValueError,'cover_letter_fill_timeout'):
+            application._ensure_cover_letter_editor(page,form,'Prepared letter',diagnostics)
+        self.assertEqual(first.fill.call_args.kwargs['timeout'],3000)
+        self.assertEqual(second.fill.call_args.kwargs['timeout'],3000)
+        self.assertEqual([event['stage'] for event in diagnostics['events']],
+                         ['fill_started','fill_timeout','fill_started','fill_timeout'])
+
+    def test_cover_letter_readback_timeout_is_specific_and_bounded(self):
+        page=MagicMock(); form=MagicMock(); editor=MagicMock(); readback=MagicMock()
+        readback.input_value.side_effect=application.PlaywrightTimeoutError('synthetic timeout')
+        diagnostics={}
+        with patch('application._visible_letter_editor',side_effect=[editor,readback]), \
+             patch('application._reacquire_response_scope',return_value=form), \
+             self.assertRaisesRegex(ValueError,'cover_letter_readback_timeout'):
+            application._ensure_cover_letter_editor(page,form,'Prepared letter',diagnostics)
+        readback.input_value.assert_called_once_with(timeout=3000)
+        self.assertEqual(diagnostics['events'][-1]['stage'],'readback_timeout')
+
+    def test_cover_letter_readback_mismatch_is_specific(self):
+        page=MagicMock(); form=MagicMock(); editor=MagicMock(); readback=MagicMock()
+        readback.input_value.return_value='Different letter'
+        diagnostics={}
+        with patch('application._visible_letter_editor',side_effect=[editor,readback]), \
+             patch('application._reacquire_response_scope',return_value=form), \
+             self.assertRaisesRegex(ValueError,'cover_letter_readback_mismatch'):
+            application._ensure_cover_letter_editor(page,form,'Prepared letter',diagnostics)
+        self.assertFalse(diagnostics['events'][-1]['exact_match'])
+        self.assertNotIn('Different letter',repr(diagnostics))
+
+    def test_cover_letter_editor_lost_after_fill_is_specific(self):
+        page=MagicMock(); form=MagicMock(); editor=MagicMock(); diagnostics={}
+        with patch('application._visible_letter_editor',return_value=editor), \
+             patch('application._reacquire_response_scope',return_value=None), \
+             self.assertRaisesRegex(ValueError,'cover_letter_editor_lost'):
+            application._ensure_cover_letter_editor(page,form,'Prepared letter',diagnostics)
+        editor.fill.assert_called_once_with('Prepared letter',timeout=3000)
+        self.assertEqual(diagnostics['events'][-1]['stage'],'readback_failed')
+        self.assertEqual(diagnostics['events'][-1]['category'],'editor_lost')
+
+    def test_cover_letter_reacquires_if_editor_is_replaced_after_fill(self):
+        page=MagicMock(); old_form=MagicMock(); new_form=MagicMock()
+        old_editor=MagicMock(); new_editor=MagicMock()
+        new_editor.input_value.return_value='Prepared letter'
+        diagnostics={}
+        with patch('application._visible_letter_editor',side_effect=[old_editor,new_editor]), \
+             patch('application._reacquire_response_scope',return_value=new_form):
+            form,editor=application._ensure_cover_letter_editor(
+                page,old_form,'Prepared letter',diagnostics)
+        self.assertIs(form,new_form); self.assertIs(editor,new_editor)
+        old_editor.fill.assert_called_once_with('Prepared letter',timeout=3000)
+        new_editor.input_value.assert_called_once_with(timeout=3000)
+
+    def test_cover_letter_failures_never_reach_submit(self):
+        cases=(
+            (application.PlaywrightTimeoutError('synthetic timeout'),'cover_letter_readback_timeout'),
+            ('Different letter','cover_letter_readback_mismatch'),
+        )
+        for readback,reason in cases:
+            with self.subTest(reason=reason):
+                page,form,letters,submit,route,journal,order,fill,model=self.fixture()
+                if isinstance(readback,Exception):
+                    letters.input_value.side_effect=readback
+                else:
+                    letters.input_value.return_value=readback
+                result=application.apply(page,VAC,'Prepared letter',resume_id='aaaa',dry_run=False,
+                                         before_submit=journal)
+                self.assertEqual(result['reason_code'],reason)
+                submit.click.assert_not_called(); self.assertEqual(order,[])
+
     def test_native_fill_types(self):
         for kind,value in [('text','hello'),('textarea','hello'),('number','3'),('select-one','yes'),('checkbox','true'),('radio','yes')]:
             form=MagicMock(); control=MagicMock()
