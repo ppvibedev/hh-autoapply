@@ -442,6 +442,7 @@ class DOMTests(unittest.TestCase):
         snapshots=diag['dom_snapshots']
         self.assertEqual([s['snapshot'] for s in snapshots],['before_click','immediately_after_click','100ms','500ms','1500ms','3000ms'])
         self.assertEqual(diag['reason_code'],'resume_popup_not_opened')
+        self.assertEqual(diag['state_reason_code'],'chooser_not_opened')
         self.assertEqual(snapshots[0]['trigger']['aria_expanded'],'false')
         self.assertTrue(snapshots[0]['trigger']['visible'])
         self.assertTrue(snapshots[0]['trigger']['enabled'])
@@ -472,6 +473,133 @@ class DOMTests(unittest.TestCase):
           if(update)document.getElementById('trigger').setAttribute('data-resume-id','aaaa');
           document.getElementById('portal').hidden=true;
         }''',update)
+
+    def _modal_resume_state(self, selected='aaaa', close_on_escape=True):
+        escape = "document.addEventListener('keydown',event=>{if(event.key==='Escape')document.getElementById('portal').hidden=true})" if close_on_escape else ''
+        self.page.set_content(f'''<meta charset="utf-8"><div role="dialog" id="response">
+          <section><div>Резюме для отклика</div>
+          <div id="trigger" role="button" onclick="document.getElementById('portal').hidden=false">Synthetic</div></section>
+          <button data-qa="add-cover-letter" onclick="window.addClicks++">Добавить</button>
+          <button type="submit" data-qa="vacancy-response-submit-popup" onclick="window.submitClicks++">Откликнуться</button>
+        </div><div role="dialog" data-qa="drop-base" id="portal" hidden>
+          <div role="listbox" data-qa="magritte-select-option-list">
+            <label id="other" role="option" data-magritte-select-option data-qa="magritte-select-option-bbbb" aria-selected="{'true' if selected == 'bbbb' else 'false'}">
+              Other<input type="radio" {'checked' if selected == 'bbbb' else ''}></label>
+            <label id="target" role="option" data-magritte-select-option data-qa="magritte-select-option-aaaa" aria-selected="{'true' if selected == 'aaaa' else 'false'}"
+              onclick="if(event.target!==this)return;window.targetClicks++;document.getElementById('other').setAttribute('aria-selected','false');this.setAttribute('aria-selected','true');this.querySelector('input').checked=true;document.querySelector('#other input').checked=false">
+              Target<input type="radio" {'checked' if selected == 'aaaa' else ''}></label>
+          </div></div><script>window.targetClicks=0;window.addClicks=0;window.submitClicks=0;{escape}</script>''')
+        return self.page.locator('#response')
+
+    def test_modal_already_selected_is_not_clicked_and_chooser_closes(self):
+        form=self._modal_resume_state('aaaa')
+        diag={}; evidence={}
+        self.assertTrue(app._choose_resume(form,'aaaa',diag,evidence,'123456789'))
+        self.assertEqual(diag['selection_result'],'desired_resume_already_selected')
+        self.assertEqual(diag['target_option_click_count'],0)
+        self.assertTrue(diag['chooser_closed'])
+        self.assertTrue(self.page.locator('#portal').is_hidden())
+        self.assertEqual(self.page.evaluate('targetClicks'),0)
+        self.assertTrue(evidence['valid'])
+
+    def test_modal_wrong_resume_switches_once_then_closes(self):
+        form=self._modal_resume_state('bbbb')
+        diag={}; evidence={}
+        self.assertTrue(app._choose_resume(form,'aaaa',diag,evidence,'123456789'))
+        self.assertEqual(diag['selection_result'],'desired_resume_switched')
+        self.assertEqual(diag['target_option_click_count'],1)
+        self.assertEqual(self.page.evaluate('targetClicks'),1)
+        self.assertTrue(self.page.locator('#portal').is_hidden())
+        self.assertIsNotNone(app._reacquire_response_scope(self.page))
+
+    def test_modal_chooser_that_cannot_close_fails_before_next_action(self):
+        form=self._modal_resume_state('aaaa',close_on_escape=False)
+        diag={}
+        self.assertFalse(app._choose_resume(form,'aaaa',diag,{},'123456789'))
+        self.assertEqual(diag['reason_code'],'resume_chooser_not_closed')
+        self.assertEqual(diag['state_reason_code'],'chooser_not_closed')
+        self.assertEqual(self.page.evaluate('[addClicks,submitClicks]'),[0,0])
+
+    def test_scoped_resume_evidence_rejects_conflict_and_other_vacancy(self):
+        self.page.set_content('<div id="scope"><div>Резюме для отклика</div><div role="button">Synthetic</div></div>')
+        scope=self.page.locator('#scope'); evidence={}
+        app._resume_evidence_record(evidence,'aaaa','111',self.page,'resume_chooser_exact_id')
+        self.assertTrue(app._selected_resume(scope,'aaaa',evidence,'111'))
+        self.assertFalse(app._selected_resume(scope,'aaaa',evidence,'222'))
+        self.page.locator('#scope').evaluate("root=>root.insertAdjacentHTML('afterbegin','<input name=resumeId value=bbbb>')")
+        self.assertFalse(app._selected_resume(scope,'aaaa',evidence,'111'))
+        self.assertFalse(evidence['valid'])
+        self.assertEqual(evidence['invalidated_reason'],'conflicting_resume_id')
+
+    def test_cover_letter_existing_editor_skips_add(self):
+        self.page.set_content('''<div role="dialog" id="response"><button data-qa="add-cover-letter" onclick="window.addClicks++">Добавить</button>
+          <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div><script>window.addClicks=0</script>''')
+        diag={}; scope,editor=app._ensure_cover_letter_editor(self.page,self.page.locator('#response'),'Letter',diag)
+        self.assertEqual(diag['state'],'editor_already_visible')
+        self.assertEqual(self.page.evaluate('addClicks'),0)
+        self.assertEqual(editor.input_value(),'Letter')
+        self.assertEqual(scope.get_attribute('id'),'response')
+
+    def test_cover_letter_reacquires_replaced_scope(self):
+        self.page.set_content('''<div role="dialog" id="response"><button data-qa="add-cover-letter"
+          onclick="this.parentElement.outerHTML='<div role=dialog id=response><textarea data-qa=vacancy-response-popup-form-letter-input></textarea><button type=submit data-qa=vacancy-response-submit-popup>Откликнуться</button></div>'">Добавить</button>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div>''')
+        diag={}; scope,editor=app._ensure_cover_letter_editor(self.page,self.page.locator('#response'),'Letter',diag)
+        self.assertEqual(diag['state'],'editor_opened')
+        self.assertTrue(diag['response_scope_reacquired'])
+        self.assertEqual(editor.input_value(),'Letter')
+        self.assertTrue(scope.evaluate('(root)=>root.isConnected'))
+
+    def test_cover_letter_editor_not_appeared_is_specific_failure(self):
+        self.page.set_content('''<div role="dialog" id="response"><button data-qa="add-cover-letter">Добавить</button>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div>''')
+        with self.assertRaisesRegex(ValueError,'cover_letter_editor_not_appeared'):
+            app._ensure_cover_letter_editor(self.page,self.page.locator('#response'),'Letter',{})
+
+    def _touch_regression_flow(self, conflicting_id=False):
+        from playwright.sync_api import Route
+        conflict = '<input type="hidden" name="resumeId" value="bbbb">' if conflicting_id else ''
+        replacement = f'''<div role="dialog" id="response"><section><div>Резюме для отклика</div>
+          <div role="button" onclick="document.getElementById('portal').hidden=false">Synthetic</div></section>{conflict}
+          <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+          <button type="submit" data-qa="vacancy-response-submit-popup"
+            onclick="fetch('/applicant/vacancy_response',{{method:'POST',body:'vacancyId=123456789&resumeId=aaaa'}}).then(()=>document.body.innerHTML='<p>Отклик отправлен</p>')">Откликнуться</button></div>'''
+        replacement_json=json.dumps(replacement)
+        html=f'''<meta charset="utf-8"><a data-qa="vacancy-response-link-top" onclick="document.getElementById('response').hidden=false">Откликнуться</a>
+          <div role="dialog" id="response" hidden><section><div>Резюме для отклика</div>
+          <div role="button" onclick="document.getElementById('portal').hidden=false">Synthetic</div></section>
+          <button data-qa="add-cover-letter" onclick="replaceResponse()">Добавить</button>
+          <button type="submit" data-qa="vacancy-response-submit-popup">Откликнуться</button></div>
+          <div role="dialog" data-qa="drop-base" id="portal" hidden><div role="listbox" data-qa="magritte-select-option-list">
+          <label role="option" data-magritte-select-option data-qa="magritte-select-option-bbbb" aria-selected="false">Other<input type="radio"></label>
+          <label role="option" data-magritte-select-option data-qa="magritte-select-option-aaaa" aria-selected="true">Target<input type="radio" checked></label>
+          </div></div><script>function replaceResponse(){{document.getElementById('response').outerHTML={replacement_json}}}
+          document.addEventListener('keydown',event=>{{if(event.key==='Escape')document.getElementById('portal').hidden=true}})</script>'''
+        requests=[]
+        def offline(route,**kwargs):
+            if route.request.method == 'GET': route.fulfill(status=200,content_type='text/html',body=html)
+            else: requests.append(route.request.post_data);route.fulfill(status=200,body='{}')
+        with patch.object(Route,'continue_',offline),patch.object(app.config,'DRY_RUN',False):
+            result=app.apply(self.page,test_safe_mvp.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=lambda:None)
+        return result,requests
+
+    def test_touch_transient_exact_id_survives_scope_replacement(self):
+        result,requests=self._touch_regression_flow(False)
+        self.assertEqual(result['application_status'],'applied_confirmed',result)
+        self.assertEqual(result['resume_dropdown_diagnostics']['selection_result'],'desired_resume_already_selected')
+        self.assertTrue(result['resume_dropdown_diagnostics']['chooser_closed'])
+        self.assertEqual(result['cover_letter_diagnostics']['state'],'editor_opened')
+        self.assertTrue(result['validation_predicates']['resume_matches_at_validation'])
+        self.assertEqual(len(requests),1)
+
+    def test_touch_later_conflicting_exact_id_invalidates_evidence(self):
+        result,requests=self._touch_regression_flow(True)
+        self.assertEqual(result['reason_code'],'required_fields_or_resume_invalid',result)
+        self.assertEqual(result['validation_reason_code'],'resume_invalid_at_validation')
+        self.assertFalse(result['resume_evidence_diagnostics']['valid'])
+        self.assertEqual(result['resume_evidence_diagnostics']['invalidated_reason'],'conflicting_resume_id')
+        self.assertEqual(requests,[])
 
     def test_real_resume_portal_exact_option_id(self):
         self._real_resume_portal(True)

@@ -104,6 +104,7 @@ class LiveTests(unittest.TestCase):
         stack=ExitStack(); self.addCleanup(stack.close)
         stack.enter_context(patch.object(config,'DRY_RUN',False))
         stack.enter_context(patch('application._wait_response_form',return_value=(form,None)))
+        stack.enter_context(patch('application._reacquire_response_scope',return_value=form))
         stack.enter_context(patch('application._transient_error',return_value=False))
         stack.enter_context(patch('application._resume_diagnostics',return_value={'verified':chosen}))
         stack.enter_context(patch('application.form_diagnostics',return_value={}))
@@ -190,6 +191,18 @@ class LiveTests(unittest.TestCase):
         page=MagicMock()
         result=application.apply(page,VAC,'letter',resume_id='aaaa',dry_run=True)
         self.assertEqual(result['application_status'],'safe_not_sent'); self.assertEqual(page.mock_calls,[])
+
+    def test_cover_letter_trigger_click_failure_is_specific(self):
+        page=MagicMock(); form=MagicMock(); empty=MagicMock(); trigger=MagicMock()
+        empty.count.return_value=0
+        form.locator.return_value=empty
+        form.get_by_label.return_value=empty
+        trigger.count.return_value=1; trigger.is_visible.return_value=True
+        trigger.click.side_effect=RuntimeError('synthetic click failure')
+        with patch('application._custom_resume_state',return_value={'popup_found':False}), \
+             patch('application._letter_add',return_value=trigger), \
+             self.assertRaisesRegex(ValueError,'cover_letter_trigger_click_failed'):
+            application._ensure_cover_letter_editor(page,form,'Prepared letter',{})
 
     def test_native_fill_types(self):
         for kind,value in [('text','hello'),('textarea','hello'),('number','3'),('select-one','yes'),('checkbox','true'),('radio','yes')]:

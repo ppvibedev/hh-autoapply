@@ -424,6 +424,20 @@ selector или fallback.
 Capture выполнен без письма/submit, все запросы записи были заблокированы.
 Это подтверждает структуру, но не доказывает причину отсутствия popup в старом run.
 
+## Стабильное состояние modal resume chooser
+
+Modal-flow различает уже выбранный exact resume ID и реальное переключение. Уже
+выбранный option повторно не нажимается. После exact-ID проверки chooser обязательно
+закрывается через Escape и проверяется его исчезновение; при незакрывшемся chooser
+flow останавливается до cover letter. После resume transition и открытия collapsed
+cover letter response scope находится заново.
+
+Exact-ID evidence живёт только внутри одного `apply()` и привязано к vacancy ID,
+ожидаемому resume ID и текущему URL path. Оно позволяет повторно проверить modal после
+исчезновения transient chooser, но любой обнаруженный conflicting exact ID немедленно
+его аннулирует. Новая vacancy получает новое пустое evidence. Standalone
+`/applicant/vacancy_response` без доказанного exact ID по-прежнему блокируется.
+
 ## Telegram из существующего кэша выбранного резюме
 
 Если Telegram не задан в локальном application_profile, resolver читает только

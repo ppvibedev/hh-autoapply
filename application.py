@@ -579,6 +579,16 @@ def _response_ui(page):
     return None
 
 
+def _reacquire_response_scope(page):
+    """Return the current response scope after a DOM transition, without clicking anything."""
+    scope = _response_ui(page)
+    if scope is not None:
+        return scope
+    forms = page.locator(FORM_SELECTOR)
+    visible = [forms.nth(i) for i in range(forms.count()) if forms.nth(i).is_visible()]
+    return visible[0] if len(visible) == 1 else None
+
+
 def _wait_response_form(page, warnings, blocked, stopped, diagnostics=None):
     """Bounded warning -> form transitions. All sending requests remain blocked."""
     deadline = time.monotonic() + 10
@@ -754,7 +764,7 @@ CUSTOM_RESUME = r'''(form, action) => {
     // The closed trigger is selected-value evidence, never the whole options list.
     const selected = ids(trigger);
     const checked = popup ? [...popup.querySelectorAll('input[type="radio"]:checked,[aria-selected="true"]')].flatMap(ids) : [];
-    return {selected_ids:[...new Set([...selected,...checked])], popup_found:!!popup, option_count:options.length, options:options.map(el => ({ids:ids(el),selected:el.getAttribute('aria-selected') === 'true'}))};
+    return {selected_ids:[...new Set([...selected,...checked])], popup_found:!!popup && visible(popup), option_count:options.length, options:options.map(el => ({ids:ids(el),selected:el.getAttribute('aria-selected') === 'true'}))};
 }'''
 
 
@@ -942,12 +952,107 @@ def _resume_dom_snapshot(observer, snapshots, label, started, page=None, navigat
         snapshots.append(technical)
 
 
-def _custom_resume_choose(form, resume_id, diagnostics):
+def _resume_evidence_record(evidence, resume_id, vacancy_id, page, source):
+    if evidence is None:
+        return
+    evidence.update(valid=True, expected_resume_id=resume_id, verified_resume_id=resume_id,
+                    vacancy_id=str(vacancy_id or ''), page_path=_safe_url_path(page.url),
+                    source=source, invalidated_reason='')
+
+
+def _resume_evidence_invalidate(evidence, reason):
+    if evidence is not None:
+        evidence.update(valid=False, verified_resume_id=None, invalidated_reason=reason)
+
+
+def _resume_evidence_matches(evidence, resume_id, vacancy_id, page):
+    return bool(evidence and evidence.get('valid') is True
+                and evidence.get('verified_resume_id') == resume_id
+                and evidence.get('expected_resume_id') == resume_id
+                and evidence.get('vacancy_id') == str(vacancy_id or '')
+                and evidence.get('page_path') == _safe_url_path(page.url))
+
+
+def _current_or_fallback_scope(page, fallback):
+    scope = _reacquire_response_scope(page)
+    if scope is not None:
+        return scope
+    try:
+        if fallback.evaluate('(root) => root.isConnected') is True:
+            return fallback
+    except Exception:
+        pass
+    return None
+
+
+def _dismiss_resume_chooser(page, scope, diagnostics):
+    """Close a chooser deterministically and prove that it is gone."""
+    current = _current_or_fallback_scope(page, scope)
+    if current is None:
+        diagnostics['state_reason_code'] = 'response_scope_unavailable'
+        return None
+    try:
+        if not _custom_resume_state(current).get('popup_found'):
+            diagnostics['chooser_closed'] = True
+            return current
+    except Exception:
+        diagnostics['state_reason_code'] = 'response_scope_unavailable'
+        return None
+    try:
+        page.keyboard.press('Escape')
+    except Exception:
+        diagnostics['state_reason_code'] = 'chooser_not_closed'
+        return None
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        current = _current_or_fallback_scope(page, current)
+        if current is not None:
+            try:
+                if not _custom_resume_state(current).get('popup_found'):
+                    diagnostics['chooser_closed'] = True
+                    return current
+            except Exception:
+                pass
+        page.wait_for_timeout(50)
+    diagnostics['state_reason_code'] = 'chooser_not_closed'
+    diagnostics['chooser_closed'] = False
+    return None
+
+
+def _open_resume_chooser(scope, timeout=1500):
+    handle = scope.evaluate_handle(CUSTOM_RESUME, {'kind':'trigger'})
+    try:
+        trigger = handle.as_element()
+        if trigger is None:
+            return scope, {}
+        trigger.click(timeout=3000)
+    finally:
+        handle.dispose()
+    deadline = time.monotonic() + timeout / 1000
+    state = _custom_resume_state(scope)
+    while not state.get('options') and time.monotonic() < deadline:
+        scope.page.wait_for_timeout(50)
+        current = _current_or_fallback_scope(scope.page, scope)
+        if current is None:
+            return scope, {}
+        scope = current
+        state = _custom_resume_state(scope)
+    return scope, state
+
+
+def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_id=None):
     before = _custom_resume_state(form)
     diagnostics.update(expected_resume_id=resume_id, before=before)
     if before.get('selected_ids') == [resume_id]:
         diagnostics['after'] = before
-        return _selected_resume(form,resume_id)
+        diagnostics['selection_result'] = 'desired_resume_already_selected'
+        stable = _dismiss_resume_chooser(form.page, form, diagnostics) if before.get('popup_found') else form
+        if stable is None:
+            diagnostics['reason_code'] = 'resume_chooser_not_closed'
+            return False
+        _resume_evidence_record(evidence,resume_id,vacancy_id,form.page,'current_dom')
+        diagnostics['reason_code'] = 'resume_verified'
+        return True
     try:
         trigger_diagnostics=form.evaluate(CUSTOM_RESUME, {'kind':'trigger_diagnostics','id':resume_id})
         if isinstance(trigger_diagnostics,dict): diagnostics['trigger_diagnostics']=trigger_diagnostics
@@ -1006,22 +1111,63 @@ def _custom_resume_choose(form, resume_id, diagnostics):
         handle.dispose()
         try: page.remove_listener('framenavigated',note_navigation)
         except Exception: pass
-    handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'option','id':resume_id})
-    try:
-        option = handle.as_element()
-        if option is None:
-            diagnostics['reason_code']='resume_target_not_found' if diagnostics['opened'].get('popup_found') else 'resume_popup_not_opened'
+    opened = diagnostics['opened']
+    if not opened.get('popup_found'):
+        diagnostics.update(reason_code='resume_popup_not_opened',state_reason_code='chooser_not_opened')
+        return False
+    selected_ids = opened.get('selected_ids',[])
+    if len(selected_ids) > 1:
+        diagnostics.update(reason_code='resume_selection_ambiguous',state_reason_code='conflicting_resume_id')
+        _resume_evidence_invalidate(evidence,'conflicting_resume_id')
+        return False
+    exact_observed = selected_ids == [resume_id]
+    if exact_observed:
+        diagnostics['selection_result'] = 'desired_resume_already_selected'
+        diagnostics['target_option_click_count'] = 0
+        verified_state = opened
+    else:
+        handle = form.evaluate_handle(CUSTOM_RESUME, {'kind':'option','id':resume_id})
+        try:
+            option = handle.as_element()
+            if option is None:
+                diagnostics.update(reason_code='resume_target_not_found',state_reason_code='exact_resume_not_verified')
+                return False
+            option.click(timeout=3000)
+            diagnostics['target_option_click_count'] = 1
+        finally:
+            handle.dispose()
+        diagnostics['selection_result'] = 'desired_resume_switched'
+        deadline = time.monotonic() + 3
+        current = _current_or_fallback_scope(page,form)
+        verified_state = _custom_resume_state(current) if current is not None else {}
+        while verified_state.get('selected_ids') != [resume_id] and time.monotonic() < deadline:
+            if not verified_state.get('popup_found'):
+                break
+            page.wait_for_timeout(50)
+            current = _current_or_fallback_scope(page,current if current is not None else form)
+            verified_state = _custom_resume_state(current) if current is not None else {}
+        if verified_state.get('selected_ids') != [resume_id] and not verified_state.get('popup_found'):
+            current = _current_or_fallback_scope(page,current if current is not None else form)
+            if current is not None:
+                current, verified_state = _open_resume_chooser(current)
+        exact_observed = verified_state.get('selected_ids') == [resume_id]
+        if not exact_observed:
+            if verified_state.get('selected_ids'):
+                _resume_evidence_invalidate(evidence,'conflicting_resume_id')
+                diagnostics['state_reason_code'] = 'conflicting_resume_id'
+            else:
+                diagnostics['state_reason_code'] = 'exact_resume_not_verified'
+            diagnostics.update(after=verified_state,reason_code='resume_selection_not_changed')
             return False
-        option.click(timeout=3000)
-    finally: handle.dispose()
-    deadline = time.monotonic() + 3
-    diagnostics['after'] = _custom_resume_state(form)
-    while diagnostics['after'].get('selected_ids') != [resume_id] and time.monotonic() < deadline:
-        form.page.wait_for_timeout(50)
-        diagnostics['after'] = _custom_resume_state(form)
-    verified=diagnostics['after'].get('selected_ids') == [resume_id] and _selected_resume(form,resume_id)
-    diagnostics['reason_code']='resume_verified' if verified else 'resume_selection_not_changed'
-    return verified
+    diagnostics['after'] = verified_state
+    current = _current_or_fallback_scope(page,form)
+    stable = _dismiss_resume_chooser(page,current if current is not None else form,diagnostics)
+    if stable is None:
+        diagnostics['reason_code'] = 'resume_chooser_not_closed'
+        return False
+    _resume_evidence_record(evidence,resume_id,vacancy_id,page,'resume_chooser_exact_id')
+    diagnostics['reason_code'] = 'resume_verified'
+    return True
 
 
 def _resume_diagnostics(form,resume_id):
@@ -1030,15 +1176,29 @@ def _resume_diagnostics(form,resume_id):
     return {key:evidence.get(key) for key in ('verified','selected_count','expected_selected','other_selected')}
 
 
-def _selected_resume(form, resume_id):
-    evidence = form.evaluate(RESUME_PROBE,resume_id)
-    if isinstance(evidence,dict) and evidence.get('verified') is True: return True
-    if isinstance(evidence,dict) and evidence.get('selected_count',0): return False
-    return _custom_resume_state(form).get('selected_ids') == [resume_id]
+def _selected_resume(form, resume_id, evidence=None, vacancy_id=None):
+    native = form.evaluate(RESUME_PROBE,resume_id)
+    if isinstance(native,dict) and native.get('verified') is True:
+        _resume_evidence_record(evidence,resume_id,vacancy_id,form.page,'native_exact_id')
+        return True
+    if isinstance(native,dict) and native.get('selected_count',0):
+        _resume_evidence_invalidate(evidence,'conflicting_resume_id')
+        return False
+    state = _custom_resume_state(form)
+    selected_ids = state.get('selected_ids',[])
+    if selected_ids == [resume_id]:
+        _resume_evidence_record(evidence,resume_id,vacancy_id,form.page,'current_dom_exact_id')
+        return True
+    if selected_ids:
+        _resume_evidence_invalidate(evidence,'conflicting_resume_id')
+        return False
+    if state.get('popup_found'):
+        return False
+    return _resume_evidence_matches(evidence,resume_id,vacancy_id,form.page)
 
 
 
-def _choose_resume(form, resume_id, diagnostics=None):
+def _choose_resume(form, resume_id, diagnostics=None, evidence=None, vacancy_id=None):
     # Match actual control value, never title or list position.
     if diagnostics is not None:
         diagnostics.update(expected_resume_id=resume_id,before=_custom_resume_state(form))
@@ -1052,17 +1212,26 @@ def _choose_resume(form, resume_id, diagnostics=None):
         el = selects.nth(i)
         if el.get_attribute('name') in ('resumeId','resume_id','resume'):
             el.select_option(value=resume_id,timeout=3000)
-    evidence = form.evaluate(RESUME_PROBE,resume_id)
-    if isinstance(evidence,dict) and not evidence.get('verified') and len(evidence.get('candidates',[])) == 1:
-        handle = form.evaluate_handle("(form,i) => (form.elements || form.querySelectorAll('input,select,textarea,button,fieldset,output'))[i]",evidence['candidates'][0])
+    native = form.evaluate(RESUME_PROBE,resume_id)
+    if isinstance(native,dict) and not native.get('verified') and len(native.get('candidates',[])) == 1:
+        handle = form.evaluate_handle("(form,i) => (form.elements || form.querySelectorAll('input,select,textarea,button,fieldset,output'))[i]",native['candidates'][0])
         try:
             element = handle.as_element()
             if element is not None: element.check(timeout=3000)
         finally: handle.dispose()
-    if _selected_resume(form, resume_id):
-        if diagnostics is not None: diagnostics['after'] = _custom_resume_state(form)
+    native = form.evaluate(RESUME_PROBE,resume_id)
+    if isinstance(native,dict) and native.get('verified') is True:
+        _resume_evidence_record(evidence,resume_id,vacancy_id,form.page,'native_exact_id')
+        if diagnostics is not None:
+            diagnostics.update(selection_result='desired_resume_already_selected',
+                               chooser_closed=True,reason_code='resume_verified')
         return True
-    return _custom_resume_choose(form,resume_id,diagnostics if diagnostics is not None else {})
+    if isinstance(native,dict) and native.get('selected_count',0):
+        _resume_evidence_invalidate(evidence,'conflicting_resume_id')
+        if diagnostics is not None:
+            diagnostics.update(reason_code='resume_selection_not_changed',state_reason_code='conflicting_resume_id')
+        return False
+    return _custom_resume_choose(form,resume_id,diagnostics if diagnostics is not None else {},evidence,vacancy_id)
 
 
 def _clear_optional_question(form, question):
@@ -1152,6 +1321,66 @@ def _fill_letter(form, letter):
     return letters
 
 
+def _visible_letter_editor(root):
+    exact = root.locator('[data-qa="vacancy-response-popup-form-letter-input"]')
+    if exact.count() == 1 and exact.is_visible():
+        return exact
+    visible = [exact.nth(i) for i in range(exact.count()) if exact.nth(i).is_visible()]
+    if len(visible) == 1:
+        return visible[0]
+    labelled = root.get_by_label(re.compile(r'^Сопроводительное письмо',re.I))
+    if labelled.count() == 1 and labelled.is_visible():
+        return labelled
+    visible = [labelled.nth(i) for i in range(labelled.count()) if labelled.nth(i).is_visible()]
+    return visible[0] if len(visible) == 1 else None
+
+
+def _ensure_cover_letter_editor(page, form, letter, diagnostics):
+    """Ensure one visible editor exists, then fill and verify it in the current scope."""
+    if not isinstance(letter,str) or not letter.strip():
+        raise ValueError('cover_letter_verification_failed')
+    editor = _visible_letter_editor(form)
+    if editor is not None:
+        diagnostics['state'] = 'editor_already_visible'
+    else:
+        if _custom_resume_state(form).get('popup_found'):
+            raise ValueError('resume_chooser_not_closed')
+        add = _letter_add(form)
+        visible = [add] if add.count() == 1 and add.is_visible() else [
+            add.nth(i) for i in range(add.count()) if add.nth(i).is_visible()]
+        diagnostics['visible_trigger_count'] = len(visible)
+        if len(visible) != 1:
+            raise ValueError('cover_letter_trigger_missing')
+        try:
+            visible[0].click(timeout=3000)
+        except Exception:
+            raise ValueError('cover_letter_trigger_click_failed') from None
+        deadline = time.monotonic() + 3
+        current = None
+        editor = None
+        while time.monotonic() < deadline:
+            current = _current_or_fallback_scope(page,current if current is not None else form)
+            if current is not None:
+                editor = _visible_letter_editor(current)
+                if editor is not None:
+                    break
+            page.wait_for_timeout(50)
+        if current is None:
+            raise ValueError('response_scope_unavailable')
+        if editor is None:
+            raise ValueError('cover_letter_editor_not_appeared')
+        form = current
+        diagnostics.update(state='editor_opened',response_scope_reacquired=True)
+    try:
+        editor.fill(letter,timeout=3000)
+    except Exception:
+        raise ValueError('cover_letter_fill_failed') from None
+    if editor.input_value() != letter:
+        raise ValueError('cover_letter_verification_failed')
+    diagnostics['readback_verified'] = True
+    return form, editor
+
+
 def _transient_error(page, form):
     pattern=re.compile(r'^Произошла ошибка,\s*попробуйте ещ[её] раз[.!]?$',re.I)
     for scope in (form,page.locator('[role="alert"]')):
@@ -1224,6 +1453,10 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
     sent = False
     armed = False
     blocked = False
+    resume_evidence = {'valid':False,'expected_resume_id':resume_id,
+                       'verified_resume_id':None,'vacancy_id':str(vacancy['id']),
+                       'page_path':'','source':'','invalidated_reason':''}
+    result['resume_evidence_diagnostics'] = resume_evidence
     stage = 'apply_open'
     verified_answers=[]
     retry_count=0
@@ -1398,18 +1631,24 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
             verified_answers.append(dict(index=field['index'],indices=field.get('indices',[field['index']]),type=field['type'],answer=answer['answer']))
         stage = 'apply_resume'
         result['resume_dropdown_diagnostics'] = {}
-        if not _choose_resume(form,resume_id,result['resume_dropdown_diagnostics']):
+        if not _choose_resume(form,resume_id,result['resume_dropdown_diagnostics'],
+                              resume_evidence,str(vacancy['id'])):
             return finish(reason='selected_resume_not_verified',stage=stage,
                           resume_diagnostics=_resume_diagnostics(form,resume_id),
                           form_diagnostics=form_diagnostics(page))
         result['resume_verification']='dom_verified'
+        form = _reacquire_response_scope(page)
+        if form is None:
+            return finish(reason='response_scope_unavailable',stage=stage)
+        result['resume_dropdown_diagnostics']['response_scope_reacquired'] = True
         stage = 'apply_letter'
-        letters = _fill_letter(form,letter)
+        result['cover_letter_diagnostics'] = {}
+        form, letters = _ensure_cover_letter_editor(page,form,letter,result['cover_letter_diagnostics'])
         if letters is None: return finish(reason='letter_field_not_verified')
         stage = 'apply_validate'
         if form.locator('iframe:visible').count() or page.locator('[data-qa*="captcha"]:visible').count():
             return finish(reason='captcha_or_external_form')
-        resume_matches_at_validation = _selected_resume(form, resume_id)
+        resume_matches_at_validation = _selected_resume(form,resume_id,resume_evidence,str(vacancy['id']))
         form_check_validity = form.evaluate("(form) => form.checkValidity ? form.checkValidity() : [...form.querySelectorAll('input,textarea,select')].every(el => el.checkValidity())") is True
         result['validation_predicates'] = {"resume_matches_at_validation": resume_matches_at_validation,
                                            "form_check_validity": form_check_validity}
@@ -1448,7 +1687,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         prior_error = form.locator('[data-qa="vacancy-response-error"]')
         if prior_error.count() and prior_error.first.is_visible():
             return finish(reason='form_error_before_submit')
-        if not _selected_resume(form,resume_id): return finish(reason='resume_selection_ambiguous')
+        if not _selected_resume(form,resume_id,resume_evidence,str(vacancy['id'])): return finish(reason='resume_selection_ambiguous')
         if letters.input_value()!=letter: return finish(reason='letter_changed')
         if not _answers_verified(form,verified_answers): return finish(reason='question_fill_failed')
         stage = 'apply_submit'
@@ -1480,7 +1719,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
                     continue
                 if (stopped() or _signal(page,str(vacancy['id']),before=True) or _signal(page,str(vacancy['id']))
                     or not submit.is_visible() or not submit.is_enabled()
-                    or not _selected_resume(form,resume_id) or letters.input_value()!=letter
+                    or not _selected_resume(form,resume_id,resume_evidence,str(vacancy['id'])) or letters.input_value()!=letter
                     or not letter.strip() or not _answers_verified(form,verified_answers)
                     or not form.evaluate("(root) => root.checkValidity ? root.checkValidity() : [...root.querySelectorAll('input,textarea,select')].every(el=>el.checkValidity())")):
                     return finish(reason='submit_transient_error')
@@ -1514,7 +1753,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
                     add=_letter_add(dialog)
                     if any(add.nth(j).is_visible() for j in range(add.count())):
                         _fill_letter(dialog,letter)
-                        if not _selected_resume(form,resume_id): return finish(reason='selected_resume_not_verified')
+                        if not _selected_resume(form,resume_id,resume_evidence,str(vacancy['id'])): return finish(reason='selected_resume_not_verified')
                     # A separate warning, not descriptive text in a normal response form.
                     if dialog.locator('input:not([type="hidden"]),textarea:not([data-qa="vacancy-response-popup-form-letter-input"]),select').count(): continue
                     confirm=dialog.get_by_role('button',name='Откликнуться',exact=True)
@@ -1541,7 +1780,10 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         raise
     except Exception as error:
         return finish(application_status='submission_unknown' if sent else 'needs_manual_review',
-                    reason=str(error) if str(error) in ('cover_letter_control_not_found','cover_letter_open_failed','cover_letter_fill_failed','cover_letter_verification_failed') else 'application_flow_error',stage=stage,
+                    reason=str(error) if str(error) in ('cover_letter_control_not_found','cover_letter_open_failed',
+                        'cover_letter_trigger_missing','cover_letter_trigger_click_failed','cover_letter_editor_not_appeared',
+                        'response_scope_unavailable','resume_chooser_not_closed','cover_letter_fill_failed',
+                        'cover_letter_verification_failed') else 'application_flow_error',stage=stage,
                     error_type=type(error).__module__+'.'+type(error).__qualname__,
                     error_message=sanitize_exception_message(error))
     finally:

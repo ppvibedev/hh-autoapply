@@ -29,7 +29,7 @@ class RequestVariants(unittest.TestCase):
 
     def test_payload_cannot_replace_dom_resume_verification(self):
         page,form,letter,submit,route,journal,order,fill,model=self.fixture()
-        def pending(root,rid,diag):
+        def pending(root,rid,diag,*args):
             diag.update(before={'selected_ids':[]},opened={'selected_ids':[]},reason_code='resume_target_not_found')
             return False
         with patch('application._choose_resume',side_effect=pending):
