@@ -27,6 +27,8 @@ _active_run_id = None
 _active_stage = "run_setup"
 _worker_stop_ack_logged = False
 _worker_stop_observed_logged = False
+_active_stop_attempt_id = None
+_STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 
 
 class _RunControl:
@@ -81,8 +83,13 @@ class _RunControl:
                         connection.sendall(b'{"ok":false}')
                         continue
                     if request["action"] == "stop":
-                        _request_stop()
-                        _worker_stop_acknowledged("authenticated_control_socket")
+                        attempt_id = request.get("stop_attempt_id")
+                        if attempt_id is not None and (not isinstance(attempt_id, str)
+                                or _STOP_ATTEMPT_RE.fullmatch(attempt_id) is None):
+                            connection.sendall(b'{"ok":false}')
+                            continue
+                        _request_stop(stop_attempt_id=attempt_id)
+                        _worker_stop_acknowledged("authenticated_control_socket", attempt_id)
                         connection.sendall(b'{"ok":true,"status":"stop_requested"}')
                     else:
                         connection.sendall(b'{"ok":true,"status":"active"}')
@@ -109,18 +116,24 @@ def _write_run_state(path, run_id, token):
         os.fsync(stream.fileno())
 
 
-def _request_stop(*_):
-    global _stop_requested
+def _request_stop(*_, stop_attempt_id=None):
+    global _stop_requested, _active_stop_attempt_id
     _stop_requested = True
+    if isinstance(stop_attempt_id, str) and _STOP_ATTEMPT_RE.fullmatch(stop_attempt_id):
+        _active_stop_attempt_id = stop_attempt_id
 
 
-def _worker_stop_acknowledged(source="worker_signal"):
+def _worker_stop_acknowledged(source="worker_signal", stop_attempt_id=None):
     global _worker_stop_ack_logged
     if _worker_stop_ack_logged or not _active_run_id:
         return
     _worker_stop_ack_logged = True
-    _log({"event": "worker_stop_acknowledged", "run_id": _active_run_id,
-          "stage": _active_stage, "source": source})
+    entry = {"event": "worker_stop_acknowledged", "run_id": _active_run_id,
+             "stage": _active_stage, "source": source}
+    attempt_id = stop_attempt_id or _active_stop_attempt_id
+    if isinstance(attempt_id, str) and _STOP_ATTEMPT_RE.fullmatch(attempt_id):
+        entry["stop_attempt_id"] = attempt_id
+    _log(entry)
 
 
 def _observe_stop():
@@ -130,8 +143,11 @@ def _observe_stop():
     _worker_stop_acknowledged()
     if not _worker_stop_observed_logged and _active_run_id:
         _worker_stop_observed_logged = True
-        _log({"event": "worker_stop_observed", "run_id": _active_run_id,
-              "stage": _active_stage})
+        entry = {"event": "worker_stop_observed", "run_id": _active_run_id,
+                 "stage": _active_stage}
+        if isinstance(_active_stop_attempt_id, str) and _STOP_ATTEMPT_RE.fullmatch(_active_stop_attempt_id):
+            entry["stop_attempt_id"] = _active_stop_attempt_id
+        _log(entry)
     return True
 
 
@@ -213,7 +229,7 @@ def _get_resume(page, resume_id, on_stage=None):
 
 
 def main():
-    global _stop_requested, _active_run_id, _active_stage, _worker_stop_ack_logged, _worker_stop_observed_logged
+    global _stop_requested, _active_run_id, _active_stage, _worker_stop_ack_logged, _worker_stop_observed_logged, _active_stop_attempt_id
     _stop_requested = False
     llm.reset_runtime()
     mode = "SAFE" if config.DRY_RUN else "LIVE"
@@ -222,6 +238,7 @@ def main():
     _active_stage = "run_setup"
     _worker_stop_ack_logged = False
     _worker_stop_observed_logged = False
+    _active_stop_attempt_id = None
     counts = {"scanned": 0, "hard_rejected": 0, "score_rejected": 0,
               "safe_ready": 0, "manual_review": 0, "applied_confirmed": 0,
               "apply_failed": 0, "submission_unknown": 0, "already_applied": 0, "apply_attempted": 0}
@@ -419,8 +436,12 @@ def main():
         print(json.dumps(diagnostic, ensure_ascii=False), flush=True)
         print("Прогон остановлен:", stop_reason, flush=True)
     finally:
-        _log({"event": "run_finished", "run_id": run_id, "mode": mode, "status": run_status,
-              "stop_reason": stop_reason, "counts": counts})
+        final = {"event": "run_finished", "run_id": run_id, "mode": mode, "status": run_status,
+                 "stop_reason": stop_reason, "counts": counts}
+        if (stop_reason == "user_stop" and isinstance(_active_stop_attempt_id, str)
+                and _STOP_ATTEMPT_RE.fullmatch(_active_stop_attempt_id)):
+            final["stop_attempt_id"] = _active_stop_attempt_id
+        _log(final)
         try:
             if pid_path.exists():
                 state = json.loads(pid_path.read_text(encoding="utf-8"))
@@ -432,6 +453,7 @@ def main():
             control.close()
         _active_run_id = None
         _active_stage = "run_setup"
+        _active_stop_attempt_id = None
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
     return 1 if run_status == "FAILED" else 0

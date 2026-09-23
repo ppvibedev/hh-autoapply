@@ -72,7 +72,7 @@
     <span class="pulse"></span>
     <span id="runBannerMode">Идёт SAFE-прогон — отклики не отправляются</span>
     <span id="runBannerCount" class="muted"></span>
-    <button class="danger" style="margin-left:auto" onclick="stop()">Стоп</button>
+    <button id="runBannerStopBtn" class="danger" style="margin-left:auto" onclick="stop()">Стоп</button>
   </div>
 
 
@@ -240,6 +240,10 @@ const ROLE_ALIGNMENT_LABELS = {
   unclear: 'роль не ясна',
 };
 let cfgTouched = false;
+let lastRunRunning = false;
+let stopRequestPending = false;
+let stopUiState = 'idle';
+let activeStopAttemptId = null;
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>cfgTouched=true));
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -251,6 +255,30 @@ function showToast(text, kind){
   el.textContent = text;
   box.appendChild(el);
   setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),300); }, 3200);
+}
+
+function newStopAttemptId(){
+  if(globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  if(globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') globalThis.crypto.getRandomValues(bytes);
+  else for(let i=0;i<bytes.length;i++) bytes[i]=Math.floor(Math.random()*256);
+  return [...bytes].map(n=>n.toString(16).padStart(2,'0')).join('');
+}
+
+function renderStopState(){
+  const locked = stopRequestPending || stopUiState === 'accepted';
+  document.getElementById('stopBtn').disabled = !lastRunRunning || locked;
+  document.getElementById('runBannerStopBtn').disabled = !lastRunRunning || locked;
+  if(!lastRunRunning) return;
+  if(stopUiState === 'pending' || stopUiState === 'accepted'){
+    const message = 'Остановка запрошена; ожидаю завершения…';
+    document.getElementById('runState').textContent = message;
+    document.getElementById('runBannerMode').textContent = message;
+  } else if(stopUiState === 'failed'){
+    const message = 'Запрос остановки не доставлен; прогон может продолжаться';
+    document.getElementById('runState').textContent = message;
+    document.getElementById('runBannerMode').textContent = message;
+  }
 }
 // POST + разбор {ok,error}. Возвращает данные. Тостит успех/ошибку.
 async function postAction(url, okMsg, body){
@@ -298,6 +326,12 @@ async function loadAreas(){
 
 async function refresh(){
   const s = await (await fetch('/api/state')).json();
+  lastRunRunning = Boolean(s.running);
+  if(!lastRunRunning){
+    stopRequestPending = false;
+    stopUiState = 'idle';
+    activeStopAttemptId = null;
+  }
   document.getElementById('modeBadge').textContent = s.mode === 'LIVE' ? 'LIVE — реальные отклики' : 'SAFE';
   document.getElementById('modeBadge').className = s.mode === 'LIVE' ? 'badge b-live' : 'badge b-shadow';
   document.getElementById('runBannerMode').textContent = s.mode === 'LIVE' ? 'LIVE: реальные отклики разрешены' : 'SAFE: отклики не отправляются';
@@ -341,6 +375,8 @@ async function refresh(){
       const el = document.getElementById(k); if(el) el.value = v;
     }
   }
+
+  renderStopState();
 
 
   const feed = document.getElementById('feed');
@@ -441,11 +477,31 @@ async function run(){
   refresh();
 }
 async function stop(){
-  const d = await postAction('/api/stop', null);
-  if(!d) return;
-  if(d.status === 'already_stopped') showToast('Прогон уже остановлен', 'ok');
-  else if(d.delivery_accepted) showToast('Остановка запрошена; ожидаю завершения прогона…');
-  else showToast('Не удалось передать запрос остановки', 'err');
+  if(stopRequestPending || stopUiState === 'accepted') return;
+  activeStopAttemptId = newStopAttemptId();
+  stopRequestPending = true;
+  stopUiState = 'pending';
+  renderStopState();
+  const d = await postAction('/api/stop', null, {stop_attempt_id:activeStopAttemptId});
+  stopRequestPending = false;
+  if(!d){
+    activeStopAttemptId = null;
+    stopUiState = 'failed';
+    renderStopState();
+    return;
+  }
+  if(d.status === 'already_stopped'){
+    stopUiState = 'idle';
+    activeStopAttemptId = null;
+    showToast('Прогон уже остановлен', 'ok');
+  } else if(d.delivery_accepted){
+    stopUiState = 'accepted';
+    showToast('Остановка передана; ожидаю завершения…');
+  } else {
+    activeStopAttemptId = null;
+    stopUiState = 'failed';
+  }
+  renderStopState();
   refresh();
 }
 async function reset(){

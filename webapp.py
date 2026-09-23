@@ -14,8 +14,10 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
@@ -35,6 +37,10 @@ _resumes_proc: subprocess.Popen | None = None
 LOGIN_FLAG = "state/login_done.flag"
 # Кэш справочника регионов hh.ru (грузим один раз).
 _areas_cache: list | None = None
+_stop_attempts: dict[str, tuple[dict, int] | None] = {}
+_stop_attempts_lock = threading.Lock()
+_STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
+_STOP_ATTEMPT_LIMIT = 64
 
 # Ключи .env, которые разрешено править из интерфейса.
 EDITABLE = [
@@ -85,6 +91,45 @@ def _log_stop_telemetry(event, *, run_id=None, **fields):
         stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _try_log_stop_telemetry(event, *, run_id=None, **fields):
+    """Stop delivery must never depend on diagnostics being writable."""
+    try:
+        _log_stop_telemetry(event, run_id=run_id, **fields)
+        return True
+    except Exception:
+        return False
+
+
+def _stop_attempt_id():
+    payload = request.get_json(silent=True)
+    attempt_id = payload.get("stop_attempt_id") if isinstance(payload, dict) else None
+    # Keep cached/older dashboard pages capable of stopping a run safely.
+    if attempt_id is None:
+        return uuid4().hex
+    if not isinstance(attempt_id, str) or _STOP_ATTEMPT_RE.fullmatch(attempt_id) is None:
+        raise ValueError("invalid_stop_attempt_id")
+    return attempt_id
+
+
+def _reserve_stop_attempt(attempt_id):
+    """Reserve one delivery action per correlation ID, including concurrent repeats."""
+    with _stop_attempts_lock:
+        if attempt_id in _stop_attempts:
+            return False, _stop_attempts[attempt_id]
+        _stop_attempts[attempt_id] = None
+        while len(_stop_attempts) > _STOP_ATTEMPT_LIMIT:
+            oldest = next(iter(_stop_attempts))
+            if oldest == attempt_id:
+                break
+            _stop_attempts.pop(oldest, None)
+        return True, None
+
+
+def _complete_stop_attempt(attempt_id, payload, status_code):
+    with _stop_attempts_lock:
+        _stop_attempts[attempt_id] = (dict(payload), status_code)
 
 
 def _current_run_rows():
@@ -201,20 +246,23 @@ def _any_run_alive() -> bool:
     return _run_pid() is not None
 
 
-def _control_request(state, action):
+def _control_request(state, action, stop_attempt_id=None):
     """A successful response proves the current worker holds this state's token."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(0.75)
             client.connect(config.RUN_CONTROL_SOCKET)
-            client.sendall(json.dumps({"action": action, "token": state["control_token"]}).encode("utf-8"))
+            payload = {"action": action, "token": state["control_token"]}
+            if isinstance(stop_attempt_id, str) and _STOP_ATTEMPT_RE.fullmatch(stop_attempt_id):
+                payload["stop_attempt_id"] = stop_attempt_id
+            client.sendall(json.dumps(payload).encode("utf-8"))
             response = json.loads(client.recv(1024).decode("utf-8"))
         return response if isinstance(response, dict) else {}
     except (OSError, UnicodeError, ValueError, TypeError):
         return {}
 
 
-def _kill_all_runs() -> dict:
+def _kill_all_runs(stop_attempt_id=None) -> dict:
     """Stop in-memory worker or an authenticated recovered worker; never signal PID state."""
     if _running():
         try:
@@ -238,7 +286,7 @@ def _kill_all_runs() -> dict:
         _remove_run_state(state)
         return {"ok": True, "stopped": False, "status": "already_stopped",
                 "delivery_path": "already_dead", "delivery_accepted": False}
-    response = _control_request(state, "stop")
+    response = _control_request(state, "stop", stop_attempt_id)
     if response.get("ok") is True and response.get("status") == "stop_requested":
         return {"ok": True, "stopped": True, "status": "recovered_stop_requested",
                 "delivery_path": "authenticated_control_socket", "delivery_accepted": True}
@@ -470,22 +518,53 @@ def api_reset():
 @app.post("/api/stop")
 def api_stop():
     """Request a graceful stop only from a known or authenticated worker."""
+    try:
+        attempt_id = _stop_attempt_id()
+    except ValueError:
+        return jsonify({"ok": False, "stopped": False,
+                        "error": "Некорректный идентификатор запроса остановки",
+                        "status": "invalid_stop_attempt_id"}), 400
     state = _read_run_state()
     run_id = state.get("run_id") if state else None
-    _log_stop_telemetry("stop_requested_by_user", run_id=run_id)
-    _log_stop_telemetry("stop_api_received", run_id=run_id,
-                        in_memory_process_exists=_running(), durable_worker_state_exists=state is not None)
-    result = _kill_all_runs()
-    _log_stop_telemetry("stop_delivery_path", run_id=run_id,
-                        delivery_path=result.get("delivery_path", "other"))
-    _log_stop_telemetry("stop_delivery_result", run_id=run_id,
-                        delivery_status=result.get("status", "other"),
-                        delivery_accepted=result.get("delivery_accepted") is True)
+    telemetry = [
+        _try_log_stop_telemetry("stop_requested_by_user", run_id=run_id,
+                                stop_attempt_id=attempt_id),
+        _try_log_stop_telemetry("stop_api_received", run_id=run_id,
+                                stop_attempt_id=attempt_id,
+                                in_memory_process_exists=_running(),
+                                durable_worker_state_exists=state is not None),
+    ]
+    reserved, cached = _reserve_stop_attempt(attempt_id)
+    if not reserved:
+        if cached is None:
+            payload = {"ok": True, "stopped": False, "status": "stop_request_in_progress",
+                       "delivery_path": "duplicate_in_progress", "delivery_accepted": True,
+                       "stop_attempt_id": attempt_id,
+                       "telemetry_recorded": all(telemetry)}
+            return jsonify(payload), 202
+        payload, status_code = cached
+        payload = dict(payload, duplicate=True,
+                       telemetry_recorded=payload.get("telemetry_recorded", False) and all(telemetry))
+        return jsonify(payload), status_code
+
+    result = _kill_all_runs(attempt_id)
+    telemetry.extend([
+        _try_log_stop_telemetry("stop_delivery_path", run_id=run_id,
+                                stop_attempt_id=attempt_id,
+                                delivery_path=result.get("delivery_path", "other")),
+        _try_log_stop_telemetry("stop_delivery_result", run_id=run_id,
+                                stop_attempt_id=attempt_id,
+                                delivery_status=result.get("status", "other"),
+                                delivery_accepted=result.get("delivery_accepted") is True),
+    ])
+    payload = dict(result, stop_attempt_id=attempt_id,
+                   telemetry_recorded=all(telemetry))
+    status_code = 200 if result["ok"] else 409
     if not result["ok"]:
-        return jsonify({"ok": False, "stopped": False,
-                        "error": "Нельзя безопасно подтвердить фоновый прогон; сигнал не отправлен",
-                        "status": result["status"]}), 409
-    return jsonify(result)
+        payload.update(stopped=False,
+                       error="Нельзя безопасно подтвердить фоновый прогон; сигнал не отправлен")
+    _complete_stop_attempt(attempt_id, payload, status_code)
+    return jsonify(payload), status_code
 
 
 @app.get("/api/areas")
