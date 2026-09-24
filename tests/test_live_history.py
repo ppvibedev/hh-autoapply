@@ -35,6 +35,23 @@ class LiveHistoryTests(unittest.TestCase):
             self.path, sleep=sleep_calls.append), expected)
         self.assertEqual(sleep_calls, [])
 
+    def test_unicode_line_separators_remain_inside_one_jsonl_record(self):
+        for separator in ("\u2028", "\u2029"):
+            with self.subTest(codepoint=f"U+{ord(separator):04X}"):
+                sleep_calls = []
+                expected = {"title": f"Before{separator}After", "vacancy_id": "123"}
+                serialized = json.dumps(expected, ensure_ascii=False) + "\n"
+                self.assertIn(separator, serialized)
+                self.assertEqual(serialized.count("\n"), 1)
+                self.assertEqual(json.loads(serialized.rstrip("\n")), expected)
+                self.path.write_text(serialized, encoding="utf-8")
+
+                self.assertEqual(
+                    run_web._read_live_history(self.path, sleep=sleep_calls.append),
+                    [expected],
+                )
+                self.assertEqual(sleep_calls, [])
+
     def test_malformed_final_line_recovers_after_one_complete_reread(self):
         private_fragment = "person@example.test"
         self.path.write_text(_row(application_status="applied_confirmed", vacancy_id="123")

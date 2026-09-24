@@ -220,7 +220,13 @@ def _history_snapshot(path, attempt):
         "mtime_ns": stat.st_mtime_ns if stat is not None else None,
         "ends_with_newline": not text or text.endswith("\n"),
     }
-    lines = text.splitlines()
+    # JSONL records are delimited by literal LF only. Unicode separators such as
+    # U+2028/U+2029 are valid JSON string content and must stay inside a record.
+    lines = text.split("\n")
+    last_nonempty_line = max(
+        (line_number for line_number, line in enumerate(lines, 1) if line.strip()),
+        default=0,
+    )
     records = []
     for line_number, line in enumerate(lines, 1):
         if not line.strip():
@@ -233,14 +239,14 @@ def _history_snapshot(path, attempt):
                            line_length_bytes=len(line.encode("utf-8")),
                            error_position=(error.pos if isinstance(error, json.JSONDecodeError)
                                            else None),
-                           is_last_line=line_number == len(lines))
+                           is_last_line=line_number == last_nonempty_line)
             return None, failure, metadata
         if not isinstance(record, dict):
             failure = dict(metadata, line_number=line_number,
                            line_length_chars=len(line),
                            line_length_bytes=len(line.encode("utf-8")),
                            error_position=None,
-                           is_last_line=line_number == len(lines),
+                           is_last_line=line_number == last_nonempty_line,
                            record_type_invalid=True)
             return None, failure, metadata
         records.append(record)
