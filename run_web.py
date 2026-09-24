@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import secrets
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -29,6 +30,15 @@ _worker_stop_ack_logged = False
 _worker_stop_observed_logged = False
 _active_stop_attempt_id = None
 _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
+LIVE_HISTORY_REREAD_DELAY_SECONDS = 0.02
+
+
+class LiveHistoryCorrupt(ValueError):
+    """Fail-closed LIVE history error carrying technical-only diagnostics."""
+
+    def __init__(self, diagnostics):
+        super().__init__("live_history_corrupt")
+        self.history_diagnostics = diagnostics
 
 
 class _RunControl:
@@ -158,7 +168,7 @@ def _error_code(error):
              "hh_session_missing", "invalid_run_settings", "matching_invalid_score",
              "matching_invalid_json", "matching_invalid_schema", "matching_inconsistent_decision",
              "matching_invalid_remote_status", "matching_invalid_role_alignment", "matching_llm_unavailable", "letter_llm_unavailable",
-             "selected_resume_title_unavailable",
+             "selected_resume_title_unavailable", "live_history_corrupt",
              "letter_invalid", "candidate_context_symlink_not_allowed", "candidate_context_path_not_allowed",
              "candidate_context_too_large_120000_chars", "llm_context_too_large_180000_chars",
              "vacancy_description_empty", "vacancy_description_not_found", "resume_cache_symlink_not_allowed"}
@@ -180,6 +190,8 @@ def _exception_details(error, stage):
             "error_message": sanitize_exception_message(error), "traceback_frames": frames}
     if isinstance(error, LLMUnavailable):
         details["llm_failures"] = error.failures
+    if isinstance(error, LiveHistoryCorrupt):
+        details["history_diagnostics"] = error.history_diagnostics
     return details
 
 
@@ -192,6 +204,72 @@ def _log(entry):
         stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _history_snapshot(path, attempt):
+    """Read and strictly parse one complete JSONL snapshot without exposing records."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        stat = path.stat()
+    except OSError:
+        stat = None
+    metadata = {
+        "attempt": attempt,
+        "snapshot_size_bytes": len(text.encode("utf-8")),
+        "file_size": stat.st_size if stat is not None else None,
+        "mtime_ns": stat.st_mtime_ns if stat is not None else None,
+        "ends_with_newline": not text or text.endswith("\n"),
+    }
+    lines = text.splitlines()
+    records = []
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError) as error:
+            failure = dict(metadata, line_number=line_number,
+                           line_length_chars=len(line),
+                           line_length_bytes=len(line.encode("utf-8")),
+                           error_position=(error.pos if isinstance(error, json.JSONDecodeError)
+                                           else None),
+                           is_last_line=line_number == len(lines))
+            return None, failure, metadata
+        if not isinstance(record, dict):
+            failure = dict(metadata, line_number=line_number,
+                           line_length_chars=len(line),
+                           line_length_bytes=len(line.encode("utf-8")),
+                           error_position=None,
+                           is_last_line=line_number == len(lines),
+                           record_type_invalid=True)
+            return None, failure, metadata
+        records.append(record)
+    return records, None, metadata
+
+
+def _read_live_history(path, *, sleep=time.sleep, telemetry=None):
+    """Parse LIVE history, allowing one bounded reread but never skipping corruption."""
+    path = Path(path)
+    records, initial_failure, initial_snapshot = _history_snapshot(path, "initial")
+    if initial_failure is None:
+        return records
+
+    sleep(LIVE_HISTORY_REREAD_DELAY_SECONDS)
+    records, reread_failure, reread_snapshot = _history_snapshot(path, "reread")
+    changed = {
+        "size_changed": (initial_snapshot["snapshot_size_bytes"]
+                         != reread_snapshot["snapshot_size_bytes"]),
+        "mtime_changed": initial_snapshot["mtime_ns"] != reread_snapshot["mtime_ns"],
+    }
+    if reread_failure is None:
+        if telemetry is not None:
+            telemetry({"event": "history_read_recovered",
+                       "initial_failure": initial_failure,
+                       "reread_snapshot": reread_snapshot,
+                       **changed})
+        return records
+
+    raise LiveHistoryCorrupt({"attempts": [initial_failure, reread_failure], **changed})
 
 
 def _get_resume(page, resume_id, on_stage=None):
@@ -278,12 +356,7 @@ def main():
             raise ValueError("selected_resume_title_unavailable")
         instructions, materials = load_candidate_context()
         if mode == "LIVE" and Path(config.DECISIONS_LOG).exists():
-            for line in Path(config.DECISIONS_LOG).read_text(encoding="utf-8").splitlines():
-                try:
-                    previous = json.loads(line)
-                except ValueError:
-                    # A corrupt journal must not silently remove LIVE dedup protection.
-                    raise ValueError("live_history_corrupt") from None
+            for previous in _read_live_history(config.DECISIONS_LOG, telemetry=_log):
                 status = previous.get("application_status")
                 if status in ("applied_confirmed", "already_applied", "submission_unknown"):
                     blocked_vacancies[str(previous.get("vacancy_id"))] = status
