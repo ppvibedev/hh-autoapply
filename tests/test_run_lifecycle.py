@@ -9,6 +9,7 @@ import test_safe_mvp
 import config
 import run_web
 import webapp
+from llm_errors import LLMStopped
 
 
 class RunLifecycleTests(unittest.TestCase):
@@ -240,6 +241,23 @@ class RunLifecycleTests(unittest.TestCase):
         final = next(row for row in rows if row.get("event") == "run_finished")
         self.assertEqual((final["status"], final["stop_reason"]), ("STOPPED", "user_stop"))
         self.assertEqual(final["stop_attempt_id"], attempt_id)
+
+    def test_llm_stop_does_not_start_next_vacancy(self):
+        browser = MagicMock(); browser.__enter__.return_value = (None, MagicMock())
+        rows = []
+        vacancies = [dict(test_safe_mvp.VAC, id="123"), dict(test_safe_mvp.VAC, id="456")]
+        with patch("run_web.has_session", return_value=True), \
+             patch("run_web.browser_context", return_value=browser), \
+             patch("run_web._get_resume", return_value="Current resume facts"), \
+             patch("hh_web.search_page", return_value=vacancies), \
+             patch("hh_web.load_full", side_effect=lambda _page, vacancy: vacancy) as load_full, \
+             patch("decide.hard_filters", return_value=None), \
+             patch("decide.score", side_effect=LLMStopped()), \
+             patch("run_web._log", side_effect=rows.append):
+            self.assertEqual(run_web.main(), 0)
+        self.assertEqual(load_full.call_count, 1)
+        final = next(row for row in rows if row.get("event") == "run_finished")
+        self.assertEqual((final["status"], final["stop_reason"]), ("STOPPED", "user_stop"))
 
     def test_stop_ui_reports_request_not_completion(self):
         source = Path("web/index.html").read_text(encoding="utf-8")

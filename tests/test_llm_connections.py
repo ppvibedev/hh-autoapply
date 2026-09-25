@@ -12,7 +12,7 @@ import config
 import llm
 import llm_connections as store
 from llm_connections import LLMConnection as Connection
-from llm_errors import LLMUnavailable, classify_http
+from llm_errors import LLMUnavailable, LLMStopped, classify_http
 import run_web
 from requests import Response
 
@@ -76,6 +76,33 @@ class ConnectionTests(unittest.TestCase):
         with patch('llm.requests.post', return_value=response()) as post:
             router.generate('facts'); router.generate('facts')
             self.assertEqual([c.kwargs['params']['key'] for c in post.call_args_list], ['SECRET_A']*2)
+
+    def test_stop_before_operation_starts_no_provider_attempt(self):
+        router = llm.Router([connection()], stopped=lambda: True)
+        with patch('llm.requests.post') as post, self.assertRaises(LLMStopped):
+            router.generate('facts')
+        post.assert_not_called()
+
+    def test_stop_after_active_provider_call_prevents_retry_and_failover(self):
+        stopped = {'value': False}
+        def request(*_args, **_kwargs):
+            stopped['value'] = True
+            return response(503)
+        router = llm.Router([connection(), connection(2)], stopped=lambda: stopped['value'])
+        with patch('llm.requests.post', side_effect=request) as post, self.assertRaises(LLMStopped):
+            router.generate('facts')
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(router.unavailable, set())
+
+    def test_retry_wait_is_interrupted_without_retry_or_failover(self):
+        stopped = {'value': False}
+        def sleep(_delay):
+            stopped['value'] = True
+        router = llm.Router([connection(), connection(2)], sleep=sleep,
+                            stopped=lambda: stopped['value'])
+        with patch('llm.requests.post', return_value=response(503)) as post, self.assertRaises(LLMStopped):
+            router.generate('facts')
+        self.assertEqual(post.call_count, 1)
 
     def test_first_attempt_success_has_operation_and_attempt_timing(self):
         clock=FakeClock(); events=[]

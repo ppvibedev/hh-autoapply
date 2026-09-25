@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 import config
 import decide
+import history_store
 from hh_client import HHClient
 
 
@@ -29,10 +30,8 @@ def _save_seen(seen: set[str]) -> None:
 
 
 def _log(entry: dict) -> None:
-    os.makedirs(os.path.dirname(config.DECISIONS_LOG), exist_ok=True)
     entry["ts"] = datetime.now(timezone.utc).isoformat()
-    with open(config.DECISIONS_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    history_store.append_jsonl(config.DECISIONS_LOG, entry)
 
 
 def main() -> int:

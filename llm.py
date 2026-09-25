@@ -4,7 +4,7 @@ import requests  # Compatibility for existing offline patches of llm.requests.po
 from uuid import uuid4
 import config
 from llm_connections import DEFAULT_MODEL, load_connections, ConnectionConfigError
-from llm_errors import LLMUnavailable
+from llm_errors import LLMUnavailable, LLMStopped
 from llm_provider import execute
 from privacy import sanitize_candidate_text
 
@@ -20,7 +20,7 @@ RETRYABLE_CATEGORIES = frozenset({
 
 class Router:
     def __init__(self, connections, sleep=None, clock=None, telemetry=None,
-                 operation_id_factory=None):
+                 operation_id_factory=None, stopped=None):
         self.connections = tuple(connections)
         self.unavailable = set()
         self.active = None
@@ -30,9 +30,29 @@ class Router:
         self.clock = clock or time.perf_counter
         self.telemetry = telemetry
         self.operation_id_factory = operation_id_factory or (lambda: uuid4().hex)
+        self.stopped = stopped
 
     def set_telemetry(self, telemetry):
         self.telemetry = telemetry
+
+    def set_stopped(self, stopped):
+        self.stopped = stopped
+
+    def _check_stopped(self):
+        if self.stopped is not None and self.stopped():
+            raise LLMStopped()
+
+    def _interruptible_sleep(self, delay):
+        if self.stopped is None:
+            self.sleep(delay)
+            return
+        remaining = delay
+        while remaining > 0:
+            self._check_stopped()
+            interval = min(0.1, remaining)
+            self.sleep(interval)
+            remaining -= interval
+        self._check_stopped()
 
     def _emit(self, event, **details):
         if self.telemetry is None:
@@ -57,6 +77,7 @@ class Router:
     def generate(self, prompt, max_tokens=600, task='text'):
         if task not in TASKS:
             raise ValueError('llm_task_unsupported')
+        self._check_stopped()
         operation_id = self.operation_id_factory()
         operation_clock = self.clock()
         operation_start = len(self.failures)
@@ -81,6 +102,7 @@ class Router:
             prompt = sanitize_candidate_text(
                 prompt, tuple(c.credential for c in self.connections) + (config.ACCESS_TOKEN,))
             while True:
+                self._check_stopped()
                 candidates = self._candidates()
                 if not candidates:
                     if not exhaustion_emitted:
@@ -94,6 +116,7 @@ class Router:
                 self.active = connection
                 final_failure = None
                 for attempt in range(RATE_RETRIES + 1):
+                    self._check_stopped()
                     attempt_count += 1
                     attempt_number = attempt + 1
                     common = dict(operation_id=operation_id, task=task,
@@ -103,6 +126,7 @@ class Router:
                                operation_elapsed_ms=self._elapsed_ms(operation_clock))
                     attempt_clock = self.clock()
                     text, failure = execute(connection, prompt, max_tokens)
+                    self._check_stopped()
                     attempt_duration = self._elapsed_ms(attempt_clock)
                     if failure is None:
                         self._emit('llm_attempt_finished', **common,
@@ -158,7 +182,7 @@ class Router:
                                operation_elapsed_ms=self._elapsed_ms(operation_clock))
                     wait_clock = self.clock()
                     # Never retry earlier than a provider's long delay merely to cap our wait.
-                    self.sleep(requested_delay)
+                    self._interruptible_sleep(requested_delay)
                     self._emit('llm_retry_wait_finished', **common,
                                requested_delay_ms=round(requested_delay * 1000),
                                actual_duration_ms=self._elapsed_ms(wait_clock),
@@ -177,6 +201,9 @@ class Router:
                                task=task, last_connection_id=connection.id,
                                reason_category=final_failure.category,
                                operation_elapsed_ms=self._elapsed_ms(operation_clock))
+        except LLMStopped:
+            operation_event('user_stop')
+            raise
         except LLMUnavailable:
             operation_event('unavailable')
             raise
@@ -201,7 +228,7 @@ def reset_runtime():
     _router = None
 
 
-def start_runtime(telemetry=None):
+def start_runtime(telemetry=None, stopped=None):
     """Freeze the connection list at run start, before loading private task data."""
     global _router
     if _router is None:
@@ -212,9 +239,11 @@ def start_runtime(telemetry=None):
             invalid = True
         if invalid:
             raise LLMUnavailable([{'provider_error_category': 'connection_config_invalid'}])
-        _router = Router(connections, telemetry=telemetry)
+        _router = Router(connections, telemetry=telemetry, stopped=stopped)
     elif telemetry is not None:
         _router.set_telemetry(telemetry)
+    if stopped is not None:
+        _router.set_stopped(stopped)
 
 
 def generate(prompt: str, max_tokens: int = 600, *, task='text') -> str:

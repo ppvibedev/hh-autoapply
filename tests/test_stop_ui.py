@@ -93,18 +93,22 @@ class StopUITests(unittest.TestCase):
         page.evaluate("window.__running=false; refresh()")
         page.wait_for_function("stopUiState === 'idle'")
 
-    def test_network_failure_is_persistent_and_allows_new_attempt(self):
+    def test_transport_retry_reuses_id_and_stops_after_second_failure(self):
         page = self.page()
         page.click("#stopBtn")
         first_id = page.evaluate("__stopRequests[0].body.stop_attempt_id")
         page.evaluate("() => __stopPending[0].reject(new TypeError('offline failure'))")
+        page.wait_for_function("__stopRequests.length === 2")
+        self.assertEqual(first_id, page.evaluate("__stopRequests[1].body.stop_attempt_id"))
+        page.evaluate("() => __stopPending[1].reject(new TypeError('offline failure'))")
         page.wait_for_function("stopUiState === 'failed'")
+        self.assertEqual(page.evaluate("__stopRequests.length"), 2)
         self.assertIn("не доставлен", page.locator("#runState").inner_text())
         self.assertFalse(page.locator("#stopBtn").is_disabled())
         self.assertFalse(page.locator("#runBannerStopBtn").is_disabled())
         page.click("#runBannerStopBtn")
-        self.assertEqual(page.evaluate("__stopRequests.length"), 2)
-        self.assertNotEqual(first_id, page.evaluate("__stopRequests[1].body.stop_attempt_id"))
+        self.assertEqual(page.evaluate("__stopRequests.length"), 3)
+        self.assertNotEqual(first_id, page.evaluate("__stopRequests[2].body.stop_attempt_id"))
 
     def test_non_2xx_is_persistent_delivery_failure(self):
         page = self.page()
@@ -113,8 +117,51 @@ class StopUITests(unittest.TestCase):
           JSON.stringify({ok:false,error:'delivery rejected'}),
           {status:409,headers:{'Content-Type':'application/json'}}))""")
         page.wait_for_function("stopUiState === 'failed'")
+        self.assertEqual(page.evaluate("__stopRequests.length"), 1)
         self.assertIn("прогон может продолжаться", page.locator("#runState").inner_text())
         self.assertFalse(page.locator("#stopBtn").is_disabled())
+
+    def test_only_one_state_refresh_is_active(self):
+        page = self.page()
+        page.evaluate("""() => {
+          window.__stateRequests=0;
+          window.__resolveState=null;
+          window.fetch=(url,options={})=>{
+            const path=new URL(String(url),location.href).pathname;
+            if(path==='/api/state'){
+              window.__stateRequests++;
+              return new Promise(resolve=>window.__resolveState=resolve);
+            }
+            return Promise.resolve(new Response('{"ok":true}',{status:200,headers:{'Content-Type':'application/json'}}));
+          };
+        }""")
+        page.evaluate("() => { refresh(); refresh(); refresh(); return true; }")
+        self.assertEqual(page.evaluate("__stateRequests"), 1)
+
+    def test_stop_pauses_polling_and_aborts_active_state_fetch(self):
+        page = self.page()
+        page.evaluate("""() => {
+          window.__stateAborted=false; window.__stateRequests=0; window.__stopRequests=[]; window.__stopPending=[];
+          window.fetch=(url,options={})=>{
+            const path=new URL(String(url),location.href).pathname;
+            if(path==='/api/state'){
+              window.__stateRequests++;
+              return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>{
+                window.__stateAborted=true; reject(new DOMException('aborted','AbortError'));
+              }));
+            }
+            if(path==='/api/stop'){
+              window.__stopRequests.push(JSON.parse(options.body));
+              return new Promise(resolve=>window.__stopPending.push(resolve));
+            }
+          };
+          refresh(); return true;
+        }""")
+        page.click("#stopBtn")
+        page.wait_for_function("__stateAborted && __stopRequests.length === 1")
+        self.assertTrue(page.evaluate("pollingPaused"))
+        page.evaluate("() => { refresh(); return true; }")
+        self.assertEqual(page.evaluate("__stateRequests"), 1)
 
 
 if __name__ == "__main__":

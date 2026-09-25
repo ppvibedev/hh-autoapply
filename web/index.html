@@ -244,6 +244,9 @@ let lastRunRunning = false;
 let stopRequestPending = false;
 let stopUiState = 'idle';
 let activeStopAttemptId = null;
+let stateRefreshPromise = null;
+let stateFetchController = null;
+let pollingPaused = false;
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>cfgTouched=true));
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -325,7 +328,12 @@ async function loadAreas(){
 }
 
 async function refresh(){
-  const s = await (await fetch('/api/state')).json();
+  if(pollingPaused || stateRefreshPromise) return stateRefreshPromise;
+  const controller = new AbortController();
+  stateFetchController = controller;
+  stateRefreshPromise = (async()=>{
+  try {
+  const s = await (await fetch('/api/state',{signal:controller.signal})).json();
   lastRunRunning = Boolean(s.running);
   if(!lastRunRunning){
     stopRequestPending = false;
@@ -400,6 +408,14 @@ async function refresh(){
   }
 
   document.getElementById('runlog').textContent = s.run_log || '—';
+  } catch(error) {
+    if(error && error.name !== 'AbortError') showToast('Не удалось обновить состояние','err');
+  } finally {
+    if(stateFetchController === controller) stateFetchController = null;
+    stateRefreshPromise = null;
+  }
+  })();
+  return stateRefreshPromise;
 }
 
 function connectionProviderChanged(){
@@ -481,13 +497,33 @@ async function stop(){
   activeStopAttemptId = newStopAttemptId();
   stopRequestPending = true;
   stopUiState = 'pending';
+  pollingPaused = true;
+  if(stateFetchController) stateFetchController.abort();
   renderStopState();
-  const d = await postAction('/api/stop', null, {stop_attempt_id:activeStopAttemptId});
+  let d = null;
+  for(let attempt=0;attempt<2 && !d;attempt++){
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(),3000);
+    try {
+      const response = await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({stop_attempt_id:activeStopAttemptId}),signal:controller.signal});
+      const payload = await response.json().catch(()=>({}));
+      if(response.ok && payload.ok!==false) d = payload;
+      else {
+        showToast(payload.error || `Ошибка (${response.status})`,'err');
+        break;
+      }
+    } catch(error) {
+      if(attempt===1) showToast('Запрос остановки не доставлен','err');
+    } finally { clearTimeout(timer); }
+  }
   stopRequestPending = false;
   if(!d){
     activeStopAttemptId = null;
     stopUiState = 'failed';
+    pollingPaused = false;
     renderStopState();
+    refresh();
     return;
   }
   if(d.status === 'already_stopped'){
@@ -501,6 +537,7 @@ async function stop(){
     activeStopAttemptId = null;
     stopUiState = 'failed';
   }
+  pollingPaused = false;
   renderStopState();
   refresh();
 }
@@ -521,7 +558,7 @@ async function saveCfg(){
 }
 
 loadAreas().then(refresh);
-setInterval(refresh, 3000);
+setInterval(()=>{ if(!pollingPaused) refresh(); }, 3000);
 </script>
 </body>
 </html>

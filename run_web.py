@@ -16,7 +16,8 @@ from uuid import uuid4
 import config
 import decide
 import llm
-from llm_errors import LLMUnavailable
+from llm_errors import LLMUnavailable, LLMStopped
+import history_store
 from resume_metadata import selected_resume_title
 import hh_web
 from browser import browser_context, has_session
@@ -169,6 +170,7 @@ def _error_code(error):
              "matching_invalid_json", "matching_invalid_schema", "matching_inconsistent_decision",
              "matching_invalid_remote_status", "matching_invalid_role_alignment", "matching_llm_unavailable", "letter_llm_unavailable",
              "selected_resume_title_unavailable", "live_history_corrupt",
+             "application_safety_state_corrupt",
              "letter_invalid", "candidate_context_symlink_not_allowed", "candidate_context_path_not_allowed",
              "candidate_context_too_large_120000_chars", "llm_context_too_large_180000_chars",
              "vacancy_description_empty", "vacancy_description_not_found", "resume_cache_symlink_not_allowed"}
@@ -198,12 +200,7 @@ def _exception_details(error, stage):
 def _log(entry):
     entry = dict(entry, ts=datetime.now(timezone.utc).isoformat())
     entry = sanitize_record(entry)
-    path = Path(config.DECISIONS_LOG)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    history_store.append_jsonl(config.DECISIONS_LOG, entry)
 
 
 def _history_snapshot(path, attempt):
@@ -348,7 +345,7 @@ def main():
         _log(row)
 
     try:
-        llm.start_runtime(telemetry=record_llm_timing)
+        llm.start_runtime(telemetry=record_llm_timing, stopped=_observe_stop)
         resume_id = hh_web.resume_id_from_url(config.RESUME_URL)
         if not has_session():
             raise ValueError("hh_session_missing")
@@ -361,12 +358,18 @@ def main():
         if not resume_title:
             raise ValueError("selected_resume_title_unavailable")
         instructions, materials = load_candidate_context()
-        if mode == "LIVE" and Path(config.DECISIONS_LOG).exists():
-            for previous in _read_live_history(config.DECISIONS_LOG, telemetry=_log):
-                status = previous.get("application_status")
-                if status in ("applied_confirmed", "already_applied", "submission_unknown"):
-                    blocked_vacancies[str(previous.get("vacancy_id"))] = status
-                # Unknown submissions stay blocked even if later records look benign.
+        if mode == "LIVE":
+            previous_records = (_read_live_history(
+                                    config.DECISIONS_LOG,
+                                    telemetry=lambda event: _log(dict(event, run_id=run_id)))
+                                if Path(config.DECISIONS_LOG).exists() else [])
+            blocked_vacancies.update(history_store.merge_safety(
+                config.APPLICATION_SAFETY_FILE, previous_records))
+            if previous_records:
+                # Recovery telemetry may have appended after the first snapshot.
+                compact_records = _read_live_history(config.DECISIONS_LOG)
+                history_store.compact_history(
+                    config.DECISIONS_LOG, compact_records, active_run_id=run_id)
 
         # The socket starts before durable state becomes visible. A recovered
         # dashboard can therefore authenticate the worker without signalling a PID.
@@ -463,6 +466,8 @@ def main():
                                     mark_stage("application")
                                     counts["apply_attempted"] += 1
                                     def before_submit():
+                                        history_store.record_safety(
+                                            config.APPLICATION_SAFETY_FILE, vid, "submission_unknown")
                                         _log({"event":"apply_submit_started", "run_id":run_id,
                                               "vacancy_id":vid, "selected_resume_id":resume_id,
                                               "application_status":"submission_unknown"})
@@ -478,12 +483,17 @@ def main():
                                         counts[status] += 1
                                     if status == "needs_manual_review": counts["manual_review"] += 1
                                     if status in ("applied_confirmed", "already_applied", "submission_unknown"):
+                                        history_store.record_safety(
+                                            config.APPLICATION_SAFETY_FILE, vid, status)
                                         blocked_vacancies[vid] = status
                                     if status == "submission_unknown":
                                         halt, stop_reason = True, "submission_unknown"
                                         run_status = "STOPPED"
                                     if counts["applied_confirmed"] >= config.TARGET_APPLICATIONS_PER_RUN:
                                         halt, stop_reason = True, "target_reached"
+                    except LLMStopped:
+                        halt, run_status, stop_reason = True, "STOPPED", "user_stop"
+                        break
                     except LLMUnavailable as error:
                         halt, run_status, stop_reason = True, "STOPPED", "llm_infrastructure_unavailable"
                         entry.update(_exception_details(error, stage))
@@ -511,6 +521,8 @@ def main():
                     print(f"{mode}: обработано {counts['scanned']}, подготовлено {counts['safe_ready']}", flush=True)
         if _observe_stop():
             run_status, stop_reason = "STOPPED", "user_stop"
+    except LLMStopped:
+        run_status, stop_reason = "STOPPED", "user_stop"
     except LLMUnavailable as error:
         run_status, stop_reason = "STOPPED", "llm_infrastructure_unavailable"
         _log(dict(event="run_error", run_id=run_id, reason_code=stop_reason,
@@ -529,6 +541,12 @@ def main():
                 and _STOP_ATTEMPT_RE.fullmatch(_active_stop_attempt_id)):
             final["stop_attempt_id"] = _active_stop_attempt_id
         _log(final)
+        try:
+            records = _read_live_history(config.DECISIONS_LOG)
+            history_store.compact_history(config.DECISIONS_LOG, records)
+        except (OSError, ValueError, RuntimeError, LiveHistoryCorrupt):
+            # A future LIVE preflight still fails closed; never rewrite uncertain data.
+            pass
         try:
             if pid_path.exists():
                 state = json.loads(pid_path.read_text(encoding="utf-8"))

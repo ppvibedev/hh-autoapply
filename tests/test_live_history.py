@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import test_safe_mvp
+import history_store
 
 config = test_safe_mvp.config
 run_web = test_safe_mvp.run_web
@@ -76,6 +77,22 @@ class LiveHistoryTests(unittest.TestCase):
         self.assertFalse(event["initial_failure"]["ends_with_newline"])
         self.assertIsInstance(event["initial_failure"]["error_position"], int)
         self.assertNotIn(private_fragment, json.dumps(event))
+
+    def test_recovery_telemetry_is_included_before_atomic_compaction(self):
+        self.path.write_text(_row(vacancy_id="1") + "\n{partial", encoding="utf-8")
+        def complete_append(_delay):
+            self.path.write_text(_row(vacancy_id="1", run_id="run-1") + "\n"
+                                 + _row(event="run_finished", run_id="run-1") + "\n",
+                                 encoding="utf-8")
+        run_web._read_live_history(
+            self.path, sleep=complete_append,
+            telemetry=lambda event: history_store.append_jsonl(
+                self.path, dict(event, run_id="current-run")),
+        )
+        latest = run_web._read_live_history(self.path)
+        history_store.compact_history(self.path, latest, active_run_id="current-run")
+        parsed = [json.loads(line) for line in self.path.read_text().split("\n") if line]
+        self.assertEqual(parsed[-1]["event"], "history_read_recovered")
 
     def test_malformed_middle_line_recovers_only_from_fully_valid_reread(self):
         self.path.write_text(_row(vacancy_id="1") + "\n{broken}\n" + _row(vacancy_id="3") + "\n",

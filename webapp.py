@@ -24,6 +24,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 import config
 import envfile
+import history_store
 from hh_web import resume_id_from_url
 from privacy import sanitize_record, sanitize_candidate_text
 
@@ -55,22 +56,35 @@ EDITABLE = [
 SECRET_KEYS = ["LLM_API_KEY"]
 
 
+_decisions_cache_lock = threading.Lock()
+_decisions_cache = {"identity": None, "offset": 0, "pending": b"", "rows": []}
+
+
 def _read_decisions(limit: int = 100) -> list[dict]:
     path = config.DECISIONS_LOG
     if not os.path.exists(path):
+        with _decisions_cache_lock:
+            _decisions_cache.update(identity=None, offset=0, pending=b"", rows=[])
         return []
-    rows: list[dict] = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    item = sanitize_record(json.loads(line))
-                    if isinstance(item, dict):
-                        rows.append(item)
-                except (ValueError, TypeError):
-                    pass
-    return rows[-limit:][::-1]  # новые сверху
+    with _decisions_cache_lock:
+        identity, offset, chunk, rebuilt = history_store.read_tail(
+            path, _decisions_cache["identity"], _decisions_cache["offset"])
+        if rebuilt:
+            _decisions_cache.update(pending=b"", rows=[])
+        _decisions_cache["identity"] = identity
+        _decisions_cache["offset"] = offset
+        data = _decisions_cache["pending"] + chunk
+        physical = data.split(b"\n")
+        _decisions_cache["pending"] = physical.pop()
+        for raw in physical:
+            if not raw.strip():
+                continue
+            item = json.loads(raw.decode("utf-8"))
+            if not isinstance(item, dict):
+                raise ValueError("decisions_log_corrupt")
+            _decisions_cache["rows"].append(sanitize_record(item))
+        rows = _decisions_cache["rows"]
+        return rows[-limit:][::-1]  # новые сверху
 
 
 _pending_after_run = None
@@ -85,12 +99,7 @@ def _log_stop_telemetry(event, *, run_id=None, **fields):
         entry["run_id"] = run_id
     entry.update(fields)
     entry = sanitize_record(entry)
-    path = Path(config.DECISIONS_LOG)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    history_store.append_jsonl(config.DECISIONS_LOG, entry)
 
 
 def _try_log_stop_telemetry(event, *, run_id=None, **fields):

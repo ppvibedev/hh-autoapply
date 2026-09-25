@@ -72,6 +72,7 @@ HH_SEARCH_PARAMS = {k: v for k, v in {
 # Файлы состояния
 SEEN_FILE = "state/seen.json"          # id вакансий, уже обработанных (дедуп)
 DECISIONS_LOG = "state/decisions.jsonl"  # лог всех решений (для калибровки)
+APPLICATION_SAFETY_FILE = "state/application_safety.json"  # exact vacancy-id submit safety
 
 # ИИ для сопроводительных писем
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").strip()  # anthropic | openai | yandex | none

@@ -12,6 +12,11 @@ class LLMUnavailable(RuntimeError):
         self.failures = list(failures)
 
 
+class LLMStopped(RuntimeError):
+    def __init__(self):
+        super().__init__('user_stop')
+
+
 @dataclass(frozen=True)
 class ProviderFailure:
     category: str

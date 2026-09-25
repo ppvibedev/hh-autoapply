@@ -45,6 +45,7 @@ class SafeTests(unittest.TestCase):
             RESUMES_FILE=str(self.root/'resume-list.json'),
             RESUME_URL='https://hh.ru/resume/aaaa', RESUME_CACHE_DIR=str(self.root/'resumes'),
             DECISIONS_LOG=str(self.root/'history.jsonl'), RUN_PID_FILE=str(self.root/'run.pid'),
+            APPLICATION_SAFETY_FILE=str(self.root/'application-safety.json'),
             RUN_CONTROL_SOCKET=self.control_socket,
             PAGES_PER_RUN=1, PAUSE_SECONDS=0, TARGET_APPLICATIONS_PER_RUN=1, SCORE_THRESHOLD=80)
         self.settings.start(); self.addCleanup(self.settings.stop)

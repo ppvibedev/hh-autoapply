@@ -5,7 +5,7 @@ import time
 from urllib.parse import urlparse, parse_qs, urljoin
 
 import config
-from llm_errors import LLMUnavailable
+from llm_errors import LLMUnavailable, LLMStopped
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from privacy import sanitize_candidate_text, sanitize_exception_message
 
@@ -305,7 +305,7 @@ def answer_question(question, vacancy, resume, context='', instructions='', *, d
     ) + json.dumps(prompt_question, ensure_ascii=False) + '\n' + decide._context(vacancy, resume, context, instructions)
     try:
         raw = llm.generate(prompt, max_tokens=650, task="question")
-    except LLMUnavailable:
+    except (LLMUnavailable, LLMStopped):
         raise
     except Exception:
         raise ValueError('llm_error') from None
@@ -1658,7 +1658,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
             question_diagnostics = {}
             try:
                 answer = answer_question(field,vacancy,resume_text,candidate_text,instructions,diagnostics=question_diagnostics,resume_id=resume_id)
-            except LLMUnavailable:
+            except (LLMUnavailable, LLMStopped):
                 raise
             except Exception as error:
                 codes = {'question_label_unknown':'question_text_not_found',
@@ -1858,7 +1858,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
             page.wait_for_timeout(250)
         return finish(application_status='submission_unknown' if sent or not retry_count else 'needs_manual_review',
                     reason='submission_sent_confirmation_missing' if sent else ('submit_transient_error_after_retry' if _transient_error(page,form) else 'submit_retry_request_not_seen') if retry_count else 'submit_request_not_observed')
-    except LLMUnavailable:
+    except (LLMUnavailable, LLMStopped):
         raise
     except Exception as error:
         return finish(application_status='submission_unknown' if sent else 'needs_manual_review',

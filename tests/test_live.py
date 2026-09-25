@@ -10,6 +10,7 @@ import config
 import decide
 import run_web
 import webapp
+import history_store
 
 Q = {'index':0,'question':'Опишите опыт проектов','type':'textarea','required':True,'options':[]}
 FACT = 'Я руководил запуском проекта Alpha.'
@@ -367,6 +368,25 @@ class LiveTests(unittest.TestCase):
         rows=[json.loads(x) for x in Path(config.DECISIONS_LOG).read_text().splitlines()]
         self.assertEqual(rows[-1]['stop_reason'],'target_reached')
         self.assertEqual(rows[-1]['counts']['applied_confirmed'],1)
+
+    def test_compact_exact_id_safety_blocks_old_id_but_not_similar_new_id(self):
+        from pathlib import Path
+        history_store.record_safety(config.APPLICATION_SAFETY_FILE, '111', 'submission_unknown')
+        old = dict(VAC, id='111', name='Project Manager', employer={'name':'Company X'})
+        new = dict(VAC, id='222', name='Project Manager', employer={'name':'Company X'})
+        browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
+        with patch.object(config,'DRY_RUN',False), patch('run_web.browser_context',return_value=browser), \
+             patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), \
+             patch('run_web._get_resume',return_value=FACT), patch('hh_web.search_page',return_value=[old,new]), \
+             patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), \
+             patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), \
+             patch('hh_web.apply',return_value={'application_status':'applied_confirmed','reason':'fixture'}) as apply:
+            self.assertEqual(run_web.main(),0)
+        apply.assert_called_once()
+        self.assertEqual(apply.call_args.args[1]['id'],'222')
+        safety=history_store.load_safety(config.APPLICATION_SAFETY_FILE)
+        self.assertEqual(safety['111'],'submission_unknown')
+        self.assertEqual(safety['222'],'applied_confirmed')
 
     def test_old_live_setting_does_not_arm_worker(self):
         import os,sys,types
