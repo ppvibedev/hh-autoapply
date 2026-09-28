@@ -3,6 +3,45 @@ import requests
 from llm_errors import ProviderFailure, classify_http
 
 
+OPENAI_COMPATIBLE = {
+    'openai': {
+        'url': 'https://api.openai.com/v1/chat/completions',
+        'extra': {},
+    },
+    'groq': {
+        'url': 'https://api.groq.com/openai/v1/chat/completions',
+        # GPT-OSS returns only final content while using its lowest supported
+        # reasoning effort for these short classification/writing tasks.
+        'extra': {'reasoning_effort': 'low', 'reasoning_format': 'hidden'},
+    },
+    'zai': {
+        'url': 'https://api.z.ai/api/paas/v4/chat/completions',
+        # The selected GLM model supports disabling thinking; callers need only
+        # the final answer text and already validate JSON/evidence themselves.
+        'extra': {'thinking': {'type': 'disabled'}},
+    },
+}
+
+
+def _openai_compatible(connection, prompt, max_tokens):
+    settings = OPENAI_COMPATIBLE[connection.provider]
+    payload = {
+        'model': connection.model,
+        'max_tokens': max_tokens,
+        'messages': [{'role': 'user', 'content': prompt}],
+        **settings['extra'],
+    }
+    response = requests.post(
+        settings['url'],
+        headers={'Authorization': f'Bearer {connection.credential}',
+                 'Content-Type': 'application/json'},
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()['choices'][0]['message']['content'].strip()
+
+
 def execute(connection, prompt, max_tokens):
     failure = None
     try:
@@ -48,19 +87,8 @@ def _request(connection, prompt, max_tokens):
         r.raise_for_status()
         return r.json()["content"][0]["text"].strip()
 
-    if prov == "openai":
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+    if prov in OPENAI_COMPATIBLE:
+        return _openai_compatible(connection, prompt, max_tokens)
 
     if prov == "yandex":
         folder = connection.folder_id

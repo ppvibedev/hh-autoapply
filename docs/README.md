@@ -507,10 +507,28 @@ symlink в пути отвергается. `private/` уже исключён �
 Routing: текущее доступное подключение → оставшиеся с тем же provider/model
 → остальные по сохранённому порядку. Disabled, пустой credential и Yandex без
 folder ID пропускаются. Сохранены HTTP-контракты Gemini, Anthropic, OpenAI, YandexGPT.
+Добавлены явные provider-варианты Groq и Z.ai на фиксированных OpenAI-compatible
+endpoint; пользовательский base URL не принимается. Порядок Groq/Z.ai задаётся
+только их позицией в сохранённом списке; отдельного provider preference нет.
 Используются только существующие текстовые adapters; работоспособность конкретного
 имени модели и качество другого provider offline-тестами не подтверждаются.
 Все прежние task validation gates остаются обязательными. Невалидный matching JSON
 не является основанием ослабить validation или автоматически перебрать провайдеров.
+
+Groq по умолчанию использует `openai/gpt-oss-120b` через
+`https://api.groq.com/openai/v1/chat/completions`. Для этой модели заданы
+`reasoning_effort=low` и `reasoning_format=hidden`, чтобы task-модули получали
+только финальный text. Контракт: [Groq OpenAI compatibility](https://console.groq.com/docs/openai)
+и [GPT-OSS 120B](https://console.groq.com/docs/model/openai/gpt-oss-120b). Наличие ключа не
+означает наличие квоты или биллинга.
+
+Z.ai по умолчанию использует `glm-4.7-flash` через обычный general API
+`https://api.z.ai/api/paas/v4/chat/completions`, а не Coding Plan endpoint. Модель выбрана
+как действующая Flash-модель для недорогой текстовой генерации; thinking явно
+отключен. Официальные контракты: [general HTTP API](https://docs.z.ai/guides/develop/http/introduction),
+[OpenAI compatibility](https://docs.z.ai/guides/develop/openai/python) и
+[model list/pricing](https://docs.z.ai/guides/overview/pricing). Доступность модели и кредитов
+конкретному account проверяется только API-ответом.
 
 Gemini HTTP 429 классифицируется по `google.rpc.QuotaFailure.violations[].quotaId`:
 известные GenerateRequests PerDay / PerMinute и GenerateContentInputTokens PerDay /
@@ -571,8 +589,11 @@ provider calls и HH не запускаются.
 
 Безопасная ручная проверка: открыть настройки без запуска прогона, увидеть legacy A,
 добавить B, проверить отметку «ключ сохранён» и пустое поле ключа, отключить/включить B
-и перезагрузить страницу. Это проверяет persistence без расходов API. Даже SAFE-прогон
-может обращаться к LLM: для проверки только настроек его запускать не нужно.
+и перезагрузить страницу. Это проверяет persistence без расходов API. Кнопка «Проверить» делает
+один маленький provider-запрос с постоянным нейтральным prompt; резюме, вакансия, HH-данные
+и candidate context не передаются. Ответ в UI ограничен `CONNECTED` или нормализованной
+ошибкой/HTTP status; сырое тело ответа не возвращается. Проверка может использовать квоту
+или платные токены согласно тарифу provider. Даже SAFE-прогон может обращаться к LLM.
 
 Подключения, routing, privacy boundary и UI покрыты offline-тестами с
 искусственными credentials, HTTP и локальным Chromium. Реальный provider failover

@@ -14,6 +14,7 @@ STORAGE_PATH = Path(__file__).resolve().parent / 'private' / 'llm_connections.js
 DEFAULT_MODEL = {
     'anthropic': 'claude-haiku-4-5-20251001', 'openai': 'gpt-4o-mini',
     'yandex': 'yandexgpt-lite', 'gemini': 'gemini-1.5-flash',
+    'groq': 'openai/gpt-oss-120b', 'zai': 'glm-4.7-flash',
 }
 _LOCK = threading.RLock()
 _KNOWN_CREDENTIALS = set()

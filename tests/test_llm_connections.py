@@ -11,8 +11,9 @@ import test_safe_mvp
 import config
 import llm
 import llm_connections as store
+import llm_provider
 from llm_connections import LLMConnection as Connection
-from llm_errors import LLMUnavailable, LLMStopped, classify_http
+from llm_errors import LLMUnavailable, LLMStopped, ProviderFailure, classify_http
 import run_web
 from requests import Response
 
@@ -36,6 +37,10 @@ def response(status=200, qid=None, delay=None, body=None):
             body = {'error': {'status': 'RESOURCE_EXHAUSTED', 'message': 'SECRET_B private prompt', 'details': details}}
     r._content = json.dumps(body).encode()
     return r
+
+
+def chat_response(status=200, text='OK'):
+    return response(status, body={'choices': [{'message': {'content': text}}]})
 
 
 def connection(index=1, provider='gemini', model='model-x', enabled=True, folder_id=''):
@@ -383,6 +388,86 @@ class ConnectionTests(unittest.TestCase):
                 self.assertEqual(router.generate('facts',650,'question'),'OK')
                 self.assertEqual(post.call_args.kwargs['timeout'],60)
 
+    def test_groq_and_zai_openai_compatible_contracts(self):
+        cases = {
+            'groq': ('openai/gpt-oss-120b', 'https://api.groq.com/openai/v1/chat/completions',
+                     {'reasoning_effort': 'low', 'reasoning_format': 'hidden'}),
+            'zai': ('glm-4.7-flash', 'https://api.z.ai/api/paas/v4/chat/completions',
+                    {'thinking': {'type': 'disabled'}}),
+        }
+        for index, (provider, (model, url, extra)) in enumerate(cases.items(), 1):
+            with self.subTest(provider=provider), patch('llm.requests.post', return_value=chat_response(text=' FINAL ')) as post:
+                item = connection(index, provider, model)
+                self.assertEqual(llm.Router([item]).generate('neutral facts', 123, 'question'), 'FINAL')
+                request = post.call_args
+                self.assertEqual(request.args[0], url)
+                self.assertEqual(request.kwargs['headers']['Authorization'], f'Bearer SECRET_{chr(64+index)}')
+                self.assertEqual(request.kwargs['json']['model'], model)
+                self.assertEqual(request.kwargs['json']['max_tokens'], 123)
+                self.assertEqual(request.kwargs['json']['messages'], [{'role': 'user', 'content': 'neutral facts'}])
+                for key, value in extra.items():
+                    self.assertEqual(request.kwargs['json'][key], value)
+                self.assertEqual(request.kwargs['timeout'], 60)
+
+    def test_groq_and_zai_429_are_safely_normalized(self):
+        for provider, model in (('groq', 'openai/gpt-oss-120b'), ('zai', 'glm-4.7-flash')):
+            with self.subTest(provider=provider), patch('llm.requests.post', return_value=response(429)):
+                text, failure = llm_provider.execute(connection(provider=provider, model=model), 'neutral', 8)
+                self.assertIsNone(text)
+                self.assertEqual(failure.category, 'rate_limit_unknown')
+                self.assertEqual(failure.http_status, 429)
+
+    def test_gemini_groq_zai_failover_and_saved_order(self):
+        gemini = connection(1)
+        groq = connection(2, 'groq', 'openai/gpt-oss-120b')
+        zai = connection(3, 'zai', 'glm-4.7-flash')
+        sleep = MagicMock()
+        router = llm.Router([gemini, groq, zai], sleep=sleep)
+        replies = [response(503), response(503), response(503), response(503), chat_response()]
+        with patch('llm.requests.post', side_effect=replies) as post:
+            self.assertEqual(router.generate('facts'), 'OK')
+        self.assertEqual([call.args[0] for call in post.call_args_list], [
+            'https://generativelanguage.googleapis.com/v1beta/models/model-x:generateContent',
+            'https://generativelanguage.googleapis.com/v1beta/models/model-x:generateContent',
+            'https://api.groq.com/openai/v1/chat/completions',
+            'https://api.groq.com/openai/v1/chat/completions',
+            'https://api.z.ai/api/paas/v4/chat/completions'])
+        self.assertEqual(router.active.id, zai.id)
+        self.assertEqual(sleep.call_count, 2)
+
+        # Saved order remains authoritative when there is no active connection.
+        ordered = llm.Router([zai, groq])
+        with patch('llm.requests.post', return_value=chat_response()) as post:
+            self.assertEqual(ordered.generate('facts'), 'OK')
+        self.assertEqual(post.call_args.args[0], 'https://api.z.ai/api/paas/v4/chat/completions')
+
+    def test_new_provider_503_exhaustion_and_disabled_skip(self):
+        groq = connection(1, 'groq', 'openai/gpt-oss-120b')
+        zai = connection(2, 'zai', 'glm-4.7-flash')
+        router = llm.Router([groq, zai], sleep=MagicMock())
+        with patch('llm.requests.post', side_effect=[response(503)] * 4) as post:
+            with self.assertRaises(LLMUnavailable) as caught:
+                router.generate('facts')
+        self.assertEqual(post.call_count, 4)
+        self.assertEqual([(row['connection_id'], row['attempt']) for row in caught.exception.failures],
+                         [(groq.id, 1), (groq.id, 2), (zai.id, 1), (zai.id, 2)])
+
+        router = llm.Router([connection(1, 'groq', enabled=False), zai])
+        with patch('llm.requests.post', return_value=chat_response()) as post:
+            self.assertEqual(router.generate('facts'), 'OK')
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.args[0], 'https://api.z.ai/api/paas/v4/chat/completions')
+
+        # Z.ai receives its bounded retry, then fails over like every provider.
+        openai = connection(3, 'openai', 'gpt-4o-mini')
+        router = llm.Router([zai, openai], sleep=MagicMock())
+        with patch('llm.requests.post', side_effect=[response(503), response(503), chat_response()]) as post:
+            self.assertEqual(router.generate('facts'), 'OK')
+        self.assertEqual([call.args[0] for call in post.call_args_list], [
+            'https://api.z.ai/api/paas/v4/chat/completions',
+            'https://api.z.ai/api/paas/v4/chat/completions',
+            'https://api.openai.com/v1/chat/completions'])
+
     def test_storage_migration_public_enable_and_secret_safety(self):
         import webapp
         client=webapp.app.test_client()
@@ -405,6 +490,41 @@ class ConnectionTests(unittest.TestCase):
                 router.generate('facts'); self.assertEqual(post.call_args.kwargs['params']['key'],'SECRET_A')
             self.assertEqual(client.patch('/api/llm-connections/'+cid,json={'credential':''}).status_code,200)
             self.assertEqual(store.load_connections()[1].credential,'SECRET_B')
+
+    def test_groq_and_zai_storage_defaults_and_safe_connection_test(self):
+        import webapp
+        client = webapp.app.test_client()
+        env = {'LLM_PROVIDER': 'gemini', 'LLM_MODEL': 'model-x', 'LLM_API_KEY': 'SECRET_A'}
+        with patch('webapp.envfile.read_env', return_value=env):
+            groq_result = client.post('/api/llm-connections', json={
+                'provider': 'groq', 'model': '', 'credential': 'SECRET_B'})
+            zai_result = client.post('/api/llm-connections', json={
+                'provider': 'zai', 'model': '', 'credential': 'SECRET_C'})
+            self.assertEqual((groq_result.status_code, zai_result.status_code), (200, 200))
+            rows = zai_result.json['connections']
+            self.assertEqual([(row['provider'], row['model']) for row in rows[1:]], [
+                ('groq', 'openai/gpt-oss-120b'), ('zai', 'glm-4.7-flash')])
+            public = groq_result.get_data(as_text=True) + zai_result.get_data(as_text=True)
+            for secret in ('SECRET_A', 'SECRET_B', 'SECRET_C'):
+                self.assertNotIn(secret, public)
+
+            target = rows[1]['id']
+            with patch('llm_provider.execute', return_value=('CONNECTED', None)) as execute:
+                tested = client.post(f'/api/llm-connections/{target}/test', json={})
+            self.assertEqual(tested.json, {'ok': True, 'status': 'CONNECTED'})
+            item, prompt, limit = execute.call_args.args
+            self.assertEqual((item.provider, item.model, limit),
+                             ('groq', 'openai/gpt-oss-120b', 16))
+            self.assertEqual(prompt, 'Reply with exactly the single word CONNECTED.')
+            for private in ('SECRET_A', 'SECRET_B', 'SECRET_C', 'resume', 'vacancy', 'candidate', 'hh'):
+                self.assertNotIn(private, prompt.lower())
+                self.assertNotIn(private, tested.get_data(as_text=True))
+
+            failure = ProviderFailure('provider_server_error', 503)
+            with patch('llm_provider.execute', return_value=(None, failure)):
+                tested = client.post(f'/api/llm-connections/{target}/test', json={})
+            self.assertEqual(tested.json, {'ok': False, 'status': 'HTTP 503',
+                                           'category': 'provider_server_error', 'http_status': 503})
 
     def test_secret_in_any_prompt_or_public_metadata_is_blocked(self):
         from privacy import sanitize_candidate_text, PrivacyError

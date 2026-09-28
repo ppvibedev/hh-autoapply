@@ -190,7 +190,8 @@
       <div class="grid2">
         <div><label for="connectionProvider">Провайдер</label><select id="connectionProvider" onchange="connectionProviderChanged()">
           <option value="gemini">Gemini</option><option value="anthropic">Anthropic</option>
-          <option value="openai">OpenAI</option><option value="yandex">YandexGPT</option>
+          <option value="openai">OpenAI</option><option value="groq">Groq</option>
+          <option value="zai">Z.ai</option><option value="yandex">YandexGPT</option>
         </select></div>
         <div><label for="connectionModel">Модель — пусто = стандартная</label><input id="connectionModel" autocomplete="off"></div>
         <div><label for="connectionCredential">API-ключ</label><input id="connectionCredential" type="password" autocomplete="off"></div>
@@ -419,7 +420,11 @@ async function refresh(){
 }
 
 function connectionProviderChanged(){
-  document.getElementById('connectionFolderRow').hidden = document.getElementById('connectionProvider').value !== 'yandex';
+  const provider=document.getElementById('connectionProvider').value;
+  document.getElementById('connectionFolderRow').hidden = provider !== 'yandex';
+  const defaults={gemini:'gemini-1.5-flash',anthropic:'claude-haiku-4-5-20251001',openai:'gpt-4o-mini',
+    groq:'openai/gpt-oss-120b',zai:'glm-4.7-flash',yandex:'yandexgpt-lite'};
+  document.getElementById('connectionModel').placeholder=defaults[provider]||'';
 }
 function clearConnectionForm(){
   for(const name of ['Model','Credential','Folder']) document.getElementById('connection'+name).value='';
@@ -446,8 +451,23 @@ function renderConnections(items){
     };
     const state=document.createElement('span'); state.textContent=item.enabled?'Включено':'Отключено';
     const control=document.createElement('label'); control.style.cssText='display:inline-flex;align-items:center;gap:8px;margin:0';
-    control.append(toggle,state); row.append(label,control); root.append(row);
+    control.append(toggle,state);
+    const test=document.createElement('button'); test.type='button'; test.textContent='Проверить';
+    test.setAttribute('aria-label',`Проверить подключение ${item.order+1}`);
+    const testState=document.createElement('span'); testState.className='muted';
+    test.onclick=()=>testConnection(item.id,test,testState);
+    row.append(label,control,test,testState); root.append(row);
   }
+}
+async function testConnection(id,button,state){
+  button.disabled=true; state.textContent='Проверка…';
+  try {
+    const response=await fetch('/api/llm-connections/'+encodeURIComponent(id)+'/test',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const data=await response.json(); state.textContent=data.status||'Ошибка';
+    if(!data.ok) showToast(`Подключение: ${state.textContent}`,'err');
+  } catch { state.textContent='Ошибка сети'; }
+  finally { button.disabled=false; }
 }
 async function loadConnections(){
   try {

@@ -401,6 +401,31 @@ def api_llm_connection_save(connection_id=None):
         return jsonify({"error": "Проверьте провайдера, модель и настройки подключения"}), 400
 
 
+@app.post("/api/llm-connections/<connection_id>/test")
+def api_llm_connection_test(connection_id):
+    """Test one saved provider with a constant prompt containing no HH data."""
+    import llm_connections as connections
+    from llm_provider import execute
+    if (not request.is_json or (request.headers.get("Origin")
+            and request.headers["Origin"].rstrip("/") != request.host_url.rstrip("/"))):
+        return jsonify({"ok": False, "status": "invalid_request"}), 400
+    try:
+        item = next((connection for connection in connections.load_connections(envfile.read_env())
+                     if connection.id == connection_id), None)
+    except connections.ConnectionConfigError:
+        return jsonify({"ok": False, "status": "connection_config_invalid"}), 400
+    if item is None or not item.credential:
+        return jsonify({"ok": False, "status": "connection_not_found"}), 404
+    text, failure = execute(item, "Reply with exactly the single word CONNECTED.", 16)
+    if failure is not None:
+        status = f"HTTP {failure.http_status}" if failure.http_status is not None else failure.category
+        return jsonify({"ok": False, "status": status,
+                        "category": failure.category, "http_status": failure.http_status})
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"ok": False, "status": "provider_invalid_response"})
+    return jsonify({"ok": True, "status": "CONNECTED"})
+
+
 @app.post("/api/config")
 def api_config():
     payload = request.get_json(force=True) or {}
