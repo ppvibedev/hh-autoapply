@@ -72,7 +72,7 @@ class ConnectionsUITests(unittest.TestCase):
                     for secret in ('SECRET_A','SECRET_B','SECRET_C','SECRET_D'):
                         self.assertNotIn(secret,public)
                     tested_connection,test_prompt,test_limit=connection_test.call_args.args
-                    self.assertEqual((tested_connection.provider,test_limit),('groq',16))
+                    self.assertEqual((tested_connection.provider,test_limit),('groq',128))
                     self.assertEqual(test_prompt,'Reply with exactly the single word CONNECTED.')
                     self.assertEqual(errors,[]); self.assertEqual(forbidden_requests,[])
                     page.locator('#llmConnections').scroll_into_view_if_needed()

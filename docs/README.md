@@ -517,8 +517,10 @@ endpoint; пользовательский base URL не принимается.
 
 Groq по умолчанию использует `openai/gpt-oss-120b` через
 `https://api.groq.com/openai/v1/chat/completions`. Для этой модели заданы
-`reasoning_effort=low` и `reasoning_format=hidden`, чтобы task-модули получали
-только финальный text. Контракт: [Groq OpenAI compatibility](https://console.groq.com/docs/openai)
+`reasoning_effort=low` и `include_reasoning=false`, чтобы task-модули получали
+только финальный text. Лимит передаётся как актуальный `max_completion_tokens`;
+нейтральная проверка подключения использует увеличенный лимит, потому что GPT-OSS
+расходует часть completion budget на скрытые reasoning tokens. Контракт: [Groq API reference](https://console.groq.com/docs/api-reference)
 и [GPT-OSS 120B](https://console.groq.com/docs/model/openai/gpt-oss-120b). Наличие ключа не
 означает наличие квоты или биллинга.
 

@@ -391,11 +391,12 @@ class ConnectionTests(unittest.TestCase):
     def test_groq_and_zai_openai_compatible_contracts(self):
         cases = {
             'groq': ('openai/gpt-oss-120b', 'https://api.groq.com/openai/v1/chat/completions',
-                     {'reasoning_effort': 'low', 'reasoning_format': 'hidden'}),
+                     {'reasoning_effort': 'low', 'include_reasoning': False},
+                     'max_completion_tokens'),
             'zai': ('glm-4.7-flash', 'https://api.z.ai/api/paas/v4/chat/completions',
-                    {'thinking': {'type': 'disabled'}}),
+                    {'thinking': {'type': 'disabled'}}, 'max_tokens'),
         }
-        for index, (provider, (model, url, extra)) in enumerate(cases.items(), 1):
+        for index, (provider, (model, url, extra, limit_field)) in enumerate(cases.items(), 1):
             with self.subTest(provider=provider), patch('llm.requests.post', return_value=chat_response(text=' FINAL ')) as post:
                 item = connection(index, provider, model)
                 self.assertEqual(llm.Router([item]).generate('neutral facts', 123, 'question'), 'FINAL')
@@ -403,11 +404,35 @@ class ConnectionTests(unittest.TestCase):
                 self.assertEqual(request.args[0], url)
                 self.assertEqual(request.kwargs['headers']['Authorization'], f'Bearer SECRET_{chr(64+index)}')
                 self.assertEqual(request.kwargs['json']['model'], model)
-                self.assertEqual(request.kwargs['json']['max_tokens'], 123)
+                self.assertEqual(request.kwargs['json'][limit_field], 123)
+                self.assertNotIn('max_tokens' if limit_field == 'max_completion_tokens'
+                                 else 'max_completion_tokens', request.kwargs['json'])
                 self.assertEqual(request.kwargs['json']['messages'], [{'role': 'user', 'content': 'neutral facts'}])
                 for key, value in extra.items():
                     self.assertEqual(request.kwargs['json'][key], value)
                 self.assertEqual(request.kwargs['timeout'], 60)
+
+    def test_groq_reasoning_only_length_response_fails_closed(self):
+        real_shape = {'choices': [{'finish_reason': 'length', 'message': {
+            'role': 'assistant', 'content': ''}}], 'usage': {
+            'completion_tokens': 16,
+            'completion_tokens_details': {'reasoning_tokens': 9}}}
+        with patch('llm_provider.requests.post', return_value=response(body=real_shape)):
+            text, failure = llm_provider.execute(
+                connection(provider='groq', model='openai/gpt-oss-120b'), 'neutral', 16)
+        self.assertIsNone(text)
+        self.assertEqual(failure.category, 'provider_invalid_response')
+
+    def test_groq_never_returns_reasoning_as_final_output(self):
+        body = {'choices': [{'finish_reason': 'stop', 'message': {
+            'role': 'assistant', 'content': ' CONNECTED ',
+            'reasoning': 'PRIVATE_CHAIN_OF_THOUGHT'}}]}
+        with patch('llm_provider.requests.post', return_value=response(body=body)):
+            text, failure = llm_provider.execute(
+                connection(provider='groq', model='openai/gpt-oss-120b'), 'neutral', 128)
+        self.assertEqual(text, 'CONNECTED')
+        self.assertIsNone(failure)
+        self.assertNotIn('PRIVATE_CHAIN_OF_THOUGHT', text)
 
     def test_groq_and_zai_429_are_safely_normalized(self):
         for provider, model in (('groq', 'openai/gpt-oss-120b'), ('zai', 'glm-4.7-flash')):
@@ -514,7 +539,7 @@ class ConnectionTests(unittest.TestCase):
             self.assertEqual(tested.json, {'ok': True, 'status': 'CONNECTED'})
             item, prompt, limit = execute.call_args.args
             self.assertEqual((item.provider, item.model, limit),
-                             ('groq', 'openai/gpt-oss-120b', 16))
+                             ('groq', 'openai/gpt-oss-120b', 128))
             self.assertEqual(prompt, 'Reply with exactly the single word CONNECTED.')
             for private in ('SECRET_A', 'SECRET_B', 'SECRET_C', 'resume', 'vacancy', 'candidate', 'hh'):
                 self.assertNotIn(private, prompt.lower())

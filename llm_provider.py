@@ -7,18 +7,21 @@ OPENAI_COMPATIBLE = {
     'openai': {
         'url': 'https://api.openai.com/v1/chat/completions',
         'extra': {},
+        'token_limit_field': 'max_tokens',
     },
     'groq': {
         'url': 'https://api.groq.com/openai/v1/chat/completions',
-        # GPT-OSS returns only final content while using its lowest supported
-        # reasoning effort for these short classification/writing tasks.
-        'extra': {'reasoning_effort': 'low', 'reasoning_format': 'hidden'},
+        # GPT-OSS uses reasoning even for short tasks. Exclude it from the
+        # response; callers consume only the final message content.
+        'extra': {'reasoning_effort': 'low', 'include_reasoning': False},
+        'token_limit_field': 'max_completion_tokens',
     },
     'zai': {
         'url': 'https://api.z.ai/api/paas/v4/chat/completions',
         # The selected GLM model supports disabling thinking; callers need only
         # the final answer text and already validate JSON/evidence themselves.
         'extra': {'thinking': {'type': 'disabled'}},
+        'token_limit_field': 'max_tokens',
     },
 }
 
@@ -27,7 +30,7 @@ def _openai_compatible(connection, prompt, max_tokens):
     settings = OPENAI_COMPATIBLE[connection.provider]
     payload = {
         'model': connection.model,
-        'max_tokens': max_tokens,
+        settings['token_limit_field']: max_tokens,
         'messages': [{'role': 'user', 'content': prompt}],
         **settings['extra'],
     }
@@ -46,7 +49,7 @@ def execute(connection, prompt, max_tokens):
     failure = None
     try:
         text = _request(connection, prompt, max_tokens)
-        if not isinstance(text, str):
+        if not isinstance(text, str) or not text.strip():
             return None, ProviderFailure('provider_invalid_response')
         return text, None
     except requests.HTTPError as error:

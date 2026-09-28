@@ -416,7 +416,10 @@ def api_llm_connection_test(connection_id):
         return jsonify({"ok": False, "status": "connection_config_invalid"}), 400
     if item is None or not item.credential:
         return jsonify({"ok": False, "status": "connection_not_found"}), 404
-    text, failure = execute(item, "Reply with exactly the single word CONNECTED.", 16)
+    # GPT-OSS may spend part of the completion budget on hidden reasoning.
+    # Keep the fixed neutral test large enough to leave room for its final word.
+    test_limit = 128 if item.provider == "groq" else 16
+    text, failure = execute(item, "Reply with exactly the single word CONNECTED.", test_limit)
     if failure is not None:
         status = f"HTTP {failure.http_status}" if failure.http_status is not None else failure.category
         return jsonify({"ok": False, "status": status,
