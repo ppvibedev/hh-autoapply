@@ -369,6 +369,68 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(rows[-1]['stop_reason'],'target_reached')
         self.assertEqual(rows[-1]['counts']['applied_confirmed'],1)
 
+    def test_submission_unknown_is_local_and_persistently_blocks_only_that_vacancy(self):
+        from pathlib import Path
+        unknown = dict(VAC, id='111')
+        confirmed = dict(VAC, id='222')
+        later = dict(VAC, id='333')
+        browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
+        outcomes=[
+            {'application_status':'submission_unknown','reason':'submission_sent_confirmation_missing'},
+            {'application_status':'applied_confirmed','reason':'explicit confirmation'},
+            {'application_status':'applied_confirmed','reason':'explicit confirmation'},
+        ]
+        with patch.object(config,'DRY_RUN',False), patch('run_web.browser_context',return_value=browser), \
+             patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), \
+             patch('run_web._get_resume',return_value=FACT), \
+             patch('hh_web.search_page',side_effect=[[unknown,confirmed],[unknown,later]]), \
+             patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), \
+             patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), \
+             patch('hh_web.apply',side_effect=outcomes) as apply:
+            self.assertEqual(run_web.main(),0)
+            self.assertEqual(run_web.main(),0)
+
+        self.assertEqual([call.args[1]['id'] for call in apply.call_args_list],['111','222','333'])
+        safety=history_store.load_safety(config.APPLICATION_SAFETY_FILE)
+        self.assertEqual(safety['111'],'submission_unknown')
+        rows=[json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()]
+        finished=[row for row in rows if row.get('event')=='run_finished']
+        self.assertEqual(finished[-2]['counts']['submission_unknown'],1)
+        self.assertEqual(finished[-2]['counts']['applied_confirmed'],1)
+        self.assertEqual(finished[-2]['counts']['apply_attempted'],2)
+        self.assertEqual(finished[-2]['stop_reason'],'target_reached')
+        self.assertEqual(finished[-1]['counts']['applied_confirmed'],1)
+        blocked=[row for row in rows if row.get('vacancy_id')=='111'
+                 and row.get('reason')=='blocked_by_persistent_history']
+        self.assertEqual(len(blocked),1)
+        self.assertEqual(blocked[0]['application_status'],'submission_unknown')
+
+    def test_vacancy_local_application_failures_continue_to_confirmed_application(self):
+        from pathlib import Path
+        reasons=('unsupported_form','question_not_safely_answered',
+                 'submit_disabled_validation','selected_resume_not_verified')
+        vacs=[dict(VAC,id=str(201+i)) for i in range(len(reasons)+1)]
+        outcomes=[{'application_status':'needs_manual_review','reason':reason,'reason_code':reason}
+                  for reason in reasons]
+        outcomes.append({'application_status':'applied_confirmed','reason':'explicit confirmation'})
+        browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
+        with patch.object(config,'DRY_RUN',False), patch('run_web.browser_context',return_value=browser), \
+             patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), \
+             patch('run_web._get_resume',return_value=FACT), patch('hh_web.search_page',return_value=vacs), \
+             patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), \
+             patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), \
+             patch('hh_web.apply',side_effect=outcomes) as apply:
+            self.assertEqual(run_web.main(),0)
+
+        self.assertEqual(apply.call_count,5)
+        rows=[json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()]
+        final=next(row for row in reversed(rows) if row.get('event')=='run_finished')
+        self.assertEqual(final['counts']['manual_review'],4)
+        self.assertEqual(final['counts']['applied_confirmed'],1)
+        self.assertEqual(final['counts']['submission_unknown'],0)
+        self.assertEqual(final['counts']['apply_attempted'],5)
+        self.assertEqual(final['stop_reason'],'target_reached')
+
     def test_compact_exact_id_safety_blocks_old_id_but_not_similar_new_id(self):
         from pathlib import Path
         history_store.record_safety(config.APPLICATION_SAFETY_FILE, '111', 'submission_unknown')

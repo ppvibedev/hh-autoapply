@@ -486,9 +486,9 @@ def main():
                                         history_store.record_safety(
                                             config.APPLICATION_SAFETY_FILE, vid, status)
                                         blocked_vacancies[vid] = status
-                                    if status == "submission_unknown":
-                                        halt, stop_reason = True, "submission_unknown"
-                                        run_status = "STOPPED"
+                                    # Ambiguous submission is local to this vacancy. The
+                                    # durable safety ledger prevents a blind repeat while
+                                    # the run remains free to process other vacancies.
                                     if counts["applied_confirmed"] >= config.TARGET_APPLICATIONS_PER_RUN:
                                         halt, stop_reason = True, "target_reached"
                     except LLMStopped:
