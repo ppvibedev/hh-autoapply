@@ -442,12 +442,7 @@ def main():
                                 role_alignment=result["role_alignment"],
                                 role_alignment_reason=result["role_alignment_reason"], role_evidence=result["role_evidence"],
                                 matching_result=result)
-                            if result["role_alignment"] != "aligned":
-                                counts["manual_review"] += 1
-                                entry.update(decision="needs_manual_review",
-                                    reason_code="role_" + result["role_alignment"],
-                                    reason=result["role_alignment_reason"])
-                            elif result["remote_status"] == "ineligible":
+                            if result["remote_status"] == "ineligible":
                                 counts["hard_rejected"] += 1
                                 entry.update(decision="rejected_remote", reason=result["remote_reason"])
                             elif result["remote_status"] == "unclear":
@@ -456,6 +451,11 @@ def main():
                             elif result["score"] < config.SCORE_THRESHOLD:
                                 counts["score_rejected"] += 1
                                 entry["decision"] = "rejected_score"
+                            elif result["role_alignment"] != "aligned":
+                                counts["manual_review"] += 1
+                                entry.update(decision="needs_manual_review",
+                                    reason_code="role_" + result["role_alignment"],
+                                    reason=result["role_alignment_reason"])
                             elif not _observe_stop():
                                 mark_stage("cover_letter")
                                 entry["letter"] = decide.cover_letter(full, resume_text, materials, instructions)

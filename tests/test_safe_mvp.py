@@ -303,6 +303,74 @@ class SafeTests(unittest.TestCase):
         self.assertEqual(row['matching_result']['reason'], RESULT['reason'])
         self.assertEqual(row['matching_result']['role_alignment'], 'functional_mismatch')
 
+    def test_score_threshold_precedes_role_alignment_for_valid_matching_results(self):
+        cases = (
+            (15, 'functional_mismatch', 'rejected_score', False),
+            (65, 'adjacent', 'rejected_score', False),
+            (74, 'aligned', 'rejected_score', False),
+            (75, 'aligned', 'safe_ready', True),
+            (85, 'aligned', 'safe_ready', True),
+            (85, 'adjacent', 'needs_manual_review', False),
+            (85, 'functional_mismatch', 'needs_manual_review', False),
+            (85, 'unclear', 'needs_manual_review', False),
+        )
+        for index, (score, alignment, expected, letter_expected) in enumerate(cases):
+            with self.subTest(score=score, alignment=alignment):
+                vacancy = dict(VAC, id=str(200000000 + index))
+                result = dict(RESULT, score=score, capability_score=score,
+                              role_alignment=alignment,
+                              role_alignment_reason='Тестовая классификация роли.')
+                browser = MagicMock(); browser.__enter__.return_value = (None, MagicMock())
+                with patch.object(config, 'SCORE_THRESHOLD', 75), \
+                     patch('run_web.browser_context', return_value=browser), \
+                     patch('run_web.has_session', return_value=True), \
+                     patch('run_web.load_candidate_context', return_value=('', '')), \
+                     patch('run_web._get_resume', return_value='Опыт'), \
+                     patch('hh_web.search_page', return_value=[vacancy]), \
+                     patch('hh_web.load_full', side_effect=lambda page, item: item), \
+                     patch('decide.hard_filters', return_value=None), \
+                     patch('decide.score', return_value=result), \
+                     patch('decide.cover_letter', return_value='Письмо') as letter:
+                    self.assertEqual(run_web.main(), 0)
+                row = [json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()
+                       if 'vacancy_id' in line][-1]
+                self.assertEqual(row['decision'], expected)
+                self.assertEqual(letter.called, letter_expected)
+
+    def test_threshold_and_manual_counters_are_disjoint_and_matching_failure_stays_manual(self):
+        vacancies = [dict(VAC, id=str(300000000 + index)) for index in range(4)]
+        results = [
+            dict(RESULT, score=15, capability_score=15, role_alignment='functional_mismatch'),
+            dict(RESULT, score=85, capability_score=85, role_alignment='adjacent'),
+            dict(RESULT, score=85, capability_score=85, role_alignment='aligned'),
+            ValueError('matching_invalid_json'),
+        ]
+        def score(*_args, **_kwargs):
+            value = results.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        browser = MagicMock(); browser.__enter__.return_value = (None, MagicMock())
+        with patch.object(config, 'SCORE_THRESHOLD', 75), \
+             patch('run_web.browser_context', return_value=browser), \
+             patch('run_web.has_session', return_value=True), \
+             patch('run_web.load_candidate_context', return_value=('', '')), \
+             patch('run_web._get_resume', return_value='Опыт'), \
+             patch('hh_web.search_page', return_value=vacancies), \
+             patch('hh_web.load_full', side_effect=lambda page, item: item), \
+             patch('decide.hard_filters', return_value=None), \
+             patch('decide.score', side_effect=score), \
+             patch('decide.cover_letter', return_value='Письмо'):
+            self.assertEqual(run_web.main(), 0)
+        rows = [json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()]
+        decisions = [row['decision'] for row in rows if row.get('vacancy_id')]
+        self.assertEqual(decisions, ['rejected_score', 'needs_manual_review',
+                                     'safe_ready', 'needs_manual_review'])
+        final = next(row for row in reversed(rows) if row.get('event') == 'run_finished')
+        self.assertEqual(final['counts']['score_rejected'], 1)
+        self.assertEqual(final['counts']['manual_review'], 2)
+        self.assertEqual(final['counts']['safe_ready'], 1)
+
     def test_role_gate_regression_matrix(self):
         cases = (
             ('PM → active B2B Sales', 'Project Manager', 'B2B Sales Manager',

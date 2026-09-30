@@ -42,6 +42,15 @@ _stop_attempts: dict[str, tuple[dict, int] | None] = {}
 _stop_attempts_lock = threading.Lock()
 _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _STOP_ATTEMPT_LIMIT = 64
+_RUN_ID_RE = re.compile(r"[0-9a-f]{32}")
+_VACANCY_ID_RE = re.compile(r"[1-9][0-9]*")
+_HISTORY_PAGE_DEFAULT = 75
+_HISTORY_PAGE_MAX = 100
+_HISTORY_CARD_FIELDS = (
+    "run_id", "vacancy_id", "vid", "decision", "ts", "title", "company", "employer",
+    "url", "reason_code", "reason", "why", "score", "role_alignment",
+    "role_alignment_reason", "letter",
+)
 
 # Ключи .env, которые разрешено править из интерфейса.
 EDITABLE = [
@@ -156,10 +165,10 @@ def _current_run_rows():
 
 
 
-def _run_log(rows):
+def _run_log(rows, limit=100):
     # Structured events already carry run_id; raw stdout mixes all past runs.
-    return "\n".join(json.dumps(r, ensure_ascii=False) for r in reversed(rows)
-                     if r.get("event"))
+    events = [r for r in rows if r.get("event")][:limit]
+    return "\n".join(json.dumps(r, ensure_ascii=False) for r in reversed(events))
 
 
 def _counts(rows: list[dict]) -> dict[str, int]:
@@ -173,6 +182,36 @@ def _counts(rows: list[dict]) -> dict[str, int]:
         if d in c:
             c[d] += 1
     return c
+
+
+def _history_card(row):
+    """Project a persisted outcome to the fields already shown by the local dashboard."""
+    return {key: row[key] for key in _HISTORY_CARD_FIELDS if key in row}
+
+
+def _vacancy_rows(rows, run_id):
+    return [row for row in rows
+            if row.get("run_id") == run_id and not row.get("event") and row.get("vacancy_id")]
+
+
+def _history_page(rows, run_id, cursor, limit):
+    decisions = _vacancy_rows(rows, run_id)
+    start = 0
+    if cursor is not None:
+        positions = [index for index, row in enumerate(decisions)
+                     if str(row.get("vacancy_id")) == cursor]
+        if len(positions) != 1:
+            raise ValueError("invalid_history_cursor")
+        start = positions[0] + 1
+    selected = decisions[start:start + limit]
+    more = start + len(selected) < len(decisions)
+    return {
+        "run_id": run_id,
+        "items": [_history_card(row) for row in selected],
+        "next_cursor": str(selected[-1]["vacancy_id"]) if more and selected else None,
+        "total": len(decisions),
+        "order": "newest_first",
+    }
 
 
 def _running() -> bool:
@@ -356,6 +395,7 @@ def index():
 def api_state():
     env = envfile.read_env()
     run_id, rows = _current_run_rows()
+    vacancy_rows = _vacancy_rows(rows, run_id) if run_id else []
     return jsonify({
         "running": _running() or _any_run_alive(),  # учитывает и осиротевшие процессы
         "login_running": _login_running(),
@@ -371,9 +411,37 @@ def api_state():
         "run_id": run_id,
         "run_log": _run_log(rows),
         "counts": _counts(rows),
-        "decisions": [r for r in rows if not r.get("event")][:100],
+        # Vacancy cards are loaded separately and incrementally. Keeping this
+        # compatibility field empty avoids returning large outcomes every poll.
+        "decisions": [],
+        "history_total": len(vacancy_rows),
+        "history_latest_vacancy_id": str(vacancy_rows[0]["vacancy_id"]) if vacancy_rows else None,
+        "history_page_size": _HISTORY_PAGE_DEFAULT,
         "last_run": next((r for r in rows if r.get("event") == "run_finished"), None),
     })
+
+
+@app.get("/api/history")
+def api_history():
+    run_id = request.args.get("run_id", "")
+    if not _RUN_ID_RE.fullmatch(run_id):
+        return jsonify({"error": "invalid_run_id"}), 400
+    raw_limit = request.args.get("limit", str(_HISTORY_PAGE_DEFAULT))
+    if not raw_limit.isdigit():
+        return jsonify({"error": "invalid_history_limit"}), 400
+    limit = int(raw_limit)
+    if not 1 <= limit <= _HISTORY_PAGE_MAX:
+        return jsonify({"error": "invalid_history_limit"}), 400
+    cursor = request.args.get("cursor")
+    if cursor is not None and not _VACANCY_ID_RE.fullmatch(cursor):
+        return jsonify({"error": "invalid_history_cursor"}), 400
+    rows = _read_decisions(limit=100000)
+    if not any(row.get("run_id") == run_id for row in rows):
+        return jsonify({"error": "run_not_found"}), 404
+    try:
+        return jsonify(_history_page(rows, run_id, cursor, limit))
+    except ValueError:
+        return jsonify({"error": "invalid_history_cursor"}), 400
 
 
 @app.get("/api/llm-connections")

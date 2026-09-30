@@ -11,10 +11,12 @@ class CurrentRunTests(unittest.TestCase):
     setUp = test_safe_mvp.SafeTests.setUp
 
     def test_restart_empty_then_user_run_only(self):
-        rows = [dict(event='run_started',run_id='aaa'),
-                dict(run_id='aaa',decision='safe_ready',title='Old'),
-                dict(event='run_error',run_id='aaa',error_message='Old error'),
-                dict(event='run_finished',run_id='aaa')]
+        old_run = 'a' * 32
+        new_run = 'b' * 32
+        rows = [dict(event='run_started',run_id=old_run),
+                dict(run_id=old_run,decision='safe_ready',title='Old'),
+                dict(event='run_error',run_id=old_run,error_message='Old error'),
+                dict(event='run_finished',run_id=old_run)]
         path = Path(config.DECISIONS_LOG)
         path.write_text('\n'.join(json.dumps(r) for r in rows)+'\n')
         original = path.read_bytes()
@@ -36,17 +38,20 @@ class CurrentRunTests(unittest.TestCase):
                 self.assertEqual(client.post('/api/run').status_code,200)
             spawn.assert_called_once_with('run_web.py')
             assert_empty()
-            new_rows=[dict(event='run_started',run_id='bbb'),
-                      dict(run_id='bbb',decision='safe_ready',title='New'),
-                      dict(event='run_finished',run_id='bbb',status='COMPLETED')]
+            new_rows=[dict(event='run_started',run_id=new_run),
+                      dict(run_id=new_run,vacancy_id='123456789',vid='123456789',decision='safe_ready',title='New'),
+                      dict(event='run_finished',run_id=new_run,status='COMPLETED')]
             with path.open('a') as f:
                 for row in new_rows: f.write(json.dumps(row)+'\n')
             state=client.get('/api/state').get_json()
-            self.assertEqual(state['run_id'],'bbb')
+            self.assertEqual(state['run_id'],new_run)
             self.assertEqual(state['counts']['safe_ready'],1)
-            self.assertEqual([r['title'] for r in state['decisions']],['New'])
+            self.assertEqual(state['decisions'],[])
+            self.assertEqual(state['history_total'],1)
+            history=client.get('/api/history?run_id='+new_run).get_json()
+            self.assertEqual([r['title'] for r in history['items']],['New'])
             self.assertEqual(state['last_run']['status'],'COMPLETED')
-            self.assertNotIn('aaa',state['run_log'])
+            self.assertNotIn(old_run,state['run_log'])
             self.assertNotIn('Old error',state['run_log'])
             saved=path.read_bytes()
             self.assertTrue(saved.startswith(original))

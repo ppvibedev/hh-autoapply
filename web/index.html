@@ -40,7 +40,9 @@
   label{font-size:13px;color:var(--tx2);display:block;margin:10px 0 4px}
   input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--tx);font:inherit}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .feed{display:flex;flex-direction:column;gap:8px}
+  .feed{display:flex;flex-direction:column;gap:8px;max-height:480px;overflow-y:auto;
+    overscroll-behavior:contain;padding-right:4px}
+  .history-status{margin-top:8px;text-align:center}
   .item{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px}
   .tag{font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px;white-space:nowrap;flex-shrink:0}
   .t-would{background:var(--ok-bg);color:var(--ok)}
@@ -211,6 +213,7 @@
   <div class="card">
     <h2>Лента решений</h2>
     <div class="feed" id="feed"></div>
+    <div class="muted history-status" id="historyStatus"></div>
   </div>
 
   <div class="card">
@@ -248,9 +251,84 @@ let activeStopAttemptId = null;
 let stateRefreshPromise = null;
 let stateFetchController = null;
 let pollingPaused = false;
+let historyRunId = null;
+let historyItems = [];
+let historyIds = new Set();
+let historyNextCursor = null;
+let historyLatestVacancyId = null;
+let historyKnownTotal = 0;
+let historyLoading = false;
+let historyExhausted = false;
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>cfgTouched=true));
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function historyCard(r){
+  const [cls,label] = TAGS[r.decision]||['t-below','Ранее: '+String(r.decision)];
+  const detail = r.reason_code || r.reason;
+  const extra = detail ? ` · ${detail}` : (r.why? ` · ${r.why}`:'');
+  const sc = (r.score!=null)?`<span class="sc">${esc(r.score)}</span>`:'';
+  const role = r.role_alignment && r.role_alignment !== 'aligned'
+    ? `<div class="muted">Роль: ${esc(ROLE_ALIGNMENT_LABELS[r.role_alignment]||r.role_alignment)} · ${esc(r.role_alignment_reason||'требуется проверка')}</div>` : '';
+  const letter = r.letter ? `<details data-vid="${esc(r.vid||r.vacancy_id)}" style="margin-top:6px"><summary class="muted" style="cursor:pointer">письмо</summary><div class="muted" style="white-space:pre-wrap;margin-top:6px">${esc(r.letter)}</div></details>` : '';
+  const link = /^https:\/\/hh\.ru\/vacancy\/\d+$/.test(r.url||'')
+    ? `<a href="${r.url}" target="_blank" rel="noopener noreferrer">Открыть вакансию HH</a>` : '';
+  return `<div class="item" data-vacancy-id="${esc(r.vacancy_id||r.vid||'')}"><span class="tag ${cls}">${esc(label)}</span>
+    <div style="flex:1"><div>${esc(r.title||'')}</div>${link}<div class="muted">${esc(r.company||r.employer||'')}${esc(extra)}</div>${role}${letter}</div>${sc}</div>`;
+}
+
+function renderHistory(preservePosition=false){
+  const feed = document.getElementById('feed');
+  const previousHeight = feed.scrollHeight;
+  const previousTop = feed.scrollTop;
+  const open = new Set([...feed.querySelectorAll('details[open]')].map(d=>d.dataset.vid));
+  feed.innerHTML = historyItems.map(historyCard).join('') || '<div class="muted">Пусто. Запусти прогон.</div>';
+  for(const detail of feed.querySelectorAll('details')) if(open.has(detail.dataset.vid)) detail.open=true;
+  if(preservePosition && previousTop>20) feed.scrollTop=previousTop+(feed.scrollHeight-previousHeight);
+  const shown=historyItems.length;
+  document.getElementById('historyStatus').textContent = historyLoading ? 'Загружаю историю…'
+    : historyRunId ? `Показано ${shown} из ${historyKnownTotal}${historyExhausted?'':' · прокрутите вниз'}` : '';
+}
+
+async function loadHistoryPage(newest=false){
+  if(!historyRunId || historyLoading || (!newest && historyExhausted)) return;
+  const requestedRun=historyRunId;
+  historyLoading=true; renderHistory();
+  try{
+    const params=new URLSearchParams({run_id:requestedRun,limit:'75'});
+    if(!newest && historyNextCursor) params.set('cursor',historyNextCursor);
+    const response=await fetch('/api/history?'+params.toString());
+    const data=await response.json();
+    if(!response.ok || data.run_id!==requestedRun || historyRunId!==requestedRun) return;
+    const incoming=Array.isArray(data.items)?data.items:[];
+    historyKnownTotal=Number.isInteger(data.total)?data.total:historyKnownTotal;
+    if(newest && historyItems.length){
+      const added=incoming.filter(item=>!historyIds.has(String(item.vacancy_id)));
+      for(const item of added) historyIds.add(String(item.vacancy_id));
+      historyItems=[...added,...historyItems];
+      historyLatestVacancyId=incoming.length?String(incoming[0].vacancy_id):historyLatestVacancyId;
+      renderHistory(added.length>0);
+    }else{
+      const added=incoming.filter(item=>!historyIds.has(String(item.vacancy_id)));
+      for(const item of added) historyIds.add(String(item.vacancy_id));
+      historyItems.push(...added);
+      historyNextCursor=data.next_cursor||null;
+      historyLatestVacancyId=historyItems.length?String(historyItems[0].vacancy_id):null;
+      historyExhausted=!historyNextCursor;
+    }
+  }catch(_error){
+    document.getElementById('historyStatus').textContent='Не удалось загрузить историю';
+  }finally{
+    if(historyRunId===requestedRun){historyLoading=false;renderHistory();}
+  }
+}
+
+function resetHistory(runId,total=0){
+  historyRunId=runId||null; historyItems=[]; historyIds=new Set(); historyNextCursor=null;
+  historyLatestVacancyId=null; historyKnownTotal=total||0; historyLoading=false; historyExhausted=false;
+  renderHistory();
+  if(historyRunId) loadHistoryPage(false);
+}
 
 function showToast(text, kind){
   const box = document.getElementById('toasts');
@@ -357,7 +435,7 @@ async function refresh(){
   rb.style.display = s.running ? 'flex' : 'none';
   if(s.running){
     const done = s.counts.safe_ready||0;
-    document.getElementById('runBannerCount').textContent = `· SAFE готово ${done} · подтверждено ${s.counts.applied_confirmed||0}`;
+    document.getElementById('runBannerCount').textContent = `· готово в SAFE ${done} · подтверждено ${s.counts.applied_confirmed||0}`;
   }
 
   document.getElementById('loginStartBtn').disabled = s.login_running;
@@ -370,9 +448,17 @@ async function refresh(){
 
   const c = s.counts;
   document.getElementById('stats').innerHTML = [
-    ['scanned','Просмотрено'],['applied_confirmed','Подтверждено'],['apply_failed','Не отправлено'],['submission_unknown','Неизвестно'],['safe_ready','SAFE готово'],['rejected_score','Ниже порога'],
-    ['rejected_hard_filter','Фильтр'],['rejected_remote','Не remote'],['needs_manual_review','Проверить'],
-  ].map(([k,l])=>`<div class="stat"><div class="n">${c[k]||0}</div><div class="l">${l}</div></div>`).join('');
+    ['scanned','Просмотрено','Уникальные вакансии, обработанные в этом прогоне'],
+    ['applied_confirmed','Подтверждено','HH явно подтвердил новый отклик'],
+    ['already_applied','Уже откликались','HH или safety ledger показывают существующий отклик'],
+    ['apply_failed','Ошибка отправки','HH явно сообщил, что попытка отклика не отправлена'],
+    ['submission_unknown','Неизвестно','Возможно отправлено — требуется проверка'],
+    ['safe_ready','Готово в SAFE','В SAFE письмо готово, отправка заблокирована'],
+    ['rejected_score','Ниже порога','Надёжный match score ниже настроенного порога'],
+    ['rejected_hard_filter','Hard-фильтр','Стоп-слово, blacklist или доказанный зарплатный фильтр'],
+    ['rejected_remote','Не remote','Условия удалённой работы не подходят'],
+    ['needs_manual_review','Проверить','Потенциально интересная вакансия требует ручного решения'],
+  ].map(([k,l,h])=>`<div class="stat" title="${esc(h)}"><div class="n">${c[k]||0}</div><div class="l">${l}</div></div>`).join('');
 
   populateResumes(s.resumes || []);
   const rh = document.getElementById('resumesHint');
@@ -387,25 +473,13 @@ async function refresh(){
 
   renderStopState();
 
-
-  const feed = document.getElementById('feed');
-  const sig = JSON.stringify(s.decisions.map(r=>[r.run_id,r.vid,r.decision,r.ts]));
-  if(feed.dataset.sig !== sig){                          // перерисовываем только если лента изменилась
-    const open = new Set([...feed.querySelectorAll('details[open]')].map(d=>d.dataset.vid));
-    feed.innerHTML = s.decisions.map(r=>{
-      const [cls,label] = TAGS[r.decision]||['t-below','Ранее: '+String(r.decision)];
-      const detail = r.reason_code || r.reason;
-      const extra = detail ? ` · ${detail}` : (r.why? ` · ${r.why}`:'');
-      const sc = (r.score!=null)?`<span class="sc">${esc(r.score)}</span>`:'';
-      const role = r.role_alignment && r.role_alignment !== 'aligned'
-        ? `<div class="muted">Роль: ${esc(ROLE_ALIGNMENT_LABELS[r.role_alignment]||r.role_alignment)} · ${esc(r.role_alignment_reason||'требуется проверка')}</div>` : '';
-      const isOpen = open.has(String(r.vid)) ? ' open' : '';
-      const letter = r.letter ? `<details data-vid="${esc(r.vid)}"${isOpen} style="margin-top:6px"><summary class="muted" style="cursor:pointer">письмо</summary><div class="muted" style="white-space:pre-wrap;margin-top:6px">${esc(r.letter)}</div></details>` : '';
-      return `<div class="item"><span class="tag ${cls}">${esc(label)}</span>
-        <div style="flex:1"><div>${esc(r.title||'')}</div>
-          ${/^https:\/\/hh\.ru\/vacancy\/\d+$/.test(r.url||'') ? `<a href="${r.url}" target="_blank" rel="noopener noreferrer">Открыть вакансию HH</a>` : ''}<div class="muted">${esc(r.company||r.employer||'')}${esc(extra)}</div>${role}${letter}</div>${sc}</div>`;
-    }).join('') || '<div class="muted">Пусто. Запусти прогон.</div>';
-    feed.dataset.sig = sig;
+  const total=Number.isInteger(s.history_total)?s.history_total:0;
+  const latest=s.history_latest_vacancy_id==null?null:String(s.history_latest_vacancy_id);
+  if(s.run_id!==historyRunId) resetHistory(s.run_id,total);
+  else {
+    historyKnownTotal=total;
+    if(latest && latest!==historyLatestVacancyId) loadHistoryPage(true);
+    else renderHistory();
   }
 
   document.getElementById('runlog').textContent = s.run_log || '—';
@@ -579,6 +653,10 @@ async function saveCfg(){
 
 loadAreas().then(refresh);
 setInterval(()=>{ if(!pollingPaused) refresh(); }, 3000);
+document.getElementById('feed').addEventListener('scroll',event=>{
+  const feed=event.currentTarget;
+  if(feed.scrollHeight-feed.scrollTop-feed.clientHeight<140) loadHistoryPage(false);
+});
 </script>
 </body>
 </html>
