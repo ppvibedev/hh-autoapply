@@ -195,6 +195,8 @@ def _exception_details(error, stage):
             details["privacy_source_field"] = error.privacy_source_field
         if error.privacy_rule_id:
             details["privacy_rule_id"] = error.privacy_rule_id
+        if error.privacy_match_shape:
+            details["privacy_match_shape"] = error.privacy_match_shape
     if isinstance(error, LLMUnavailable):
         details["llm_failures"] = error.failures
     if isinstance(error, LiveHistoryCorrupt):

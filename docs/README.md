@@ -632,6 +632,11 @@ URL, hostname, headers, payload и credentials для классификации
 Privacy boundary учитывает все загруженные credentials, включая disabled и резервные,
 и проверяет вход/выход общего LLM facade. Сырые requests exceptions не передаются
 в terminal exception. На завершении HTTP-ветки остаётся только безопасная классификация.
+Для блокировки `auth_scheme` diagnostics дополнительно сохраняет только закрытый
+`privacy_match_shape`: enum Basic/Bearer, тип whitespace-разделителя, bucket длины,
+три признака состава символов и, только для Basic, boolean Base64/decoded-colon.
+Matched value, контекст, точная длина, decoded bytes и fragments не сохраняются.
+Regex, порядок privacy rules и fail-closed поведение не изменены.
 
 Проверки: `test_llm_connections`, `test_llm_ui` и связанные targeted task tests
 используют искусственные credentials, временное storage, подмену HTTP/HH и локальный

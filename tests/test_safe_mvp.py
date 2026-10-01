@@ -1,4 +1,5 @@
 """Offline fixtures only. No local .env, sessions or external services are read."""
+import base64
 import json
 import os
 from pathlib import Path
@@ -280,6 +281,70 @@ class SafeTests(unittest.TestCase):
         self.assertNotIn(private_value, encoded)
         self.assertNotIn('private surrounding vacancy material', encoded)
         self.assertNotIn(source, encoded)
+
+    def test_auth_scheme_match_shape_distinguishes_natural_and_basic_credentials(self):
+        def shape(text):
+            with self.assertRaises(PrivacyError) as caught:
+                sanitize_candidate_text(text)
+            self.assertEqual(caught.exception.privacy_rule_id,'auth_scheme')
+            return caught.exception.privacy_match_shape
+
+        natural=shape('Basic knowledge')
+        self.assertEqual(natural,{
+            'scheme':'basic','separator':'space','suffix_length_bucket':'8_11',
+            'letters_only':True,'has_digit':False,'has_token_punctuation':False,
+            'basic_base64_valid':False,'basic_decoded_has_colon':False,
+        })
+        credential=base64.b64encode(b'synthetic-user:synthetic-pass').decode()
+        credential_shape=shape('Basic '+credential)
+        self.assertTrue(credential_shape['basic_base64_valid'])
+        self.assertTrue(credential_shape['basic_decoded_has_colon'])
+        no_colon=base64.b64encode(b'synthetic-payload').decode()
+        no_colon_shape=shape('Basic '+no_colon)
+        self.assertTrue(no_colon_shape['basic_base64_valid'])
+        self.assertFalse(no_colon_shape['basic_decoded_has_colon'])
+
+    def test_auth_scheme_match_shape_separator_length_and_characters(self):
+        def shape(text):
+            with self.assertRaises(PrivacyError) as caught:
+                sanitize_candidate_text(text)
+            return caught.exception.privacy_match_shape
+
+        for separator,expected in [(' ','space'),('\t','tab'),('\n','newline'),(' \t','mixed_whitespace')]:
+            with self.subTest(separator=expected):
+                self.assertEqual(shape('Bearer'+separator+'knowledge')['separator'],expected)
+        for length,expected in ((8,'8_11'),(11,'8_11'),(12,'12_23'),(23,'12_23'),
+                                (24,'24_47'),(47,'24_47'),(48,'48_plus')):
+            with self.subTest(length=length):
+                self.assertEqual(shape('Bearer '+'A'*length)['suffix_length_bucket'],expected)
+        opaque=shape('Bearer Abcd1234._-=')
+        self.assertEqual(opaque['scheme'],'bearer')
+        self.assertFalse(opaque['letters_only'])
+        self.assertTrue(opaque['has_digit'])
+        self.assertTrue(opaque['has_token_punctuation'])
+        self.assertIsNone(opaque['basic_base64_valid'])
+        self.assertIsNone(opaque['basic_decoded_has_colon'])
+        bearer_words=shape('Bearer knowledge')
+        self.assertTrue(bearer_words['letters_only'])
+        self.assertFalse(bearer_words['has_digit'])
+        self.assertFalse(bearer_words['has_token_punctuation'])
+
+    def test_auth_scheme_diagnostic_persists_shape_without_matched_value(self):
+        private_suffix='SYNTHETIC123._-='
+        source='Professional vacancy\nBearer '+private_suffix+'\nPRIVATE SURROUNDING TEXT'
+        vacancy=dict(VAC,description=source)
+        with patch('llm.generate') as generate, self.assertRaises(PrivacyError) as caught:
+            decide.score(vacancy,'Safe resume',resume_title='Project Manager')
+        generate.assert_not_called()
+        details=run_web._exception_details(caught.exception,'matching')
+        self.assertEqual(details['privacy_source_field'],'full_vacancy')
+        self.assertEqual(details['privacy_rule_id'],'auth_scheme')
+        self.assertEqual(details['privacy_match_shape']['scheme'],'bearer')
+        run_web._log(dict(event='run_error',reason_code='unsafe_content_blocked',**details))
+        persisted=Path(config.DECISIONS_LOG).read_text(encoding='utf-8')
+        for private in (private_suffix,source,'PRIVATE SURROUNDING TEXT'):
+            self.assertNotIn(private,persisted)
+        self.assertIn('privacy_match_shape',persisted)
 
     def test_full_context_sanitized_before_matching_and_letter(self):
         vacancy=dict(VAC, description='Профессиональные требования. '*500+'END_VACANCY')

@@ -1,14 +1,44 @@
 """Небольшой фильтр контактов; подозрительные технические секреты блокируют передачу."""
+import base64
+import binascii
 import re
+
+
+_MATCH_SHAPE_SCHEMES = frozenset({'basic','bearer'})
+_MATCH_SHAPE_SEPARATORS = frozenset({'space','tab','newline','mixed_whitespace','other_whitespace'})
+_MATCH_SHAPE_LENGTHS = frozenset({'8_11','12_23','24_47','48_plus'})
+
+
+def _safe_match_shape(value):
+    if not isinstance(value,dict):
+        return None
+    keys = ('scheme','separator','suffix_length_bucket','letters_only','has_digit',
+            'has_token_punctuation','basic_base64_valid','basic_decoded_has_colon')
+    if set(value) != set(keys) or value['scheme'] not in _MATCH_SHAPE_SCHEMES \
+            or value['separator'] not in _MATCH_SHAPE_SEPARATORS \
+            or value['suffix_length_bucket'] not in _MATCH_SHAPE_LENGTHS:
+        return None
+    if any(not isinstance(value[key],bool)
+           for key in ('letters_only','has_digit','has_token_punctuation')):
+        return None
+    basic_values=(value['basic_base64_valid'],value['basic_decoded_has_colon'])
+    if value['scheme'] == 'basic':
+        if any(not isinstance(item,bool) for item in basic_values):
+            return None
+    elif basic_values != (None,None):
+        return None
+    return {key:value[key] for key in keys}
 
 
 class PrivacyError(ValueError):
     """Fail-closed privacy rejection with safe, non-content diagnostics."""
 
-    def __init__(self, message="technical_secret_detected", *, rule_id=None, source_field=None):
+    def __init__(self, message="technical_secret_detected", *, rule_id=None, source_field=None,
+                 match_shape=None):
         super().__init__(message)
         self.privacy_rule_id = rule_id
         self.privacy_source_field = source_field
+        self.privacy_match_shape = _safe_match_shape(match_shape)
 
     def with_source(self, source_field):
         if self.privacy_source_field is None:
@@ -33,6 +63,44 @@ SECRET_RULES = (
 )
 
 
+def _auth_scheme_match_shape(match):
+    parsed = re.fullmatch(r'(Bearer|Basic)(\s+)([A-Za-z0-9+/_.=-]{8,})',match.group(),re.I)
+    if parsed is None:
+        return None
+    scheme, separator, suffix = parsed.groups()
+    scheme = scheme.lower()
+    chars = set(separator)
+    if chars == {' '}:
+        separator_shape = 'space'
+    elif chars == {'\t'}:
+        separator_shape = 'tab'
+    elif chars and chars <= {'\r','\n'}:
+        separator_shape = 'newline'
+    elif len(chars) > 1:
+        separator_shape = 'mixed_whitespace'
+    else:
+        separator_shape = 'other_whitespace'
+    length = len(suffix)
+    length_bucket = ('8_11' if length <= 11 else '12_23' if length <= 23
+                     else '24_47' if length <= 47 else '48_plus')
+    base64_valid = decoded_has_colon = None
+    if scheme == 'basic':
+        try:
+            decoded = base64.b64decode(suffix,validate=True)
+            base64_valid = True
+            decoded_has_colon = b':' in decoded
+        except (ValueError,binascii.Error):
+            base64_valid = False
+            decoded_has_colon = False
+    return _safe_match_shape({
+        'scheme':scheme,'separator':separator_shape,'suffix_length_bucket':length_bucket,
+        'letters_only':re.fullmatch(r'[A-Za-z]+',suffix) is not None,
+        'has_digit':re.search(r'[0-9]',suffix) is not None,
+        'has_token_punctuation':re.search(r'[+/_.=-]',suffix) is not None,
+        'basic_base64_valid':base64_valid,'basic_decoded_has_colon':decoded_has_colon,
+    })
+
+
 def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
     text = str(text or "")
     # Include disabled and fallback credentials too; never redact only the active key.
@@ -41,8 +109,10 @@ def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
 
     # Не пытаться интерпретировать файлы с credentials как профессиональный текст.
     for rule_id, pattern in SECRET_RULES:
-        if re.search(pattern, text, re.I):
-            raise PrivacyError(rule_id=rule_id)
+        match = re.search(pattern, text, re.I)
+        if match:
+            shape = _auth_scheme_match_shape(match) if rule_id == 'auth_scheme' else None
+            raise PrivacyError(rule_id=rule_id,match_shape=shape)
     if any(v and v in text for v in forbidden_values):
         raise PrivacyError(rule_id="configured_credential_value")
     text = re.sub(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+", "[email удалён]", text)
