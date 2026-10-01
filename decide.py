@@ -40,7 +40,7 @@ def hard_filters(vac: dict) -> str | None:
 def _context(vac: dict, resume_text: str, candidate_text: str, instructions: str,
              *, search_query: str = "", resume_title: str = "") -> str:
     import json
-    from privacy import sanitize_candidate_text
+    from privacy import PrivacyError, sanitize_candidate_text
     if not resume_text.strip():
         raise ValueError("selected_resume_empty")
     if not (vac.get("description") or "").strip():
@@ -57,7 +57,12 @@ def _context(vac: dict, resume_text: str, candidate_text: str, instructions: str
     }
     if search_query or resume_title:
         data.update(current_search_intent=search_query, selected_resume_title=resume_title)
-    cleaned = {k: sanitize_candidate_text(v, values) for k, v in data.items()}
+    cleaned = {}
+    for key, value in data.items():
+        try:
+            cleaned[key] = sanitize_candidate_text(value, values)
+        except PrivacyError as error:
+            raise error.with_source(key)
     if sum(map(len, cleaned.values())) > 180_000:
         raise ValueError("llm_context_too_large_180000_chars")
     return json.dumps(cleaned, ensure_ascii=False)

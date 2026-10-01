@@ -22,7 +22,7 @@ from resume_metadata import selected_resume_title
 import hh_web
 from browser import browser_context, has_session
 from candidate_context import load_candidate_context
-from privacy import sanitize_candidate_text, sanitize_record, sanitize_exception_message
+from privacy import PrivacyError, sanitize_candidate_text, sanitize_record, sanitize_exception_message
 
 _stop_requested = False
 _active_run_id = None
@@ -190,6 +190,11 @@ def _exception_details(error, stage):
     details = {"stage": stage,
             "error_type": type(error).__module__ + "." + type(error).__qualname__,
             "error_message": sanitize_exception_message(error), "traceback_frames": frames}
+    if isinstance(error, PrivacyError):
+        if error.privacy_source_field:
+            details["privacy_source_field"] = error.privacy_source_field
+        if error.privacy_rule_id:
+            details["privacy_rule_id"] = error.privacy_rule_id
     if isinstance(error, LLMUnavailable):
         details["llm_failures"] = error.failures
     if isinstance(error, LiveHistoryCorrupt):

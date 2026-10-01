@@ -739,6 +739,83 @@ CUSTOM_RESUME = r'''(form, action) => {
         return {heading_found:!!heading,block:meta(block),candidate_trigger_count:triggers.length,
             candidate_triggers:triggers.slice(0,6).map(meta)};
     }
+    if (action.kind === 'identity_diagnostics') {
+        const safeIdentifier=value=>/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value || '') ? value : '';
+        const safeRole=el=>['button','combobox','listbox','menu','option','menuitem','dialog','presentation','region']
+            .includes(el.getAttribute('role')) ? el.getAttribute('role') : '';
+        const safeType=el=>['hidden','radio','checkbox','button','submit','text'].includes((el.type || '').toLowerCase())
+            ? (el.type || '').toLowerCase() : '';
+        const resumeName=el=>/resume/i.test(el.getAttribute('name') || '')
+            && safeIdentifier(el.getAttribute('name')) ? el.getAttribute('name') : '';
+        const hex=value=>/^[0-9a-f]{4,64}$/i.test(value || '') ? value.toLowerCase() : '';
+        const hrefInfo=el=>{
+            const href=el.getAttribute('href');
+            if (!href) return null;
+            try {
+                const url=new URL(href,location.href);
+                const match=/^\/resume\/([0-9a-f]{4,64})\/?$/i.exec(url.pathname);
+                return url.protocol === 'https:' && ['hh.ru','www.hh.ru'].includes(url.hostname) && match
+                    ? {attribute:'href',resume_id:match[1].toLowerCase(),href_path:url.pathname} : null;
+            } catch (_) { return null; }
+        };
+        const idEvidence=el=>{
+            const found=[];
+            const explicitResumeId=hex(el.getAttribute('data-resume-id'));
+            if (explicitResumeId) found.push({attribute:'data-resume-id',resume_id:explicitResumeId});
+            const genericDataId=hex(el.getAttribute('data-id'));
+            // A generic data-id is safe identity evidence only when it exactly
+            // matches the already-known target ID; arbitrary hex values may be unrelated.
+            if (genericDataId && genericDataId === action.id)
+                found.push({attribute:'data-id',resume_id:genericDataId});
+            const qa=el.getAttribute('data-qa') || '';
+            const option=/^magritte-select-option-([0-9a-f]{4,64})$/i.exec(qa);
+            if (option) found.push({attribute:'data-qa',resume_id:option[1].toLowerCase()});
+            const named=resumeName(el);
+            const owner=el.tagName === 'OPTION' ? el.closest('select') : null;
+            if (named || (owner && resumeName(owner))) {
+                const resumeId=hex(el.value || el.getAttribute('value'));
+                if (resumeId) found.push({attribute:'value',resume_id:resumeId});
+            }
+            const href=hrefInfo(el);
+            if (href) found.push({attribute:href.attribute,resume_id:href.resume_id});
+            return [...new Map(found.map(item=>[item.attribute+':'+item.resume_id,item])).values()];
+        };
+        const trigger=triggers.length === 1 ? triggers[0] : null;
+        const relation=el=>el === trigger ? 'trigger' : trigger?.contains(el) ? 'trigger_descendant'
+            : el.contains(trigger) ? 'trigger_ancestor' : block.contains(el) ? 'resume_block' : 'form_associated';
+        const elementMeta=el=>{
+            const href=hrefInfo(el);
+            const dataNames=[...el.attributes].map(attr=>attr.name)
+                .filter(name=>/^data-[a-z0-9_-]{1,63}$/i.test(name)).slice(0,12);
+            const control=el.tagName === 'LABEL' ? el.control : null;
+            const expanded=el.getAttribute('aria-expanded');
+            const popup=el.getAttribute('aria-haspopup');
+            return {tag:el.tagName.toLowerCase(),role:safeRole(el),name:resumeName(el),type:safeType(el),
+                checked:['radio','checkbox'].includes((el.type || '').toLowerCase()) ? !!el.checked : null,
+                selected:el.tagName === 'OPTION' ? !!el.selected
+                    : ['true','false'].includes(el.getAttribute('aria-selected')) ? el.getAttribute('aria-selected') === 'true' : null,
+                expanded:['true','false'].includes(expanded) ? expanded === 'true' : null,
+                data_qa:safeIdentifier(el.getAttribute('data-qa')),
+                data_testid:safeIdentifier(el.getAttribute('data-testid')),
+                aria_haspopup:['true','false','menu','listbox','dialog'].includes(popup) ? popup : '',
+                href_path:href ? href.href_path : '',data_attribute_names:dataNames,
+                label_control_present:!!control,label_control_tag:control ? control.tagName.toLowerCase() : '',
+                relation:relation(el),resume_identifiers:idEvidence(el)};
+        };
+        const candidates=new Set([block,heading,...triggers].filter(Boolean));
+        for (const el of block.querySelectorAll('a[href*="/resume/"],input,select,option,label,[data-resume-id],[data-id],[data-qa],[data-testid],[role="button"],[role="combobox"]')) {
+            const marker=/resume/i.test([el.getAttribute('name'),el.getAttribute('data-qa'),el.getAttribute('data-testid')].filter(Boolean).join(' '));
+            if (el === trigger || trigger?.contains(el) || el.contains(trigger) || marker || idEvidence(el).length) candidates.add(el);
+        }
+        for (const el of form.querySelectorAll('input[type="hidden"],input[type="radio"],select,option,a[href*="/resume/"],[data-resume-id],[data-id]')) {
+            if (resumeName(el) || idEvidence(el).length) candidates.add(el);
+        }
+        const elements=[...candidates].slice(0,40).map(elementMeta);
+        const identifiers=elements.flatMap(item=>item.resume_identifiers);
+        return {phase:action.phase || '',candidate_trigger_count:triggers.length,
+            exact_target_occurrence_count:identifiers.filter(item=>item.resume_id === action.id).length,
+            resume_identifier_count:identifiers.length,elements};
+    }
     if (triggers.length !== 1) return null;
     const trigger = triggers[0];
     if (action.kind === 'trigger') return trigger;
@@ -772,6 +849,11 @@ CUSTOM_RESUME = r'''(form, action) => {
 
 def _custom_resume_state(form):
     value = form.evaluate(CUSTOM_RESUME, {'kind':'probe'})
+    return value if isinstance(value,dict) else {}
+
+
+def _resume_identity_snapshot(form, resume_id, phase):
+    value = form.evaluate(CUSTOM_RESUME, {'kind':'identity_diagnostics','id':resume_id,'phase':phase})
     return value if isinstance(value,dict) else {}
 
 
@@ -1065,6 +1147,13 @@ def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_i
     snapshots=diagnostics.setdefault('dom_snapshots',[])
     page=form.page
     initial_path=_safe_url_path(page.url)
+    standalone_identity_diagnostics = initial_path == '/applicant/vacancy_response'
+    if standalone_identity_diagnostics:
+        try:
+            diagnostics.setdefault('resume_identity_snapshots',[]).append(
+                _resume_identity_snapshot(form,resume_id,'before_click'))
+        except Exception as error:
+            diagnostics['resume_identity_diagnostic_error_type']=type(error).__name__
     navigation={'observed':False}
     def note_navigation(frame):
         if frame == page.main_frame:
@@ -1104,6 +1193,14 @@ def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_i
                     checkpoint=next(checkpoints,None)
         wait_for_options(deadline)
         if observer is not None: _resume_dom_snapshot(observer,snapshots,'3000ms',started,page,navigation,initial_path,form)
+        if standalone_identity_diagnostics:
+            try:
+                current=_current_or_fallback_scope(page,form)
+                if current is not None:
+                    diagnostics.setdefault('resume_identity_snapshots',[]).append(
+                        _resume_identity_snapshot(current,resume_id,'after_click_wait'))
+            except Exception as error:
+                diagnostics['resume_identity_after_diagnostic_error_type']=type(error).__name__
     finally:
         if observer is not None:
             try: observer.evaluate('(observer)=>observer.disconnect()')

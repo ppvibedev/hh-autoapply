@@ -3,7 +3,34 @@ import re
 
 
 class PrivacyError(ValueError):
-    pass
+    """Fail-closed privacy rejection with safe, non-content diagnostics."""
+
+    def __init__(self, message="technical_secret_detected", *, rule_id=None, source_field=None):
+        super().__init__(message)
+        self.privacy_rule_id = rule_id
+        self.privacy_source_field = source_field
+
+    def with_source(self, source_field):
+        if self.privacy_source_field is None:
+            self.privacy_source_field = source_field
+        return self
+
+
+SECRET_RULES = (
+    ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    ("token_prefix", r"\b(?:sk-ant-|sk-proj-|sk-|AIza|ghp_|github_pat_)[A-Za-z0-9_-]{16,}"),
+    ("jwt_like", r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}"),
+    ("credential_assignment",
+     r"(?im:^\s*[\"']?(?:[\w-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+     r"password|passwd|credential|secret)|token|cookies?|authorization|set-cookie|пароль)"
+     r"[\"']?\s*[:=]\s*\S)"),
+    ("json_credential_field",
+     r'"(?:api_key|access_token|refresh_token|password|credentials|authorization)"\s*:\s*"[^" ]+'),
+    ("json_cookie_or_origin_array", r'"(?:cookies|origins)"\s*:\s*\['),
+    ("auth_scheme", r"\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=-]{8,}"),
+    ("credential_url", r"https?://[^\s/:]+:[^\s/@]+@"),
+    ("credential_query_parameter", r"[?&](?:api[_-]?key|token|access_token|signature|password|secret)="),
+)
 
 
 def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
@@ -13,21 +40,11 @@ def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
     forbidden_values = tuple(forbidden_values) + credentials()
 
     # Не пытаться интерпретировать файлы с credentials как профессиональный текст.
-    secret = (
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-        r"\b(?:sk-ant-|sk-proj-|sk-|AIza|ghp_|github_pat_)[A-Za-z0-9_-]{16,}|"
-        r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}|"
-        r"(?im:^\s*[\"']?(?:[\w-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
-        r"password|passwd|credential|secret)|token|cookies?|authorization|set-cookie|пароль)"
-        r"[\"']?\s*[:=]\s*\S)|"
-        r'"(?:api_key|access_token|refresh_token|password|credentials|authorization)"\s*:\s*"[^" ]+|'
-        r'"(?:cookies|origins)"\s*:\s*\[|'
-        r"\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=-]{8,}|"
-        r"https?://[^\s/:]+:[^\s/@]+@|"
-        r"[?&](?:api[_-]?key|token|access_token|signature|password|secret)="
-    )
-    if re.search(secret, text, re.I) or any(v and v in text for v in forbidden_values):
-        raise PrivacyError("technical_secret_detected")
+    for rule_id, pattern in SECRET_RULES:
+        if re.search(pattern, text, re.I):
+            raise PrivacyError(rule_id=rule_id)
+    if any(v and v in text for v in forbidden_values):
+        raise PrivacyError(rule_id="configured_credential_value")
     text = re.sub(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+", "[email удалён]", text)
     # Явно подписанные адреса и контактные каналы, не строки «город/страна».
     text = re.sub(

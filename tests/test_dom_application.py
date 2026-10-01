@@ -460,6 +460,45 @@ class DOMTests(unittest.TestCase):
         self.assertNotIn('person@example.test',json.dumps(diag))
         self.assertNotIn('TOP_SECRET_VALUE',json.dumps(diag))
 
+    def test_standalone_resume_identity_snapshot_keeps_only_safe_structure(self):
+        self.page.set_content('''<form><section><div>Резюме для отклика</div>
+          <div role="button" data-qa="resume-trigger" data-testid="resume-control"
+            data-resume-id="aaaa" data-note="PRIVATE_DATA_VALUE" title="PRIVATE_TITLE">
+            PRIVATE_RESUME_TITLE<a href="https://hh.ru/resume/aaaa?token=PRIVATE_QUERY">PRIVATE LINK</a>
+          </div><input type="hidden" name="resumeId" value="aaaa">
+          <div data-id="aaaa"></div><div data-id="bbbb"></div><input name="contact" value="person@example.test">
+          <div title="ARBITRARY_ATTRIBUTE_VALUE">UNRELATED PRIVATE TEXT</div></section></form>''')
+        snapshot=app._resume_identity_snapshot(self.page.locator('form'),'aaaa','before_click')
+        self.assertEqual(snapshot['phase'],'before_click')
+        self.assertGreaterEqual(snapshot['exact_target_occurrence_count'],2)
+        identifiers=[item for element in snapshot['elements'] for item in element['resume_identifiers']]
+        self.assertIn({'attribute':'data-resume-id','resume_id':'aaaa'},identifiers)
+        self.assertIn({'attribute':'data-id','resume_id':'aaaa'},identifiers)
+        self.assertIn({'attribute':'href','resume_id':'aaaa'},identifiers)
+        self.assertIn({'attribute':'value','resume_id':'aaaa'},identifiers)
+        self.assertNotIn({'attribute':'data-id','resume_id':'bbbb'},identifiers)
+        encoded=json.dumps(snapshot)
+        for private in ('PRIVATE_RESUME_TITLE','PRIVATE LINK','PRIVATE_DATA_VALUE','PRIVATE_TITLE',
+                        'PRIVATE_QUERY','person@example.test','UNRELATED PRIVATE TEXT','ARBITRARY_ATTRIBUTE_VALUE'):
+            self.assertNotIn(private,encoded)
+        self.assertNotIn('?token=',encoded)
+        self.assertNotIn('contact',encoded)
+
+    def test_standalone_resume_popup_failure_records_safe_identity_snapshots(self):
+        self.page.set_content('''<form><section><div>Резюме для отклика</div>
+          <div role="button" data-qa="resume-trigger">PRIVATE RESUME TITLE</div>
+          <input name="unrelated" value="TOP_SECRET_VALUE"></section></form>''')
+        diagnostics={}
+        with patch('application._safe_url_path',return_value='/applicant/vacancy_response'):
+            self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diagnostics))
+        self.assertEqual(diagnostics['reason_code'],'resume_popup_not_opened')
+        snapshots=diagnostics['resume_identity_snapshots']
+        self.assertEqual([item['phase'] for item in snapshots],['before_click','after_click_wait'])
+        self.assertTrue(all(item['exact_target_occurrence_count']==0 for item in snapshots))
+        encoded=json.dumps(snapshots)
+        self.assertNotIn('PRIVATE RESUME TITLE',encoded)
+        self.assertNotIn('TOP_SECRET_VALUE',encoded)
+
     def _real_resume_portal(self, update):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>
           <div id="trigger" role="button" data-resume-id="bbbb"

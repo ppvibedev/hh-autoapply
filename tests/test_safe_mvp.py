@@ -250,9 +250,36 @@ class SafeTests(unittest.TestCase):
             self.assertNotIn(phone, sanitize_candidate_text(phone))
 
     def test_secrets_blocked(self):
-        for text in ('API_KEY=artificial-secret', 'password: artificial', 'Authorization: Bearer abcdefghijk', '{"cookies": []}', 'https://example.test/?token=artificial'):
-            with self.assertRaises(PrivacyError): sanitize_candidate_text(text)
-        with self.assertRaises(PrivacyError): sanitize_candidate_text('contains artificial-key-value', ('artificial-key-value',))
+        cases = (
+            ('API_KEY=artificial-secret', 'credential_assignment'),
+            ('password: artificial', 'credential_assignment'),
+            ('Authorization: Bearer abcdefghijk', 'credential_assignment'),
+            ('{"cookies": []}', 'json_cookie_or_origin_array'),
+            ('https://example.test/?token=artificial', 'credential_query_parameter'),
+        )
+        for text, rule_id in cases:
+            with self.assertRaises(PrivacyError) as caught:
+                sanitize_candidate_text(text)
+            self.assertEqual(caught.exception.privacy_rule_id, rule_id)
+        with self.assertRaises(PrivacyError) as caught:
+            sanitize_candidate_text('contains artificial-key-value', ('artificial-key-value',))
+        self.assertEqual(caught.exception.privacy_rule_id, 'configured_credential_value')
+
+    def test_matching_privacy_diagnostic_has_source_and_rule_without_content(self):
+        private_value = 'never-persist-this-value'
+        source = 'API_KEY=' + private_value + '\nprivate surrounding vacancy material'
+        vacancy = dict(VAC, description=source)
+        with patch('llm.generate') as generate, self.assertRaises(PrivacyError) as caught:
+            decide.score(vacancy, 'Safe resume', resume_title='Project Manager')
+        generate.assert_not_called()
+        details = run_web._exception_details(caught.exception, 'matching')
+        self.assertEqual(details['stage'], 'matching')
+        self.assertEqual(details['privacy_source_field'], 'full_vacancy')
+        self.assertEqual(details['privacy_rule_id'], 'credential_assignment')
+        encoded = json.dumps(details)
+        self.assertNotIn(private_value, encoded)
+        self.assertNotIn('private surrounding vacancy material', encoded)
+        self.assertNotIn(source, encoded)
 
     def test_full_context_sanitized_before_matching_and_letter(self):
         vacancy=dict(VAC, description='Профессиональные требования. '*500+'END_VACANCY')
