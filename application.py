@@ -487,7 +487,8 @@ def _signal(page, vacancy_id, *, before=False):
     same = parsed.path.rstrip('/') == '/vacancy/' + vacancy_id
     if before:
         marker = page.locator(ALREADY_SELECTOR)
-        if same and marker.count() == 1 and marker.is_visible():
+        visible_count = sum(marker.nth(i).is_visible() for i in range(marker.count()))
+        if same and visible_count >= 1:
             return 'already_applied'
         return None
     markers = page.locator(SUCCESS_SELECTOR)

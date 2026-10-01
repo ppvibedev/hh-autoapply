@@ -13,6 +13,31 @@ class RequestVariants(unittest.TestCase):
     def req(self,path='/applicant/vacancy_response',body='vacancyId=123456789&resumeId=aaaa',content='application/x-www-form-urlencoded'):
         return SimpleNamespace(url='https://hh.ru'+path,method='POST',post_data=body,headers={'content-type':content})
 
+    def signal_page(self, visibility, vacancy_id='123456789'):
+        page=MagicMock();page.url='https://hh.ru/vacancy/'+vacancy_id
+        markers=MagicMock();markers.count.return_value=len(visibility)
+        marker_nodes=[]
+        for visible in visibility:
+            node=MagicMock();node.is_visible.return_value=visible;marker_nodes.append(node)
+        markers.nth.side_effect=lambda index:marker_nodes[index]
+        page.locator.return_value=markers
+        return page
+
+    def test_already_applied_signal_accepts_visible_exact_marker_duplicates(self):
+        for visibility,expected in (([True], 'already_applied'),
+                                    ([True,True,True], 'already_applied'),
+                                    ([False,True,False], 'already_applied'),
+                                    ([False,False], None),
+                                    ([], None)):
+            with self.subTest(visibility=visibility):
+                page=self.signal_page(visibility)
+                self.assertEqual(app._signal(page,'123456789',before=True),expected)
+                page.locator.assert_called_once_with(app.ALREADY_SELECTOR)
+
+    def test_already_applied_signal_rejects_marker_on_other_vacancy(self):
+        page=self.signal_page([True,True,True],vacancy_id='999999999')
+        self.assertIsNone(app._signal(page,'123456789',before=True))
+
     def test_alternative_endpoints_and_multipart(self):
         for path in ('/negotiations','/vacancy/123456789','/applicant/vacancy_response/popup/'):
             self.assertTrue(app._request_identity(self.req(path), '123456789','aaaa'))
@@ -77,6 +102,19 @@ class RequestVariants(unittest.TestCase):
         self.assertEqual(result['application_status'],'submission_unknown')
         self.assertEqual(result['reason_code'],'submission_sent_confirmation_missing')
         submit.click.assert_called_once();route.abort.assert_not_called()
+
+    def test_duplicate_already_applied_signal_after_submit_confirms_without_retry(self):
+        real_signal=app._signal
+        page,form,letter,submit,route,journal,order,fill,model=self.fixture()
+        marker_page=self.signal_page([True,True,True])
+        with patch('application._signal',side_effect=lambda *args,**kwargs:
+                   real_signal(marker_page,args[1],before=True)
+                   if kwargs.get('before') and 'request' in order else None):
+            result=app.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,
+                             before_submit=journal)
+        self.assertEqual(result['application_status'],'applied_confirmed')
+        self.assertEqual(result['confirmation'],'explicit_success_marker_same_vacancy')
+        submit.click.assert_called_once();route.continue_.assert_called_once()
 
     def test_language_warning_after_observed_submission_is_unknown_without_second_click(self):
         page,form,letter,submit,route,journal,order,fill,model=self.fixture()
