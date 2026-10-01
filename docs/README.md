@@ -590,19 +590,31 @@ quota dimensions, response body, URL или headers. Основа формата
 
 Централизованная policy в `llm.py`:
 
-- Подтверждённая дневная квота: 0 повторов, unavailable до конца прогона, failover.
+- Подтверждённая дневная квота, 401/403 и доказанная ошибка конфигурации:
+  0 повторов и permanent unavailable до конца прогона.
 - RPM, TPM и unknown 429: максимум 1 повтор (2 попытки всего на подключение).
 - `provider_server_error` (включая HTTP 503), `provider_transport_timeout` и
   `provider_transport_connection`: максимум 1 повтор на том же подключении.
 - Без retry metadata: задержка 2 секунды.
 - `RetryInfo.retryDelay` и `Retry-After`: выбирается большая корректная задержка;
   минимум ожидания 1 секунда, максимум 30 секунд.
-- Если provider просит более 30 секунд, не повторяем раньше срока: сразу failover,
-  подключение unavailable до конца прогона. Reset timestamp не выдумывается.
+- Если provider просит более 30 секунд, не повторяем раньше срока и не создаём
+  длинный скрытый sleep: выполняется failover, а connection остаётся доступным для
+  будущих операций. Reset timestamp не выдумывается.
 - 401/403, прочие HTTP, общий `provider_transport_error` и malformed provider
   envelope не получают дополнительный повтор, используется failover.
+- HTTP 413 относится к конкретному request: немедленного provider retry нет,
+  выполняется failover, но connection не попадает в permanent blacklist run.
 
-После исчерпания usable connections возникает `LLMUnavailable`. Она проходит через
+Одна LLM-операция имеет максимум два Router round. В первом round каждое доступное
+подключение получает существующий bounded provider retry и затем уступает место
+следующему. Во второй round в том же детерминированном порядке входят только
+connections без permanent failure; допустимый cooldown остаётся stop-aware и
+ограничен 30 секундами. Третьего round нет. Исчерпанный timeout, временный 429,
+5xx, network failure, invalid envelope или request-specific HTTP не удаляет
+connection из будущих независимых LLM-операций.
+
+После исчерпания двух bounded round либо permanent pool возникает `LLMUnavailable`. Она проходит через
 matching, письмо и вопросы (включая optional) до run control. Прогон получает
 `STOPPED / llm_infrastructure_unavailable`, текущая вакансия — manual review;
 следующие вакансии не обрабатываются. В terminal-диагностике есть безопасные
@@ -613,7 +625,10 @@ availability сбрасывается. Сохранённые enabled-флаги
 
 Каждая LLM-операция дополнительно пишет безопасные timing events в общий JSONL:
 начало/завершение операции и provider attempt, фактическую длительность attempt,
-плановую и фактическую длительность retry wait, failover либо exhaustion. События
+плановую и фактическую длительность retry wait, failover либо exhaustion. Attempt,
+retry и failover содержат `router_round`; failure содержит `failure_scope` со
+значением `run_permanent` или `operation_scoped`. Начало второго round и его
+stop-aware cooldown пишутся отдельными безопасными timing events. События
 связаны случайным `operation_id`, `run_id` и безопасным `vacancy_context_id`; в них
 есть только task, connection/provider/model и нормализованная ошибка. Prompt, ответ
 модели, резюме, вакансия, письмо, employer answer, headers и credentials не пишутся.
@@ -631,7 +646,8 @@ Transport failures дополнительно получают закрытое 
 и `read_timeout`. Когда этих доказательств нет, сохраняется только
 `unknown_connection`, `unknown_timeout` или `unknown_transport`. Текст exception,
 URL, hostname, headers, payload и credentials для классификации и telemetry не
-используются; retry, failover и run-scoped unavailable policy не изменены.
+используются; provider retry и двухпроходный failover используют ту же безопасную
+классификацию.
 
 Privacy boundary учитывает все загруженные credentials, включая disabled и резервные,
 и проверяет вход/выход общего LLM facade. Сырые requests exceptions не передаются

@@ -213,11 +213,12 @@ class ConnectionTests(unittest.TestCase):
         with patch('llm.requests.post',side_effect=requests.ConnectionError(private)) as post, \
              self.assertRaises(LLMUnavailable) as caught:
             router.generate('facts',task='matching')
-        self.assertEqual(post.call_count,2)
-        sleep.assert_called_once_with(2.0)
+        self.assertEqual(post.call_count,4)
+        self.assertEqual(sleep.call_count,3)
         attempts=[event for event in events if event['event']=='llm_attempt_finished']
         self.assertEqual([event['transport_failure_detail'] for event in attempts],
-                         ['unknown_connection','unknown_connection'])
+                         ['unknown_connection']*4)
+        self.assertEqual([event['router_round'] for event in attempts],[1,1,2,2])
         public=json.dumps(events)+json.dumps(caught.exception.failures)
         self.assertNotIn(private,public)
         self.assertNotIn('private-provider.example',public)
@@ -255,9 +256,13 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(exhausted['reason_category'],'provider_server_error')
         operation=next(event for event in events if event['event']=='llm_operation_finished')
         self.assertEqual(operation['outcome'],'unavailable')
-        self.assertEqual(operation['total_provider_attempt_count'],4)
+        self.assertEqual(operation['total_provider_attempt_count'],8)
         self.assertEqual(operation['final_connection_id'],connection(2).id)
-        self.assertEqual(len([event for event in events if event['event']=='llm_failover']),1)
+        self.assertEqual(len([event for event in events if event['event']=='llm_failover']),2)
+        self.assertEqual(operation['router_rounds_started'],2)
+        round_two=next(event for event in events if event['event']=='llm_router_round_started')
+        self.assertEqual(round_two['router_round'],2)
+        self.assertEqual(exhausted['rounds_completed'],2)
 
     def test_telemetry_failure_does_not_change_provider_success(self):
         def broken_telemetry(_event):
@@ -381,19 +386,250 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual([item['attempt'] for item in router.failures],[1,2,1])
         sleep.assert_has_calls([unittest.mock.call(2.0),unittest.mock.call(2.0)])
 
-    def test_all_503_connections_exhaust_only_after_one_retry_each(self):
+    def test_all_503_connections_exhaust_after_one_retry_each_per_round(self):
         sleep=MagicMock(); router=llm.Router([connection(),connection(2)],sleep=sleep)
-        with patch('llm.requests.post',side_effect=[response(503)]*4) as post:
+        with patch('llm.requests.post',side_effect=[response(503)]*8) as post:
             with self.assertRaises(LLMUnavailable) as caught:
                 router.generate('facts')
-        self.assertEqual([call.kwargs['params']['key'] for call in post.call_args_list],['SECRET_A','SECRET_A','SECRET_B','SECRET_B'])
+        self.assertEqual([call.kwargs['params']['key'] for call in post.call_args_list],
+                         ['SECRET_A','SECRET_A','SECRET_B','SECRET_B']*2)
         self.assertEqual([(item['connection_id'],item['attempt']) for item in caught.exception.failures],[
+            (connection().id,1),(connection().id,2),(connection(2).id,1),(connection(2).id,2),
             (connection().id,1),(connection().id,2),(connection(2).id,1),(connection(2).id,2)])
-        self.assertEqual([item['retry_scheduled'] for item in caught.exception.failures],[True,False,True,False])
-        sleep.assert_has_calls([unittest.mock.call(2.0),unittest.mock.call(2.0)])
+        self.assertEqual([item['router_round'] for item in caught.exception.failures],
+                         [1]*4+[2]*4)
+        self.assertEqual([item['retry_scheduled'] for item in caught.exception.failures],
+                         [True,False,True,False]*2)
+        self.assertEqual(sleep.call_count,6)
         text=repr(caught.exception)+json.dumps(caught.exception.failures)
         for private in ('SECRET_A','SECRET_B','private prompt','?key='):
             self.assertNotIn(private,text)
+
+    def test_four_recoverable_connections_reach_round_two_first_success(self):
+        connections=[connection(index) for index in range(1,5)]
+        failure=ProviderFailure('provider_transport_error',
+                                transport_failure_detail='unknown_transport')
+        events=[]
+        router=llm.Router(connections,telemetry=events.append)
+        with patch('llm.execute',side_effect=[(None,failure)]*4+[('RECOVERED',None)]) as execute:
+            self.assertEqual(router.generate('facts',task='matching'),'RECOVERED')
+        self.assertEqual([call.args[0].id for call in execute.call_args_list],
+                         [item.id for item in connections]+[connections[0].id])
+        attempts=[event for event in events if event['event']=='llm_attempt_finished']
+        self.assertEqual([event['router_round'] for event in attempts],[1,1,1,1,2])
+        self.assertEqual(router.consume_routing_events()[0]['recovery'],
+                         'second_router_round')
+
+    def test_second_connection_recovers_and_later_round_two_connections_are_skipped(self):
+        connections=[connection(index) for index in range(1,5)]
+        failure=ProviderFailure('provider_transport_error')
+        router=llm.Router(connections)
+        with patch('llm.execute',side_effect=[(None,failure)]*5+[('OK',None)]) as execute:
+            self.assertEqual(router.generate('facts'),'OK')
+        self.assertEqual([call.args[0].id for call in execute.call_args_list],
+                         [item.id for item in connections]
+                         +[connections[0].id,connections[1].id])
+
+    def test_daily_quota_is_run_permanent_and_never_reaches_round_two(self):
+        item=connection(); events=[]
+        router=llm.Router([item],telemetry=events.append)
+        daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
+        with patch('llm.execute',return_value=(None,daily)) as execute:
+            with self.assertRaises(LLMUnavailable): router.generate('facts')
+            with self.assertRaises(LLMUnavailable): router.generate('later facts')
+        self.assertEqual(execute.call_count,1)
+        self.assertEqual(router.unavailable,{item.id})
+        self.assertFalse(any(event['event']=='llm_router_round_started' for event in events))
+        failure_event=next(event for event in events
+                           if event['event']=='llm_attempt_finished')
+        self.assertEqual(failure_event['failure_scope'],'run_permanent')
+        self.assertTrue(failure_event['connection_unavailable_after_attempt'])
+
+    def test_mixed_permanent_and_recoverable_pool_only_blacklists_permanent(self):
+        a,b,c,d=[connection(index) for index in range(1,5)]
+        daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
+        recoverable=ProviderFailure('provider_transport_error')
+        router=llm.Router([a,b,c,d])
+        with patch('llm.execute',side_effect=[(None,daily),(None,recoverable),
+                                              (None,recoverable),('OK',None),
+                                              ('NEXT',None)]) as execute:
+            self.assertEqual(router.generate('facts'),'OK')
+            self.assertEqual(router.generate('later facts'),'NEXT')
+        self.assertEqual(router.unavailable,{a.id})
+        self.assertEqual({item.id for item in router._candidates()},{b.id,c.id,d.id})
+        self.assertEqual(execute.call_args_list[-1].args[0].id,d.id)
+
+    def test_http_413_is_operation_scoped_and_eligible_in_future_operation(self):
+        groq=connection(1,'groq','openai/gpt-oss-120b')
+        backup=connection(2,'zai','glm-4.7-flash')
+        too_large=ProviderFailure('provider_http_error',413)
+        daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
+        router=llm.Router([groq,backup])
+        with patch('llm.execute',side_effect=[(None,too_large),('FIRST',None),
+                                              (None,daily),('SECOND',None)]) as execute:
+            self.assertEqual(router.generate('large facts'),'FIRST')
+            self.assertEqual(router.generate('small facts'),'SECOND')
+        self.assertEqual([call.args[0].id for call in execute.call_args_list],
+                         [groq.id,backup.id,backup.id,groq.id])
+        self.assertNotIn(groq.id,router.unavailable)
+        first_failure=router.failures[0]
+        self.assertEqual(first_failure['http_status'],413)
+        self.assertEqual(first_failure['failure_scope'],'operation_scoped')
+        self.assertFalse(first_failure['retry_scheduled'])
+
+    def test_zai_transient_429_can_recover_again_in_second_router_round(self):
+        zai=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429)
+        events=[]; sleep=MagicMock(); router=llm.Router([zai],sleep=sleep,
+                                                        telemetry=events.append)
+        with patch('llm.execute',side_effect=[(None,rate),('FIRST',None),
+                                              (None,rate),(None,rate),('SECOND',None)]) as execute:
+            self.assertEqual(router.generate('facts'),'FIRST')
+            self.assertEqual(router.generate('later facts'),'SECOND')
+        self.assertEqual(execute.call_count,5)
+        self.assertNotIn(zai.id,router.unavailable)
+        second_operation_rounds=[event['router_round'] for event in events
+                                 if event['event']=='llm_attempt_finished'][2:]
+        self.assertEqual(second_operation_rounds,[1,1,2])
+        self.assertEqual(sleep.call_count,3)
+
+    def test_two_recoverable_rounds_exhaust_without_third_round(self):
+        a,b=connection(),connection(2)
+        failure=ProviderFailure('provider_transport_error')
+        events=[]; router=llm.Router([a,b],telemetry=events.append)
+        with patch('llm.execute',return_value=(None,failure)) as execute, \
+             self.assertRaises(LLMUnavailable):
+            router.generate('facts')
+        self.assertEqual(execute.call_count,4)
+        attempts=[event for event in events if event['event']=='llm_attempt_finished']
+        self.assertEqual([(event['router_round'],event['connection_id']) for event in attempts],
+                         [(1,a.id),(1,b.id),(2,a.id),(2,b.id)])
+        exhausted=next(event for event in events
+                       if event['event']=='llm_connections_exhausted')
+        self.assertEqual(exhausted['rounds_completed'],2)
+        self.assertEqual(router.unavailable,set())
+
+    def test_permanent_pool_exhaustion_skips_empty_second_round(self):
+        a,b=connection(),connection(2)
+        daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
+        auth=ProviderFailure('auth/provider_access',401)
+        events=[]; router=llm.Router([a,b],telemetry=events.append)
+        with patch('llm.execute',side_effect=[(None,daily),(None,auth)]) as execute, \
+             self.assertRaises(LLMUnavailable):
+            router.generate('facts')
+        self.assertEqual(execute.call_count,2)
+        self.assertEqual(router.unavailable,{a.id,b.id})
+        self.assertFalse(any(event['event']=='llm_router_round_started' for event in events))
+        exhausted=next(event for event in events
+                       if event['event']=='llm_connections_exhausted')
+        self.assertEqual(exhausted['rounds_completed'],1)
+
+    def test_recoverable_exhaustion_is_eligible_in_future_operation(self):
+        item=connection(); failure=ProviderFailure('provider_transport_error')
+        router=llm.Router([item])
+        with patch('llm.execute',side_effect=[(None,failure),(None,failure),
+                                              ('RECOVERED',None)]) as execute:
+            with self.assertRaises(LLMUnavailable): router.generate('facts')
+            self.assertEqual(router.generate('later facts'),'RECOVERED')
+        self.assertEqual(execute.call_count,3)
+        self.assertEqual(router.unavailable,set())
+
+    def test_transport_retry_failover_and_future_operation_recovery(self):
+        a,b=connection(),connection(2)
+        timeout=ProviderFailure('provider_transport_timeout',transport_phase='read',
+                                transport_failure_detail='read_timeout')
+        daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
+        sleep=MagicMock(); router=llm.Router([a,b],sleep=sleep)
+        with patch('llm.execute',side_effect=[(None,timeout),(None,timeout),('FIRST',None),
+                                              (None,daily),('SECOND',None)]) as execute:
+            self.assertEqual(router.generate('facts'),'FIRST')
+            self.assertEqual(router.generate('later facts'),'SECOND')
+        self.assertEqual([call.args[0].id for call in execute.call_args_list],
+                         [a.id,a.id,b.id,b.id,a.id])
+        self.assertNotIn(a.id,router.unavailable)
+        sleep.assert_called_once_with(2.0)
+
+    def test_stop_before_round_two_prevents_new_attempt(self):
+        stopped={'value':False}; events=[]
+        def telemetry(event):
+            events.append(event)
+            if (event['event']=='llm_attempt_finished'
+                    and event['router_round']==1):
+                stopped['value']=True
+        router=llm.Router([connection()],telemetry=telemetry,
+                          stopped=lambda:stopped['value'])
+        failure=ProviderFailure('provider_transport_error')
+        with patch('llm.execute',return_value=(None,failure)) as execute, \
+             self.assertRaises(LLMStopped):
+            router.generate('facts')
+        self.assertEqual(execute.call_count,1)
+        self.assertFalse(any(event['event']=='llm_router_round_started' for event in events))
+        self.assertEqual(events[-1]['event'],'llm_operation_finished')
+        self.assertEqual(events[-1]['outcome'],'user_stop')
+
+    def test_stop_interrupts_provider_retry_wait_in_round_two(self):
+        stopped={'value':False}; events=[]; round_two_wait={'value':False}
+        def telemetry(event):
+            events.append(event)
+            if event['event']=='llm_router_round_wait_started':
+                round_two_wait['value']=True
+        def sleep(_delay):
+            if round_two_wait['value']: stopped['value']=True
+        transient=ProviderFailure('provider_server_error',503)
+        router=llm.Router([connection()],sleep=sleep,telemetry=telemetry,
+                          stopped=lambda:stopped['value'])
+        with patch('llm.execute',side_effect=[(None,transient),(None,transient)]) as execute, \
+             self.assertRaises(LLMStopped):
+            router.generate('facts')
+        self.assertEqual(execute.call_count,2)
+        self.assertTrue(any(event['event']=='llm_router_round_started' for event in events))
+        self.assertEqual(len([event for event in events
+                              if event['event']=='llm_retry_wait_started']),1)
+        self.assertEqual(len([event for event in events
+                              if event['event']=='llm_router_round_wait_started']),1)
+        self.assertEqual(events[-1]['outcome'],'user_stop')
+
+    def test_retry_delay_over_bound_skips_round_two_without_run_blacklist(self):
+        item=connection(); events=[]; sleep=MagicMock()
+        delayed=ProviderFailure('rate_limit_unknown',429,retry_delay=31)
+        router=llm.Router([item],sleep=sleep,telemetry=events.append)
+        with patch('llm.execute',side_effect=[(None,delayed),('RECOVERED',None)]) as execute:
+            with self.assertRaises(LLMUnavailable): router.generate('facts')
+            self.assertEqual(router.generate('later facts'),'RECOVERED')
+        self.assertEqual(execute.call_count,2)
+        sleep.assert_not_called()
+        self.assertEqual(router.unavailable,set())
+        skipped=next(event for event in events
+                     if event['event']=='llm_router_round_connection_skipped')
+        self.assertEqual(skipped['router_round'],2)
+        self.assertEqual(skipped['reason_category'],'retry_delay_exceeds_bound')
+
+    def test_synthetic_mixed_lifecycle_recovers_on_b_in_round_two(self):
+        a,b,c,d=[connection(index) for index in range(1,5)]
+        daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
+        transient=ProviderFailure('provider_server_error',503)
+        too_large=ProviderFailure('provider_http_error',413)
+        transport=ProviderFailure('provider_transport_timeout',transport_phase='read',
+                                  transport_failure_detail='read_timeout')
+        events=[]; router=llm.Router([a,b,c,d],sleep=MagicMock(),
+                                     telemetry=events.append)
+        replies=[(None,daily),(None,transient),(None,transient),(None,too_large),
+                 (None,transport),(None,transport),('RECOVERED',None)]
+        with patch('llm.execute',side_effect=replies) as execute:
+            self.assertEqual(router.generate('PRIVATE_PROMPT',task='matching'),'RECOVERED')
+        self.assertEqual([call.args[0].id for call in execute.call_args_list],
+                         [a.id,b.id,b.id,c.id,d.id,d.id,b.id])
+        self.assertEqual(router.unavailable,{a.id})
+        failed=[event for event in events if event['event']=='llm_attempt_finished'
+                and event['outcome']=='failure']
+        self.assertEqual([event['failure_scope'] for event in failed],
+                         ['run_permanent']+['operation_scoped']*5)
+        self.assertEqual([event['router_round'] for event in failed],[1]*6)
+        self.assertEqual(next(event for event in events
+                              if event['event']=='llm_router_round_started')['router_round'],2)
+        public=json.dumps(events)+json.dumps(router.consume_routing_events())
+        for private in ('PRIVATE_PROMPT','SECRET_A','SECRET_B','SECRET_C','SECRET_D'):
+            self.assertNotIn(private,public)
 
     def test_transient_transport_retry_and_generic_transport_failover(self):
         for first,second,expected_category,expected_calls in [
@@ -514,12 +750,12 @@ class ConnectionTests(unittest.TestCase):
         groq = connection(1, 'groq', 'openai/gpt-oss-120b')
         zai = connection(2, 'zai', 'glm-4.7-flash')
         router = llm.Router([groq, zai], sleep=MagicMock())
-        with patch('llm.requests.post', side_effect=[response(503)] * 4) as post:
+        with patch('llm.requests.post', side_effect=[response(503)] * 8) as post:
             with self.assertRaises(LLMUnavailable) as caught:
                 router.generate('facts')
-        self.assertEqual(post.call_count, 4)
+        self.assertEqual(post.call_count, 8)
         self.assertEqual([(row['connection_id'], row['attempt']) for row in caught.exception.failures],
-                         [(groq.id, 1), (groq.id, 2), (zai.id, 1), (zai.id, 2)])
+                         [(groq.id, 1), (groq.id, 2), (zai.id, 1), (zai.id, 2)]*2)
 
         router = llm.Router([connection(1, 'groq', enabled=False), zai])
         with patch('llm.requests.post', return_value=chat_response()) as post:
