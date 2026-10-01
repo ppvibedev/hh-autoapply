@@ -1,5 +1,10 @@
 """Existing provider HTTP contracts, isolated from routing and task validation."""
+import errno
+import socket
+import ssl
+
 import requests
+from urllib3 import exceptions as urllib3_exceptions
 from llm_errors import ProviderFailure, classify_http
 
 
@@ -24,6 +29,74 @@ OPENAI_COMPATIBLE = {
         'token_limit_field': 'max_tokens',
     },
 }
+
+
+def _exception_chain(error):
+    """Yield exception objects only; arbitrary args/messages are never inspected."""
+    pending = [error]
+    seen = set()
+    while pending and len(seen) < 24:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for name in ('__cause__', '__context__', 'reason', 'original_error', '_reason'):
+            try:
+                nested = getattr(current, name, None)
+            except Exception:
+                continue
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+        for nested in getattr(current, 'args', ()):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+
+
+def classify_transport_failure(error):
+    """Return a closed, privacy-safe subtype based only on types and errno."""
+    chain = tuple(_exception_chain(error))
+
+    def has(*types):
+        supported = tuple(item for item in types if isinstance(item, type))
+        return bool(supported) and any(isinstance(item, supported) for item in chain)
+
+    proxy_error = getattr(urllib3_exceptions, 'ProxyError', None)
+    resolution_error = getattr(urllib3_exceptions, 'NameResolutionError', None)
+    urllib3_ssl_error = getattr(urllib3_exceptions, 'SSLError', None)
+    connect_timeout = getattr(urllib3_exceptions, 'ConnectTimeoutError', None)
+    new_connection = getattr(urllib3_exceptions, 'NewConnectionError', None)
+    read_timeout = getattr(urllib3_exceptions, 'ReadTimeoutError', None)
+
+    if has(requests.exceptions.ProxyError, proxy_error):
+        return 'proxy'
+    if has(socket.gaierror, resolution_error):
+        return 'dns'
+    if has(requests.exceptions.SSLError, ssl.SSLError, urllib3_ssl_error):
+        return 'tls'
+
+    error_numbers = {item.errno for item in chain
+                     if isinstance(item, OSError) and isinstance(item.errno, int)}
+    if has(ConnectionRefusedError) or errno.ECONNREFUSED in error_numbers:
+        return 'tcp_refused'
+    if has(ConnectionResetError) or errno.ECONNRESET in error_numbers:
+        return 'tcp_reset'
+    if error_numbers & {errno.ENETUNREACH, errno.EHOSTUNREACH}:
+        return 'network_unreachable'
+
+    if has(requests.ConnectTimeout):
+        return 'connect_timeout'
+    if connect_timeout and any(isinstance(item, connect_timeout)
+                               and not (new_connection and isinstance(item, new_connection))
+                               for item in chain):
+        return 'connect_timeout'
+    if has(requests.ReadTimeout, read_timeout):
+        return 'read_timeout'
+    if isinstance(error, requests.Timeout):
+        return 'unknown_timeout'
+    if isinstance(error, requests.ConnectionError):
+        return 'unknown_connection'
+    return 'unknown_transport'
 
 
 def _openai_compatible(connection, prompt, max_tokens):
@@ -54,16 +127,21 @@ def execute(connection, prompt, max_tokens):
         return text, None
     except requests.HTTPError as error:
         failure = classify_http(connection.provider, error.response) if error.response is not None else ProviderFailure('provider_http_error')
-    except requests.ConnectTimeout:
-        failure = ProviderFailure('provider_transport_timeout', transport_phase='connect')
-    except requests.ReadTimeout:
-        failure = ProviderFailure('provider_transport_timeout', transport_phase='read')
-    except requests.Timeout:
-        failure = ProviderFailure('provider_transport_timeout', transport_phase='generic')
-    except requests.ConnectionError:
-        failure = ProviderFailure('provider_transport_connection', transport_phase='connection')
-    except requests.RequestException:
-        failure = ProviderFailure('provider_transport_error')
+    except requests.ConnectTimeout as error:
+        failure = ProviderFailure('provider_transport_timeout', transport_phase='connect',
+                                  transport_failure_detail=classify_transport_failure(error))
+    except requests.ReadTimeout as error:
+        failure = ProviderFailure('provider_transport_timeout', transport_phase='read',
+                                  transport_failure_detail=classify_transport_failure(error))
+    except requests.Timeout as error:
+        failure = ProviderFailure('provider_transport_timeout', transport_phase='generic',
+                                  transport_failure_detail=classify_transport_failure(error))
+    except requests.ConnectionError as error:
+        failure = ProviderFailure('provider_transport_connection', transport_phase='connection',
+                                  transport_failure_detail=classify_transport_failure(error))
+    except requests.RequestException as error:
+        failure = ProviderFailure('provider_transport_error',
+                                  transport_failure_detail=classify_transport_failure(error))
     except (ValueError, KeyError, IndexError, TypeError, AttributeError):
         failure = ProviderFailure('provider_invalid_response')
     # Return outside except; no raw HTTP exception is attached to a later terminal error.

@@ -612,6 +612,14 @@ read timeout ограничивает интервал ожидания данн
 `connect`, `read` и общий timeout, сохраняя прежнюю retry-категорию
 `provider_transport_timeout` и не меняя timeout/retry policy.
 
+Transport failures дополнительно получают закрытое поле `transport_failure_detail`.
+По типам requests/urllib3/socket/SSL и числовому errno различаются `dns`,
+`tcp_refused`, `tcp_reset`, `tls`, `proxy`, `network_unreachable`, `connect_timeout`
+и `read_timeout`. Когда этих доказательств нет, сохраняется только
+`unknown_connection`, `unknown_timeout` или `unknown_transport`. Текст exception,
+URL, hostname, headers, payload и credentials для классификации и telemetry не
+используются; retry, failover и run-scoped unavailable policy не изменены.
+
 Privacy boundary учитывает все загруженные credentials, включая disabled и резервные,
 и проверяет вход/выход общего LLM facade. Сырые requests exceptions не передаются
 в terminal exception. На завершении HTTP-ветки остаётся только безопасная классификация.

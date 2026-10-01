@@ -1,11 +1,14 @@
 """Synthetic connections/HTTP only. No real storage, credentials or provider requests."""
+import errno
 import json
 from pathlib import Path
+import socket
 import tempfile
 import traceback
 import unittest
 from unittest.mock import MagicMock, patch
 import requests
+from urllib3 import exceptions as urllib3_exceptions
 
 import test_safe_mvp
 import config
@@ -14,6 +17,7 @@ import llm_connections as store
 import llm_provider
 from llm_connections import LLMConnection as Connection
 from llm_errors import LLMUnavailable, LLMStopped, ProviderFailure, classify_http
+from llm_provider import classify_transport_failure
 import run_web
 from requests import Response
 
@@ -158,9 +162,10 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(operation['total_provider_attempt_count'],2)
 
     def test_timeout_retry_timing_distinguishes_transport_phase(self):
-        cases=((requests.ConnectTimeout(),'connect'),(requests.ReadTimeout(),'read'),
-               (requests.Timeout(),'generic'))
-        for error,phase in cases:
+        cases=((requests.ConnectTimeout(),'connect','connect_timeout'),
+               (requests.ReadTimeout(),'read','read_timeout'),
+               (requests.Timeout(),'generic','unknown_timeout'))
+        for error,phase,detail in cases:
             with self.subTest(phase=phase):
                 clock=FakeClock(); events=[]; calls=0
                 def request(*_args,**_kwargs):
@@ -176,8 +181,47 @@ class ConnectionTests(unittest.TestCase):
                 self.assertEqual(len(attempts),2)
                 self.assertEqual(attempts[0]['provider_error_category'],'provider_transport_timeout')
                 self.assertEqual(attempts[0]['transport_phase'],phase)
+                self.assertEqual(attempts[0]['transport_failure_detail'],detail)
                 self.assertTrue(attempts[0]['retry_allowed'])
                 self.assertEqual(attempts[1]['outcome'],'success')
+
+    def test_safe_transport_failure_subtypes_from_types_and_errno(self):
+        dns = urllib3_exceptions.NameResolutionError(
+            'SECRET_HOST', None, socket.gaierror(socket.EAI_NONAME, 'SECRET_DNS'))
+        cases = (
+            (requests.ConnectTimeout('SECRET_CONNECT'), 'connect_timeout'),
+            (requests.ReadTimeout('SECRET_READ'), 'read_timeout'),
+            (requests.ConnectionError('SECRET_GENERIC'), 'unknown_connection'),
+            (requests.ConnectionError(dns), 'dns'),
+            (requests.ConnectionError(ConnectionRefusedError(errno.ECONNREFUSED,
+                                                              'SECRET_REFUSED')), 'tcp_refused'),
+            (requests.ConnectionError(ConnectionResetError(errno.ECONNRESET,
+                                                            'SECRET_RESET')), 'tcp_reset'),
+            (requests.ConnectionError(OSError(errno.ENETUNREACH,
+                                               'SECRET_NETWORK')), 'network_unreachable'),
+            (requests.exceptions.SSLError('SECRET_TLS'), 'tls'),
+            (requests.exceptions.ProxyError('SECRET_PROXY'), 'proxy'),
+        )
+        for error, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(classify_transport_failure(error), expected)
+
+    def test_transport_telemetry_excludes_arbitrary_exception_message(self):
+        private = 'SECRET_TEST_VALUE https://private-provider.example/?key=PRIVATE_KEY'
+        events=[]; sleep=MagicMock()
+        router=llm.Router([connection()],sleep=sleep,telemetry=events.append)
+        with patch('llm.requests.post',side_effect=requests.ConnectionError(private)) as post, \
+             self.assertRaises(LLMUnavailable) as caught:
+            router.generate('facts',task='matching')
+        self.assertEqual(post.call_count,2)
+        sleep.assert_called_once_with(2.0)
+        attempts=[event for event in events if event['event']=='llm_attempt_finished']
+        self.assertEqual([event['transport_failure_detail'] for event in attempts],
+                         ['unknown_connection','unknown_connection'])
+        public=json.dumps(events)+json.dumps(caught.exception.failures)
+        self.assertNotIn(private,public)
+        self.assertNotIn('private-provider.example',public)
+        self.assertNotIn('PRIVATE_KEY',public)
 
     def test_timing_records_exhaustion_failover_and_success(self):
         clock=FakeClock(); events=[]; replies=[response(503),response(503),response()]

@@ -25,11 +25,13 @@ class ProviderFailure:
     quota_types: tuple = ()
     provider_status: str | None = None
     transport_phase: str | None = None
+    transport_failure_detail: str | None = None
 
     def public(self):
         return dict(provider_error_category=self.category, http_status=self.http_status,
                     retry_delay=self.retry_delay, quota_types=list(self.quota_types),
-                    provider_status=self.provider_status, transport_phase=self.transport_phase)
+                    provider_status=self.provider_status, transport_phase=self.transport_phase,
+                    transport_failure_detail=self.transport_failure_detail)
 
 
 def _seconds(value):

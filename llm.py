@@ -134,6 +134,7 @@ class Router:
                                    operation_elapsed_ms=self._elapsed_ms(operation_clock),
                                    outcome='success', provider_error_category=None,
                                    http_status=None, transport_phase=None,
+                                   transport_failure_detail=None,
                                    retry_allowed=False, failover_follows=False,
                                    connection_unavailable_after_attempt=False)
                         safe_text = sanitize_candidate_text(
@@ -171,6 +172,7 @@ class Router:
                                outcome='failure', provider_error_category=failure.category,
                                http_status=failure.http_status,
                                transport_phase=failure.transport_phase,
+                               transport_failure_detail=failure.transport_failure_detail,
                                retry_allowed=retry_scheduled,
                                failover_follows=failover_follows,
                                connection_unavailable_after_attempt=not retry_scheduled)
