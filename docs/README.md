@@ -473,6 +473,15 @@ selector или fallback.
 для внешнего элемента, короткую цепочку родителей. Это позволяет отличить click по card
 или её потомку от перекрытия другим слоем без сохранения текста DOM.
 
+Если в standalone `/applicant/vacancy_response` chooser не открылся, но после click
+виден exact `[data-qa="hidden-resume-warning"]`, результат остаётся manual с точным
+reason `resume_hidden_warning_requires_action`. `resume_warning_snapshot` описывает
+только root и интерактивные controls этого warning: закрытые role/type/data-qa поля,
+boolean state, имена `data-*`, безопасный HH path без query/fragment и exact resume ID
+из уже разрешённых структурных источников. Текст, aria-label, values и произвольные
+attribute values не сохраняются. Controls не нажимаются; modal chooser и exact-ID gate
+не изменены.
+
 ## Resume portal: один реальный DOM capture
 
 В RUSAL (137221148) после клика появился `data-qa=drop-base` с вложенным

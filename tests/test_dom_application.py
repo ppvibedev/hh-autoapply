@@ -435,10 +435,13 @@ class DOMTests(unittest.TestCase):
     def test_resume_metadata_snapshots_exclude_private_text(self):
         self.page.set_content('''<form><magritte-select-layout><div role="button" tabindex="0" class="magritte-card" data-qa="resume-trigger" aria-expanded="false"
           aria-controls="choices" onclick="this.setAttribute('aria-expanded','true');document.getElementById('choices').hidden=false">PRIVATE_RESUME_TEXT</div></magritte-select-layout>
+          <div data-qa="hidden-resume-warning">PRIVATE MODAL WARNING</div>
           <div hidden id="choices" data-qa="dropdown-unrecognised" class="dropdown-shell"><input value="TOP_SECRET_VALUE"><button>person@example.test PRIVATE_RESUME_TEXT</button></div></form>''')
         diag={}
-        with patch('application._custom_resume_state',return_value={'selected_ids':['bbbb'],'popup_found':False,'options':[]}):
+        with patch('application._custom_resume_state',return_value={'selected_ids':['bbbb'],'popup_found':False,'options':[]}), \
+             patch('application._resume_warning_snapshot') as warning_snapshot:
             self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diag))
+        warning_snapshot.assert_not_called()
         snapshots=diag['dom_snapshots']
         self.assertEqual([s['snapshot'] for s in snapshots],['before_click','immediately_after_click','100ms','500ms','1500ms','3000ms'])
         self.assertEqual(diag['reason_code'],'resume_popup_not_opened')
@@ -459,6 +462,15 @@ class DOMTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_RESUME_TEXT',json.dumps(diag))
         self.assertNotIn('person@example.test',json.dumps(diag))
         self.assertNotIn('TOP_SECRET_VALUE',json.dumps(diag))
+        self.assertNotIn('PRIVATE MODAL WARNING',json.dumps(diag))
+
+    def test_resume_warning_visible_transition_uses_structural_mutation_only(self):
+        snapshots=[{'mutation_events':[{'target':{'qa':'hidden-resume-warning'},
+            'attribute_name':'style','state_value':{'display':'block','visibility':'visible',
+                                                     'pointer_events':'auto'}}]}]
+        self.assertTrue(app._resume_warning_was_visible(snapshots))
+        snapshots[0]['mutation_events'][0]['state_value']['display']='none'
+        self.assertFalse(app._resume_warning_was_visible(snapshots))
 
     def test_standalone_resume_identity_snapshot_keeps_only_safe_structure(self):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>
@@ -492,12 +504,68 @@ class DOMTests(unittest.TestCase):
         with patch('application._safe_url_path',return_value='/applicant/vacancy_response'):
             self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diagnostics))
         self.assertEqual(diagnostics['reason_code'],'resume_popup_not_opened')
+        self.assertNotIn('resume_warning_snapshot',diagnostics)
         snapshots=diagnostics['resume_identity_snapshots']
         self.assertEqual([item['phase'] for item in snapshots],['before_click','after_click_wait'])
         self.assertTrue(all(item['exact_target_occurrence_count']==0 for item in snapshots))
         encoded=json.dumps(snapshots)
         self.assertNotIn('PRIVATE RESUME TITLE',encoded)
         self.assertNotIn('TOP_SECRET_VALUE',encoded)
+
+    def test_resume_warning_snapshot_is_structural_private_and_exact(self):
+        self.page.set_content('''<form><div data-qa="hidden-resume-warning" data-private="PRIVATE_DATA"
+          data-testid="resume-warning" aria-label="PRIVATE_ARIA" aria-controls="warning-controls">
+          PRIVATE_WARNING_TEXT
+          <button id="action" type="button" data-qa="resume-warning-action" data-note="PRIVATE_NOTE"
+            aria-label="PRIVATE_BUTTON" value="PRIVATE_VALUE" onclick="window.warningClicks++">PRIVATE_BUTTON_TEXT</button>
+          <a id="target" href="https://hh.ru/resume/aaaa?token=PRIVATE_QUERY#PRIVATE_FRAGMENT">PRIVATE_TARGET_TITLE</a>
+          <a id="other" href="https://hh.ru/resume/bbbb?token=OTHER_SECRET#fragment">PRIVATE_OTHER_TITLE</a>
+          <a id="external" href="https://private.example/SECRET_PATH?token=SECRET">PRIVATE_EXTERNAL</a>
+          <input type="radio" name="resumeId" value="bbbb" checked aria-label="PRIVATE_RADIO">
+        </div></form><script>window.warningClicks=0</script>''')
+        snapshot=app._resume_warning_snapshot(self.page.locator('form'),'aaaa')
+        self.assertTrue(snapshot['visible'])
+        self.assertEqual(snapshot['root']['data_qa'],'hidden-resume-warning')
+        self.assertIn('data-private',snapshot['root']['data_attribute_names'])
+        controls={item['data_qa'] or item['href_path']:item for item in snapshot['controls']}
+        self.assertEqual(controls['/resume/aaaa']['href_path'],'/resume/aaaa')
+        self.assertEqual(controls['/resume/bbbb']['href_path'],'/resume/bbbb')
+        self.assertEqual(controls['resume-warning-action']['type'],'button')
+        self.assertEqual(controls['']['href_path'],'')
+        identifiers=snapshot['exact_resume_identifiers']
+        self.assertIn({'source_type':'href-path','resume_id':'aaaa','matches_expected':True},identifiers)
+        self.assertIn({'source_type':'href-path','resume_id':'bbbb','matches_expected':False},identifiers)
+        self.assertIn({'source_type':'resume-control-value','resume_id':'bbbb','matches_expected':False},identifiers)
+        self.assertEqual(self.page.evaluate('warningClicks'),0)
+        encoded=json.dumps(snapshot)
+        for private in ('PRIVATE_DATA','PRIVATE_ARIA','PRIVATE_NOTE','PRIVATE_VALUE','PRIVATE_WARNING_TEXT',
+                        'PRIVATE_BUTTON_TEXT','PRIVATE_TARGET_TITLE','PRIVATE_OTHER_TITLE','PRIVATE_EXTERNAL',
+                        'PRIVATE_QUERY','PRIVATE_FRAGMENT','OTHER_SECRET','private.example','SECRET_PATH'):
+            self.assertNotIn(private,encoded)
+        self.assertNotIn('aria-label',encoded)
+        self.assertNotIn('?token=',encoded)
+
+    def test_standalone_visible_resume_warning_gets_specific_diagnostic_without_action(self):
+        self.page.set_content('''<form><section><div>Резюме для отклика</div>
+          <div id="trigger" role="button" data-qa="resume-trigger"
+            onclick="document.getElementById('warning').hidden=false">PRIVATE RESUME TITLE</div>
+          <div id="warning" data-qa="hidden-resume-warning" hidden>
+            PRIVATE WARNING <button id="warning-action" type="button"
+              data-qa="hidden-resume-warning-action" onclick="window.warningClicks++">PRIVATE ACTION</button>
+            <a href="https://hh.ru/resume/aaaa?token=PRIVATE_QUERY">PRIVATE RESUME</a>
+          </div></section></form><script>window.warningClicks=0</script>''')
+        diagnostics={}
+        with patch('application._safe_url_path',return_value='/applicant/vacancy_response'):
+            self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diagnostics))
+        self.assertEqual(diagnostics['reason_code'],'resume_hidden_warning_requires_action')
+        self.assertEqual(diagnostics['state_reason_code'],'hidden_resume_warning_visible')
+        self.assertEqual(diagnostics['resume_warning_snapshot']['visibility_evidence'],'visible_after_click')
+        self.assertEqual(diagnostics['resume_warning_snapshot']['exact_resume_identifiers'],[
+            {'source_type':'href-path','resume_id':'aaaa','matches_expected':True}])
+        self.assertEqual(self.page.evaluate('warningClicks'),0)
+        encoded=json.dumps(diagnostics['resume_warning_snapshot'])
+        for private in ('PRIVATE WARNING','PRIVATE ACTION','PRIVATE RESUME','PRIVATE_QUERY'):
+            self.assertNotIn(private,encoded)
 
     def _real_resume_portal(self, update):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>

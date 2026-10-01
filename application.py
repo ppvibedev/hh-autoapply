@@ -858,6 +858,94 @@ def _resume_identity_snapshot(form, resume_id, phase):
     return value if isinstance(value,dict) else {}
 
 
+RESUME_WARNING_SNAPSHOT = r'''(form, expectedId) => {
+    const visible=el=>{
+        if (!el || !el.getClientRects().length) return false;
+        const style=getComputedStyle(el);
+        return style.display !== 'none' && !['hidden','collapse'].includes(style.visibility);
+    };
+    const warnings=[...form.querySelectorAll('[data-qa="hidden-resume-warning"]')];
+    const warning=warnings.find(visible) || warnings[0];
+    if (!warning) return null;
+    const ident=value=>/^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/.test(value || '') ? value : '';
+    const hex=value=>/^[0-9a-f]{4,64}$/i.test(value || '') ? value.toLowerCase() : '';
+    const role=el=>['button','link','radio','checkbox','combobox','option','menuitem','select']
+        .includes(el.getAttribute('role')) ? el.getAttribute('role') : '';
+    const type=el=>['button','submit','reset','radio','checkbox','select-one','select-multiple']
+        .includes((el.type || '').toLowerCase()) ? (el.type || '').toLowerCase() : '';
+    const hrefInfo=el=>{
+        const href=el.getAttribute('href');
+        if (!href) return null;
+        try {
+            const url=new URL(href,location.href);
+            if (url.protocol !== 'https:' || !['hh.ru','www.hh.ru'].includes(url.hostname)
+                    || !/^\/[A-Za-z0-9_\/-]{1,255}\/?$/.test(url.pathname)) return null;
+            const match=/^\/resume\/([0-9a-f]{4,64})\/?$/i.exec(url.pathname);
+            return {path:url.pathname,resume_id:match ? match[1].toLowerCase() : ''};
+        } catch (_) { return null; }
+    };
+    const identifiers=el=>{
+        const found=[];
+        const add=(source,value)=>{const id=hex(value);if(id)found.push({source_type:source,resume_id:id,matches_expected:id===expectedId});};
+        add('data-resume-id',el.getAttribute('data-resume-id'));
+        const qa=el.getAttribute('data-qa') || '';
+        const option=/^magritte-select-option-([0-9a-f]{4,64})$/i.exec(qa);
+        if (option) add('data-qa-option',option[1]);
+        const generic=hex(el.getAttribute('data-id'));
+        if (generic && generic === expectedId) add('data-id-target',generic);
+        const href=hrefInfo(el);
+        if (href?.resume_id) add('href-path',href.resume_id);
+        const owner=el.tagName === 'OPTION' ? el.closest('select') : null;
+        const resumeNamed=node=>node && /resume/i.test(node.getAttribute('name') || '');
+        if (resumeNamed(el) || resumeNamed(owner)) add('resume-control-value',el.value || el.getAttribute('value'));
+        return [...new Map(found.map(item=>[item.source_type+':'+item.resume_id,item])).values()];
+    };
+    const meta=el=>{
+        const href=hrefInfo(el);
+        const expanded=el.getAttribute('aria-expanded');
+        const popup=el.getAttribute('aria-haspopup');
+        const controls=el.getAttribute('aria-controls');
+        return {tag:el.tagName.toLowerCase(),role:role(el),type:type(el),
+            data_qa:ident(el.getAttribute('data-qa')),data_testid:ident(el.getAttribute('data-testid')),
+            aria_haspopup:['true','false','menu','listbox','dialog'].includes(popup) ? popup : '',
+            aria_expanded:['true','false'].includes(expanded) ? expanded : '',
+            aria_controls_present:controls !== null,aria_controls:ident(controls),
+            disabled:el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',
+            checked:['radio','checkbox'].includes((el.type || '').toLowerCase()) ? !!el.checked : null,
+            selected:el.tagName === 'OPTION' ? !!el.selected
+                : ['true','false'].includes(el.getAttribute('aria-selected')) ? el.getAttribute('aria-selected') === 'true' : null,
+            hidden:!visible(el),
+            data_attribute_names:[...el.attributes].map(attr=>attr.name)
+                .filter(name=>/^data-[a-z0-9_-]{1,63}$/i.test(name)).slice(0,16),
+            href_path:href ? href.path : '',resume_identifiers:identifiers(el)};
+    };
+    const selector='button,[role="button"],a,[role="link"],input[type="radio"],input[type="checkbox"],select,option,[role="radio"],[role="checkbox"],[role="combobox"],[role="option"],[role="menuitem"]';
+    const controls=[...new Set([warning,...warning.querySelectorAll(selector)])]
+        .filter(el=>el === warning ? el.matches(selector) : true).slice(0,24);
+    const root=meta(warning), controlMetadata=controls.map(meta);
+    const exactIdentifiers=[...root.resume_identifiers,...controlMetadata.flatMap(item=>item.resume_identifiers)];
+    return {present:true,visible:visible(warning),root,control_count:controlMetadata.length,
+        controls:controlMetadata,exact_resume_identifiers:exactIdentifiers};
+}'''
+
+
+def _resume_warning_snapshot(form, resume_id):
+    value = form.evaluate(RESUME_WARNING_SNAPSHOT, resume_id)
+    return value if isinstance(value,dict) else None
+
+
+def _resume_warning_was_visible(snapshots):
+    for snapshot in snapshots:
+        for event in snapshot.get('mutation_events',[]):
+            if (event.get('target',{}).get('qa') != 'hidden-resume-warning'
+                    or event.get('attribute_name') != 'style'):
+                continue
+            state = event.get('state_value',{})
+            if (state.get('display') != 'none' and state.get('visibility') != 'hidden'):
+                return True
+    return False
+
+
 RESUME_DOM_OBSERVER = r'''(trigger, targetResumeId) => {
     let changed=false;
     const changedRoots=new Set();
@@ -1213,7 +1301,22 @@ def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_i
         except Exception: pass
     opened = diagnostics['opened']
     if not opened.get('popup_found'):
-        diagnostics.update(reason_code='resume_popup_not_opened',state_reason_code='chooser_not_opened')
+        warning = None
+        if standalone_identity_diagnostics:
+            try:
+                current = _current_or_fallback_scope(page,form)
+                if current is not None:
+                    warning = _resume_warning_snapshot(current,resume_id)
+            except Exception as error:
+                diagnostics['resume_warning_diagnostic_error_type']=type(error).__name__
+        if warning and (warning.get('visible') is True or _resume_warning_was_visible(snapshots)):
+            warning['visibility_evidence'] = ('visible_after_click' if warning.get('visible') is True
+                                              else 'visible_transition_observed')
+            diagnostics['resume_warning_snapshot'] = warning
+            diagnostics.update(reason_code='resume_hidden_warning_requires_action',
+                               state_reason_code='hidden_resume_warning_visible')
+        else:
+            diagnostics.update(reason_code='resume_popup_not_opened',state_reason_code='chooser_not_opened')
         return False
     selected_ids = opened.get('selected_ids',[])
     if len(selected_ids) > 1:
