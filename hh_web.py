@@ -69,6 +69,31 @@ def _safe_path(url: object) -> str:
     return path if path.startswith("/") else "[unknown]"
 
 
+_SAFE_DATA_QA = re.compile(r"[a-z][a-z0-9_-]{0,79}")
+
+
+def _safe_data_qa_identifier(value: object) -> str | None:
+    """Allow only short structural identifiers; omit dynamic/private-looking values."""
+    if not isinstance(value, str) or _SAFE_DATA_QA.fullmatch(value) is None:
+        return None
+    if re.search(r"[0-9a-f]{16,}", value) or re.search(r"\d{9,}", value):
+        return None
+    return value
+
+
+def _empty_page_data_qa_snapshot(page) -> list[dict]:
+    """Read only data-qa attributes; never inspect text, HTML or form values."""
+    elements = page.locator("[data-qa]")
+    counts: dict[str, int] = {}
+    for index in range(elements.count()):
+        identifier = _safe_data_qa_identifier(
+            elements.nth(index).get_attribute("data-qa"))
+        if identifier is not None:
+            counts[identifier] = counts.get(identifier, 0) + 1
+    return [{"data_qa": identifier, "count": counts[identifier]}
+            for identifier in sorted(counts)]
+
+
 def _search_page_diagnostic(*, requested_path: str, final_url: object,
                             navigation_http_status: object, raw_card_count: int,
                             parsed_vacancy_count: int,
@@ -186,6 +211,16 @@ def search_page(page, *, text: str, area: str, salary_min: int,
                 parsed_vacancy_count=len(out),
                 captcha_marker_present=captcha_present,
             ))
+            if raw_card_count == 0 and not out:
+                try:
+                    snapshot = _empty_page_data_qa_snapshot(page)
+                    diagnostics["empty_page_data_qa_snapshot"] = snapshot
+                    diagnostics["empty_page_data_qa_distinct_count"] = len(snapshot)
+                    diagnostics["empty_page_data_qa_snapshot_status"] = "collected"
+                except Exception:
+                    diagnostics["empty_page_data_qa_snapshot"] = []
+                    diagnostics["empty_page_data_qa_distinct_count"] = 0
+                    diagnostics["empty_page_data_qa_snapshot_status"] = "unavailable"
         except Exception:
             # Telemetry must never turn an otherwise valid search into a failure.
             pass

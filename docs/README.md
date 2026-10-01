@@ -186,6 +186,9 @@ Matching/privacy error без надёжного score также остаётс
 число raw containers, parsed вакансий и новых exact ID, а также известные
 login/captcha/error признаки. Подтверждённых empty-results и next-page
 селекторов пока нет, поэтому эти поля честно остаются `unknown`.
+Только для страницы `raw=0 / parsed=0` дополнительно сохраняется
+агрегированный allowlist коротких структурных `data-qa` identifiers. Текст,
+HTML, values, href и другие DOM-атрибуты не читаются и не пишутся.
 Событие только наблюдает: numeric pagination, selectors, parsing и reason
 `no_results_or_page_not_recognized` не меняются. `run_started` дополнительно
 сохраняет несекретный immutable snapshot фактических search filters.
