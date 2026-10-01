@@ -42,6 +42,9 @@
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .feed{display:flex;flex-direction:column;gap:8px;max-height:480px;overflow-y:auto;
     overscroll-behavior:contain;padding-right:4px}
+  .history-filters{display:flex;gap:6px;flex-wrap:wrap;margin:-2px 0 12px}
+  button.history-filter{padding:5px 10px;border-radius:999px;font-size:12px;color:var(--tx2)}
+  button.history-filter.active{background:var(--accent-bg);border-color:var(--accent);color:var(--accent);font-weight:600}
   .history-status{margin-top:8px;text-align:center}
   .item{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px}
   .tag{font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px;white-space:nowrap;flex-shrink:0}
@@ -212,6 +215,16 @@
 
   <div class="card">
     <h2>Лента решений</h2>
+    <div class="history-filters" id="historyFilters" aria-label="Фильтр ленты решений">
+      <button type="button" class="history-filter active" data-history-filter="all" aria-pressed="true" onclick="setHistoryFilter('all')">Все</button>
+      <button type="button" class="history-filter" data-history-filter="manual_review" aria-pressed="false" onclick="setHistoryFilter('manual_review')">Проверить вручную</button>
+      <button type="button" class="history-filter" data-history-filter="applied_confirmed" aria-pressed="false" onclick="setHistoryFilter('applied_confirmed')">Отклик отправлен</button>
+      <button type="button" class="history-filter" data-history-filter="already_applied" aria-pressed="false" onclick="setHistoryFilter('already_applied')">Уже откликались</button>
+      <button type="button" class="history-filter" data-history-filter="below_threshold" aria-pressed="false" onclick="setHistoryFilter('below_threshold')">Ниже порога</button>
+      <button type="button" class="history-filter" data-history-filter="filtered" aria-pressed="false" onclick="setHistoryFilter('filtered')">Отфильтровано</button>
+      <button type="button" class="history-filter" data-history-filter="errors_unknown" aria-pressed="false" onclick="setHistoryFilter('errors_unknown')">Ошибки / неизвестно</button>
+      <button type="button" class="history-filter" data-history-filter="safe_ready" aria-pressed="false" onclick="setHistoryFilter('safe_ready')">Готово в SAFE</button>
+    </div>
     <div class="feed" id="feed"></div>
     <div class="muted history-status" id="historyStatus"></div>
   </div>
@@ -259,6 +272,9 @@ let historyLatestVacancyId = null;
 let historyKnownTotal = 0;
 let historyLoading = false;
 let historyExhausted = false;
+let historyFilter = 'all';
+let historyRequestGeneration = 0;
+let historySourceLatestVacancyId = null;
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>cfgTouched=true));
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -282,7 +298,7 @@ function renderHistory(preservePosition=false){
   const previousHeight = feed.scrollHeight;
   const previousTop = feed.scrollTop;
   const open = new Set([...feed.querySelectorAll('details[open]')].map(d=>d.dataset.vid));
-  feed.innerHTML = historyItems.map(historyCard).join('') || '<div class="muted">Пусто. Запусти прогон.</div>';
+  feed.innerHTML = historyItems.map(historyCard).join('') || `<div class="muted">${historyRunId?'Нет записей для выбранного фильтра.':'Пусто. Запусти прогон.'}</div>`;
   for(const detail of feed.querySelectorAll('details')) if(open.has(detail.dataset.vid)) detail.open=true;
   if(preservePosition && previousTop>20) feed.scrollTop=previousTop+(feed.scrollHeight-previousHeight);
   const shown=historyItems.length;
@@ -290,16 +306,28 @@ function renderHistory(preservePosition=false){
     : historyRunId ? `Показано ${shown} из ${historyKnownTotal}${historyExhausted?'':' · прокрутите вниз'}` : '';
 }
 
-async function loadHistoryPage(newest=false){
+function renderHistoryFilters(){
+  for(const button of document.querySelectorAll('[data-history-filter]')){
+    const active=button.dataset.historyFilter===historyFilter;
+    button.classList.toggle('active',active);
+    button.setAttribute('aria-pressed',String(active));
+  }
+}
+
+async function loadHistoryPage(newest=false, observedLatest=null){
   if(!historyRunId || historyLoading || (!newest && historyExhausted)) return;
   const requestedRun=historyRunId;
+  const requestedFilter=historyFilter;
+  const requestGeneration=historyRequestGeneration;
   historyLoading=true; renderHistory();
   try{
-    const params=new URLSearchParams({run_id:requestedRun,limit:'75'});
+    const params=new URLSearchParams({run_id:requestedRun,limit:'75',status:requestedFilter});
     if(!newest && historyNextCursor) params.set('cursor',historyNextCursor);
     const response=await fetch('/api/history?'+params.toString());
     const data=await response.json();
-    if(!response.ok || data.run_id!==requestedRun || historyRunId!==requestedRun) return;
+    if(!response.ok || data.run_id!==requestedRun || data.filter!==requestedFilter
+        || historyRunId!==requestedRun || historyFilter!==requestedFilter
+        || historyRequestGeneration!==requestGeneration) return;
     const incoming=Array.isArray(data.items)?data.items:[];
     historyKnownTotal=Number.isInteger(data.total)?data.total:historyKnownTotal;
     if(newest && historyItems.length){
@@ -316,18 +344,31 @@ async function loadHistoryPage(newest=false){
       historyLatestVacancyId=historyItems.length?String(historyItems[0].vacancy_id):null;
       historyExhausted=!historyNextCursor;
     }
+    if(observedLatest!==null) historySourceLatestVacancyId=String(observedLatest);
   }catch(_error){
-    document.getElementById('historyStatus').textContent='Не удалось загрузить историю';
+    if(historyRequestGeneration===requestGeneration)
+      document.getElementById('historyStatus').textContent='Не удалось загрузить историю';
   }finally{
-    if(historyRunId===requestedRun){historyLoading=false;renderHistory();}
+    if(historyRunId===requestedRun && historyFilter===requestedFilter
+        && historyRequestGeneration===requestGeneration){historyLoading=false;renderHistory();}
   }
 }
 
-function resetHistory(runId,total=0){
+function resetHistory(runId,total=0,observedLatest=null){
+  historyRequestGeneration+=1;
   historyRunId=runId||null; historyItems=[]; historyIds=new Set(); historyNextCursor=null;
-  historyLatestVacancyId=null; historyKnownTotal=total||0; historyLoading=false; historyExhausted=false;
-  renderHistory();
-  if(historyRunId) loadHistoryPage(false);
+  historyLatestVacancyId=null; historySourceLatestVacancyId=null;
+  historyKnownTotal=total||0; historyLoading=false; historyExhausted=false;
+  renderHistoryFilters(); renderHistory();
+  if(historyRunId) loadHistoryPage(false,observedLatest);
+}
+
+function setHistoryFilter(value){
+  if(!document.querySelector(`[data-history-filter="${value}"]`) || value===historyFilter) return;
+  const runId=historyRunId;
+  const observedLatest=historySourceLatestVacancyId;
+  historyFilter=value;
+  resetHistory(runId,value==='all'?historyKnownTotal:0,observedLatest);
 }
 
 function showToast(text, kind){
@@ -475,10 +516,10 @@ async function refresh(){
 
   const total=Number.isInteger(s.history_total)?s.history_total:0;
   const latest=s.history_latest_vacancy_id==null?null:String(s.history_latest_vacancy_id);
-  if(s.run_id!==historyRunId) resetHistory(s.run_id,total);
+  if(s.run_id!==historyRunId) resetHistory(s.run_id,historyFilter==='all'?total:0,latest);
   else {
-    historyKnownTotal=total;
-    if(latest && latest!==historyLatestVacancyId) loadHistoryPage(true);
+    if(historyFilter==='all') historyKnownTotal=total;
+    if(latest && latest!==historySourceLatestVacancyId) loadHistoryPage(true,latest);
     else renderHistory();
   }
 

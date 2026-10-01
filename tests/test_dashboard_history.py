@@ -23,12 +23,12 @@ class DashboardHistoryTests(unittest.TestCase):
             encoding="utf-8")
         webapp._decisions_cache.update(identity=None, offset=0, pending=b"", rows=[])
 
-    def outcomes(self, run_id, count, *, start=1):
+    def outcomes(self, run_id, count, *, start=1, decision="needs_manual_review"):
         return [{
             "run_id": run_id,
             "vacancy_id": str(start + index),
             "vid": str(start + index),
-            "decision": "needs_manual_review",
+            "decision": decision,
             "title": f"Vacancy {start + index}",
             "company": "Example",
             "url": f"https://hh.ru/vacancy/{start + index}",
@@ -73,10 +73,79 @@ class DashboardHistoryTests(unittest.TestCase):
             f"/api/history?run_id={self.run_id}&limit=word",
             f"/api/history?run_id={self.run_id}&cursor=bad",
             f"/api/history?run_id={self.run_id}&cursor=999",
+            f"/api/history?run_id={self.run_id}&status=unknown",
         ):
             with self.subTest(query=query):
                 self.assertEqual(client.get(query).status_code, 400)
         self.assertEqual(client.get("/api/history?run_id=" + "b" * 32).status_code, 404)
+
+    def test_status_groups_filter_before_page_limit(self):
+        rows = [{"event": "run_started", "run_id": self.run_id}]
+        # In newest-first API order the first 75 cards are not manual. The
+        # manual cards must still fill the filtered page from deeper history.
+        rows += self.outcomes(self.run_id, 25, start=1, decision="needs_manual_review")
+        rows += self.outcomes(self.run_id, 75, start=26, decision="rejected_score")
+        rows += [
+            {"run_id": self.run_id, "vacancy_id": "101", "decision": "applied_confirmed"},
+            {"run_id": self.run_id, "vacancy_id": "102", "decision": "already_applied"},
+            {"run_id": self.run_id, "vacancy_id": "103", "decision": "rejected_hard_filter"},
+            {"run_id": self.run_id, "vacancy_id": "104", "decision": "rejected_remote"},
+            {"run_id": self.run_id, "vacancy_id": "105", "decision": "apply_failed"},
+            {"run_id": self.run_id, "vacancy_id": "106", "decision": "submission_unknown"},
+            {"run_id": self.run_id, "vacancy_id": "107", "decision": "safe_ready"},
+        ]
+        self.write(rows)
+        client = webapp.app.test_client()
+
+        all_page = client.get(f"/api/history?run_id={self.run_id}&limit=20").get_json()
+        self.assertEqual(all_page["filter"], "all")
+        self.assertEqual(all_page["total"], 107)
+        self.assertEqual(len(all_page["items"]), 20)
+
+        manual = client.get(
+            f"/api/history?run_id={self.run_id}&limit=20&status=manual_review").get_json()
+        self.assertEqual(manual["total"], 25)
+        self.assertEqual(len(manual["items"]), 20)
+        self.assertEqual({row["decision"] for row in manual["items"]}, {"needs_manual_review"})
+
+        expected = {
+            "below_threshold": {"rejected_score"},
+            "applied_confirmed": {"applied_confirmed"},
+            "already_applied": {"already_applied"},
+            "filtered": {"rejected_hard_filter", "rejected_remote"},
+            "errors_unknown": {"apply_failed", "submission_unknown"},
+            "safe_ready": {"safe_ready"},
+        }
+        for status_filter, decisions in expected.items():
+            with self.subTest(status_filter=status_filter):
+                data = client.get(
+                    f"/api/history?run_id={self.run_id}&status={status_filter}&limit=100").get_json()
+                self.assertEqual({row["decision"] for row in data["items"]}, decisions)
+                self.assertEqual(data["total"], len(data["items"]))
+
+    def test_filtered_cursor_has_no_duplicates_or_run_leakage(self):
+        other_run = "b" * 32
+        rows = ([{"event": "run_started", "run_id": self.run_id}]
+                + self.outcomes(self.run_id, 45, decision="needs_manual_review")
+                + self.outcomes(self.run_id, 15, start=46, decision="rejected_score")
+                + [{"event": "run_started", "run_id": other_run}]
+                + self.outcomes(other_run, 5, start=100, decision="needs_manual_review"))
+        self.write(rows)
+        client = webapp.app.test_client()
+        found = []
+        cursor = None
+        while True:
+            query = f"/api/history?run_id={self.run_id}&status=manual_review&limit=20"
+            if cursor:
+                query += f"&cursor={cursor}"
+            data = client.get(query).get_json()
+            found.extend(row["vacancy_id"] for row in data["items"])
+            cursor = data["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(len(found), 45)
+        self.assertEqual(len(found), len(set(found)))
+        self.assertFalse(set(found) & {str(value) for value in range(100, 105)})
 
     def test_retained_completed_and_active_runs_are_independently_paginated(self):
         completed = "b" * 32

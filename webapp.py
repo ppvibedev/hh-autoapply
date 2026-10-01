@@ -51,6 +51,16 @@ _HISTORY_CARD_FIELDS = (
     "url", "reason_code", "reason", "why", "score", "role_alignment",
     "role_alignment_reason", "letter",
 )
+_HISTORY_FILTERS = {
+    "all": None,
+    "manual_review": frozenset({"needs_manual_review"}),
+    "applied_confirmed": frozenset({"applied_confirmed"}),
+    "already_applied": frozenset({"already_applied"}),
+    "below_threshold": frozenset({"rejected_score"}),
+    "filtered": frozenset({"rejected_hard_filter", "rejected_remote"}),
+    "errors_unknown": frozenset({"apply_failed", "submission_unknown"}),
+    "safe_ready": frozenset({"safe_ready"}),
+}
 
 # Ключи .env, которые разрешено править из интерфейса.
 EDITABLE = [
@@ -194,8 +204,11 @@ def _vacancy_rows(rows, run_id):
             if row.get("run_id") == run_id and not row.get("event") and row.get("vacancy_id")]
 
 
-def _history_page(rows, run_id, cursor, limit):
+def _history_page(rows, run_id, cursor, limit, status_filter="all"):
     decisions = _vacancy_rows(rows, run_id)
+    accepted = _HISTORY_FILTERS[status_filter]
+    if accepted is not None:
+        decisions = [row for row in decisions if row.get("decision") in accepted]
     start = 0
     if cursor is not None:
         positions = [index for index, row in enumerate(decisions)
@@ -211,6 +224,7 @@ def _history_page(rows, run_id, cursor, limit):
         "next_cursor": str(selected[-1]["vacancy_id"]) if more and selected else None,
         "total": len(decisions),
         "order": "newest_first",
+        "filter": status_filter,
     }
 
 
@@ -435,11 +449,14 @@ def api_history():
     cursor = request.args.get("cursor")
     if cursor is not None and not _VACANCY_ID_RE.fullmatch(cursor):
         return jsonify({"error": "invalid_history_cursor"}), 400
+    status_filter = request.args.get("status", "all")
+    if status_filter not in _HISTORY_FILTERS:
+        return jsonify({"error": "invalid_history_filter"}), 400
     rows = _read_decisions(limit=100000)
     if not any(row.get("run_id") == run_id for row in rows):
         return jsonify({"error": "run_not_found"}), 404
     try:
-        return jsonify(_history_page(rows, run_id, cursor, limit))
+        return jsonify(_history_page(rows, run_id, cursor, limit, status_filter))
     except ValueError:
         return jsonify({"error": "invalid_history_cursor"}), 400
 
