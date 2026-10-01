@@ -385,7 +385,24 @@ def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous_handlers[sig] = signal.signal(sig, _request_stop)
         _log({"event": "run_started", "run_id": run_id, "mode": mode,
-              "selected_resume_id": resume_id, "threshold": config.SCORE_THRESHOLD})
+              "selected_resume_id": resume_id, "threshold": config.SCORE_THRESHOLD,
+              "search_config": {
+                  "search_text": config.SEARCH_TEXT,
+                  "search_query": config.SEARCH_QUERY,
+                  "area": config.AREA,
+                  "area_scope": "worldwide" if not config.AREA else "specific_area",
+                  "pages_per_run": config.PAGES_PER_RUN,
+                  "score_threshold": config.SCORE_THRESHOLD,
+                  "target_confirmed_applications": config.TARGET_APPLICATIONS_PER_RUN,
+                  "work_format": config.WORK_FORMAT,
+                  "work_format_codes": list(config.WORK_FORMAT_CODES),
+                  "salary_min": config.SALARY_MIN,
+                  "experience": config.EXPERIENCE,
+                  "employment": config.EMPLOYMENT,
+                  "schedule": config.SCHEDULE,
+                  "search_period": config.SEARCH_PERIOD,
+                  "order_by": config.ORDER_BY,
+              }})
         print(mode + (": поиск и анализ; отправка заблокирована." if mode == "SAFE" else ": реальные отклики разрешены для этого запуска."), flush=True)
         seen_this_run = set()  # SAFE не использует и не меняет старый seen.json.
         with browser_context(on_stage=mark_stage) as (_, page):
@@ -394,9 +411,48 @@ def main():
                 if _observe_stop() or halt:
                     break
                 mark_stage("search_start")
-                vacs = hh_web.search_page(page, text=config.SEARCH_QUERY, area=config.AREA,
-                    salary_min=config.SALARY_MIN, work_format_codes=["REMOTE"], page_num=page_num,
-                    extra_params=config.HH_SEARCH_PARAMS)
+                search_diagnostic = {"event": "search_page_diagnostic", "run_id": run_id,
+                                     "page_num": page_num}
+                try:
+                    vacs = hh_web.search_page(page, text=config.SEARCH_QUERY, area=config.AREA,
+                        salary_min=config.SALARY_MIN, work_format_codes=["REMOTE"], page_num=page_num,
+                        extra_params=config.HH_SEARCH_PARAMS, diagnostics=search_diagnostic)
+                except Exception:
+                    search_diagnostic.setdefault("requested_path", "/search/vacancy")
+                    search_diagnostic.setdefault("final_path", "[unknown]")
+                    search_diagnostic.setdefault("redirect_observed", False)
+                    search_diagnostic.setdefault("navigation_http_status", None)
+                    search_diagnostic.setdefault("raw_card_count", None)
+                    search_diagnostic.setdefault("parsed_vacancy_count", None)
+                    search_diagnostic.setdefault("new_unique_vacancy_count", None)
+                    search_diagnostic.setdefault("empty_results_marker", "unknown")
+                    search_diagnostic.setdefault("next_page_marker", "unknown")
+                    search_diagnostic.setdefault("login_marker_present", "unknown")
+                    search_diagnostic.setdefault("captcha_marker_present", "unknown")
+                    search_diagnostic.setdefault("hh_error_marker_present", "unknown")
+                    search_diagnostic.setdefault("interstitial_marker", "unknown")
+                    search_diagnostic.setdefault("outcome", "search_page_exception")
+                    _log(search_diagnostic)
+                    raise
+                new_ids = {str(vac.get("id", "")) for vac in vacs
+                           if str(vac.get("id", "")).isdigit()
+                           and str(vac.get("id", "")) not in seen_this_run}
+                search_diagnostic.setdefault("requested_path", "/search/vacancy")
+                search_diagnostic.setdefault("final_path", "[unknown]")
+                search_diagnostic.setdefault("redirect_observed", False)
+                search_diagnostic.setdefault("navigation_http_status", None)
+                search_diagnostic.setdefault("raw_card_count", None)
+                search_diagnostic.setdefault("parsed_vacancy_count", len(vacs))
+                search_diagnostic["new_unique_vacancy_count"] = len(new_ids)
+                search_diagnostic.setdefault("empty_results_marker", "unknown")
+                search_diagnostic.setdefault("next_page_marker", "unknown")
+                search_diagnostic.setdefault("login_marker_present", "unknown")
+                search_diagnostic.setdefault("captcha_marker_present", "unknown")
+                search_diagnostic.setdefault("hh_error_marker_present", "unknown")
+                search_diagnostic.setdefault("interstitial_marker", "unknown")
+                search_diagnostic.setdefault(
+                    "outcome", "vacancies_parsed" if vacs else "empty_unclassified")
+                _log(search_diagnostic)
                 if not vacs:
                     stop_reason = "no_results_or_page_not_recognized"
                     break

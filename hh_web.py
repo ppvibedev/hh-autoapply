@@ -61,9 +61,66 @@ def _vac_id(url: str) -> str:
     return m.group(1) if m else (url or "")
 
 
+def _safe_path(url: object) -> str:
+    """Keep only a URL path; never persist search parameters or credentials."""
+    if not isinstance(url, str):
+        return "[unknown]"
+    path = urlparse(url).path
+    return path if path.startswith("/") else "[unknown]"
+
+
+def _search_page_diagnostic(*, requested_path: str, final_url: object,
+                            navigation_http_status: object, raw_card_count: int,
+                            parsed_vacancy_count: int,
+                            captcha_marker_present: object) -> dict:
+    """Classify safe structural observations without changing search behavior."""
+    final_path = _safe_path(final_url)
+    status = (navigation_http_status if isinstance(navigation_http_status, int)
+              and not isinstance(navigation_http_status, bool) else None)
+    captcha = captcha_marker_present if isinstance(captcha_marker_present, bool) else "unknown"
+    if final_path.rstrip("/") == "/captcha":
+        captcha = True
+    login = final_path.rstrip("/") == "/account/login"
+    hh_error = status is not None and status >= 400
+
+    # No reliable empty-results, pagination or interstitial selector is currently
+    # established in this codebase. Preserve that uncertainty instead of guessing.
+    empty_marker = "unknown"
+    next_marker = "unknown"
+    interstitial = "unknown"
+    if login:
+        outcome = "login_page_detected"
+    elif captcha is True:
+        outcome = "captcha_detected"
+    elif hh_error:
+        outcome = "hh_error_detected"
+    elif parsed_vacancy_count > 0:
+        outcome = "vacancies_parsed"
+    elif raw_card_count > 0:
+        outcome = "raw_cards_parse_failed"
+    else:
+        outcome = "empty_unclassified"
+    return {
+        "requested_path": requested_path,
+        "final_path": final_path,
+        "redirect_observed": final_path not in ("[unknown]", requested_path),
+        "navigation_http_status": status,
+        "raw_card_count": raw_card_count,
+        "parsed_vacancy_count": parsed_vacancy_count,
+        "empty_results_marker": empty_marker,
+        "next_page_marker": next_marker,
+        "login_marker_present": login,
+        "captcha_marker_present": captcha,
+        "hh_error_marker_present": hh_error,
+        "interstitial_marker": interstitial,
+        "outcome": outcome,
+    }
+
+
 def search_page(page, *, text: str, area: str, salary_min: int,
                 work_format_codes: list[str], page_num: int,
-                extra_params: dict | None = None) -> list[dict]:
+                extra_params: dict | None = None,
+                diagnostics: dict | None = None) -> list[dict]:
     """Открывает страницу выдачи и парсит карточки вакансий.
 
     extra_params — родные фильтры hh (experience/employment/schedule/…).
@@ -82,12 +139,13 @@ def search_page(page, *, text: str, area: str, salary_min: int,
         if v:
             params[k] = v
     url = "https://hh.ru/search/vacancy?" + urlencode(params, doseq=True)
-    page.goto(url, wait_until="domcontentloaded")
+    response = page.goto(url, wait_until="domcontentloaded")
     _pause()
 
     cards = page.locator(SEL["card"])
+    raw_card_count = cards.count()
     out: list[dict] = []
-    for i in range(cards.count()):
+    for i in range(raw_card_count):
         c = cards.nth(i)
         title_el = c.locator(SEL["card_title"]).first
         if not title_el.count():
@@ -106,6 +164,31 @@ def search_page(page, *, text: str, area: str, salary_min: int,
             "url": href.split("?")[0],
             "description": "",  # заполним при открытии карточки
         })
+    if diagnostics is not None:
+        try:
+            captcha_present = page.locator('[data-qa*="captcha"]').count() > 0
+        except Exception:
+            captcha_present = "unknown"
+        try:
+            final_url = getattr(page, "url", None)
+        except Exception:
+            final_url = None
+        try:
+            navigation_status = getattr(response, "status", None)
+        except Exception:
+            navigation_status = None
+        try:
+            diagnostics.update(_search_page_diagnostic(
+                requested_path="/search/vacancy",
+                final_url=final_url,
+                navigation_http_status=navigation_status,
+                raw_card_count=raw_card_count,
+                parsed_vacancy_count=len(out),
+                captcha_marker_present=captcha_present,
+            ))
+        except Exception:
+            # Telemetry must never turn an otherwise valid search into a failure.
+            pass
     return out
 
 

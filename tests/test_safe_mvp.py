@@ -157,6 +157,54 @@ class SafeTests(unittest.TestCase):
             self.assertEqual(run_web.main(), 0)
         resume.assert_called_once()
 
+    def test_empty_search_diagnostic_precedes_finish_and_run_config_is_safe(self):
+        browser = MagicMock(); browser.__enter__.return_value = (None, MagicMock())
+        rows = []
+        with patch.multiple(
+                config, SEARCH_TEXT='Project Manager', SEARCH_QUERY='Project Manager', AREA='',
+                PAGES_PER_RUN=3, SCORE_THRESHOLD=75, TARGET_APPLICATIONS_PER_RUN=12,
+                WORK_FORMAT='remote_only', WORK_FORMAT_CODES=['REMOTE'], SALARY_MIN=200000,
+                EXPERIENCE='between3And6', EMPLOYMENT='full', SCHEDULE='',
+                SEARCH_PERIOD='7', ORDER_BY='publication_time',
+                HH_SEARCH_PARAMS={'experience':'between3And6','employment':'full',
+                                  'search_period':'7','order_by':'publication_time'}), \
+             patch('run_web.has_session', return_value=True), \
+             patch('run_web.browser_context', return_value=browser), \
+             patch('run_web._get_resume', return_value='Current resume facts'), \
+             patch('hh_web.search_page', return_value=[]), \
+             patch('run_web._log', side_effect=rows.append):
+            self.assertEqual(run_web.main(), 0)
+
+        events = [row.get('event') for row in rows]
+        self.assertLess(events.index('search_page_diagnostic'), events.index('run_finished'))
+        diagnostic = next(row for row in rows if row.get('event') == 'search_page_diagnostic')
+        self.assertEqual(diagnostic['page_num'], 0)
+        self.assertEqual(diagnostic['parsed_vacancy_count'], 0)
+        self.assertEqual(diagnostic['new_unique_vacancy_count'], 0)
+        self.assertEqual(diagnostic['outcome'], 'empty_unclassified')
+        final = next(row for row in rows if row.get('event') == 'run_finished')
+        self.assertEqual(final['stop_reason'], 'no_results_or_page_not_recognized')
+
+        snapshot = next(row for row in rows if row.get('event') == 'run_started')['search_config']
+        self.assertEqual(snapshot, {
+            'search_text':'Project Manager', 'search_query':'Project Manager',
+            'area':'', 'area_scope':'worldwide', 'pages_per_run':3,
+            'score_threshold':75, 'target_confirmed_applications':12,
+            'work_format':'remote_only', 'work_format_codes':['REMOTE'],
+            'salary_min':200000, 'experience':'between3And6', 'employment':'full',
+            'schedule':'', 'search_period':'7', 'order_by':'publication_time',
+        })
+        forbidden = {'api_key','token','cookie','session','credential','password',
+                     'resume_text','candidate_context','vacancy_description'}
+        def keys(value):
+            if isinstance(value, dict):
+                return {str(key).lower() for key in value} | set().union(
+                    *(keys(item) for item in value.values()))
+            if isinstance(value, list):
+                return set().union(*(keys(item) for item in value)) if value else set()
+            return set()
+        self.assertTrue(forbidden.isdisjoint(keys(diagnostic) | keys(snapshot)))
+
     def test_missing_context_matching(self):
         with patch.object(candidate_context, 'CONTEXT_DIR', self.root/'absent'):
             self.assertEqual(candidate_context.load_candidate_context(), ('', ''))

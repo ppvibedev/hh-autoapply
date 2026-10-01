@@ -181,6 +181,15 @@ Matching/privacy error без надёжного score также остаётс
 Контейнер ленты ограничен по высоте и имеет собственную прокрутку. Retention пяти
 завершённых runs и текущего активного run при этом не меняется.
 
+Каждая запрошенная страница HH search пишет компактное
+`search_page_diagnostic`: page index, безопасные URL paths, HTTP status,
+число raw containers, parsed вакансий и новых exact ID, а также известные
+login/captcha/error признаки. Подтверждённых empty-results и next-page
+селекторов пока нет, поэтому эти поля честно остаются `unknown`.
+Событие только наблюдает: numeric pagination, selectors, parsing и reason
+`no_results_or_page_not_recognized` не меняются. `run_started` дополнительно
+сохраняет несекретный immutable snapshot фактических search filters.
+
 Обе Stop-кнопки сразу переводят интерфейс в устойчивое состояние
 «остановка запрошена» до HTTP-ответа, приостанавливают polling и отменяют текущий
 state-fetch. Одновременно выполняется не более одного `/api/state`. Stop имеет
