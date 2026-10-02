@@ -197,6 +197,15 @@ HTML, values, href и другие DOM-атрибуты не читаются и
 `no_results_or_page_not_recognized` не меняются. `run_started` дополнительно
 сохраняет несекретный immutable snapshot фактических search filters.
 
+При `vacancy_description_not_found` дополнительно сохраняется
+`vacancy_detail_diagnostic`: безопасные HH paths без query, HTTP status, счётчики
+canonical selectors, известные login/captcha/error markers и ограниченный
+список только имён `data-qa`. Короткое diagnostic wait отмечает, появилось ли
+описание позже, но не меняет результа вакансии. Счётчик последовательных
+failure сбрасывается после успешной загрузки. Это только telemetry для различения
+redirect/login/challenge/error, missing/delayed selector и неизвестной вёрстки; эти
+причины ещё не доказаны.
+
 Обе Stop-кнопки сразу переводят интерфейс в устойчивое состояние
 «остановка запрошена» до HTTP-ответа, приостанавливают polling и отменяют текущий
 state-fetch. Одновременно выполняется не более одного `/api/state`. Stop имеет

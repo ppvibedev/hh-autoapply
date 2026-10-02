@@ -53,7 +53,7 @@ class DiagnosticsTests(unittest.TestCase):
     def test_matching_error_is_visible_without_generic_unfinished_message(self):
         from unittest.mock import MagicMock
         browser=MagicMock();browser.__enter__.return_value=(None,MagicMock())
-        with patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='Synthetic'),patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC)]),patch('hh_web.load_full',side_effect=lambda page,vac:vac),patch('decide.hard_filters',return_value=None),patch('decide.score',side_effect=ValueError('matching_invalid_json')),patch('hh_web.apply') as apply:
+        with patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='Synthetic'),patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC)]),patch('hh_web.load_full',side_effect=lambda page,vac,**_kwargs:vac),patch('decide.hard_filters',return_value=None),patch('decide.score',side_effect=ValueError('matching_invalid_json')),patch('hh_web.apply') as apply:
             run_web.main()
             apply.assert_not_called()
         rows=[json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()]

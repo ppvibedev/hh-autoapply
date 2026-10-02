@@ -361,7 +361,7 @@ class LiveTests(unittest.TestCase):
         Path(config.DECISIONS_LOG).write_text(json.dumps(previous)+'\n'+json.dumps(confirmed)+'\n')
         vacs=[dict(VAC,id='111'),dict(VAC,id='222'),dict(VAC,id='333'),dict(VAC,id='444')]
         browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
-        with patch.object(config,'DRY_RUN',False), patch('run_web.browser_context',return_value=browser), patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), patch('run_web._get_resume',return_value=FACT), patch('hh_web.search_page',return_value=vacs), patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), patch('hh_web.apply',return_value={'application_status':'applied_confirmed','reason':'fixture'}) as apply:
+        with patch.object(config,'DRY_RUN',False), patch('run_web.browser_context',return_value=browser), patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), patch('run_web._get_resume',return_value=FACT), patch('hh_web.search_page',return_value=vacs), patch('hh_web.load_full',side_effect=lambda page,vac,**_kwargs:vac), patch('decide.hard_filters',return_value=None), patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), patch('hh_web.apply',return_value={'application_status':'applied_confirmed','reason':'fixture'}) as apply:
             self.assertEqual(run_web.main(),0)
             apply.assert_called_once()
             self.assertEqual(apply.call_args.args[1]['id'],'333')
@@ -384,7 +384,7 @@ class LiveTests(unittest.TestCase):
              patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), \
              patch('run_web._get_resume',return_value=FACT), \
              patch('hh_web.search_page',side_effect=[[unknown,confirmed],[unknown,later]]), \
-             patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), \
+             patch('hh_web.load_full',side_effect=lambda page,vac,**_kwargs:vac), patch('decide.hard_filters',return_value=None), \
              patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), \
              patch('hh_web.apply',side_effect=outcomes) as apply:
             self.assertEqual(run_web.main(),0)
@@ -417,7 +417,7 @@ class LiveTests(unittest.TestCase):
         with patch.object(config,'DRY_RUN',False), patch('run_web.browser_context',return_value=browser), \
              patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), \
              patch('run_web._get_resume',return_value=FACT), patch('hh_web.search_page',return_value=vacs), \
-             patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), \
+             patch('hh_web.load_full',side_effect=lambda page,vac,**_kwargs:vac), patch('decide.hard_filters',return_value=None), \
              patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), \
              patch('hh_web.apply',side_effect=outcomes) as apply:
             self.assertEqual(run_web.main(),0)
@@ -440,7 +440,7 @@ class LiveTests(unittest.TestCase):
         with patch.object(config,'DRY_RUN',False), patch('run_web.browser_context',return_value=browser), \
              patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), \
              patch('run_web._get_resume',return_value=FACT), patch('hh_web.search_page',return_value=[old,new]), \
-             patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), \
+             patch('hh_web.load_full',side_effect=lambda page,vac,**_kwargs:vac), patch('decide.hard_filters',return_value=None), \
              patch('decide.score',return_value=test_safe_mvp.RESULT), patch('decide.cover_letter',return_value='Prepared letter'), \
              patch('hh_web.apply',return_value={'application_status':'applied_confirmed','reason':'fixture'}) as apply:
             self.assertEqual(run_web.main(),0)

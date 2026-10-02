@@ -339,6 +339,7 @@ def main():
     halt = False
     stage = "run_setup"
     current_vacancy_id = None
+    consecutive_description_not_found = 0
     def mark_stage(value):
         nonlocal stage
         global _active_stage
@@ -491,7 +492,25 @@ def main():
                             entry.update(decision="rejected_hard_filter", reason=reason)
                         else:
                             mark_stage("vacancy_open")
-                            full = hh_web.load_full(page, vac)
+                            detail_diagnostic = {}
+                            try:
+                                full = hh_web.load_full(
+                                    page, vac, diagnostics=detail_diagnostic,
+                                    stopped=_observe_stop)
+                            except Exception as error:
+                                if _error_code(error) == "vacancy_description_not_found":
+                                    consecutive_description_not_found += 1
+                                    detail_diagnostic.update(
+                                        event="vacancy_detail_diagnostic",
+                                        run_id=run_id,
+                                        vacancy_id=vid,
+                                        consecutive_description_not_found=(
+                                            consecutive_description_not_found),
+                                    )
+                                    _log(detail_diagnostic)
+                                raise
+                            else:
+                                consecutive_description_not_found = 0
                             if _observe_stop():
                                 break
                             mark_stage("matching")

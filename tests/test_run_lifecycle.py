@@ -250,7 +250,7 @@ class RunLifecycleTests(unittest.TestCase):
              patch("run_web.browser_context", return_value=browser), \
              patch("run_web._get_resume", return_value="Current resume facts"), \
              patch("hh_web.search_page", return_value=vacancies), \
-             patch("hh_web.load_full", side_effect=lambda _page, vacancy: vacancy) as load_full, \
+             patch("hh_web.load_full", side_effect=lambda _page, vacancy, **_kwargs: vacancy) as load_full, \
              patch("decide.hard_filters", return_value=None), \
              patch("decide.score", side_effect=LLMStopped()), \
              patch("run_web._log", side_effect=rows.append):

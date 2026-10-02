@@ -956,7 +956,7 @@ class RunTerminalTests(unittest.TestCase):
             self.assertEqual(llm.generate('facts',task='matching'),'OK')
             return test_safe_mvp.RESULT
 
-        with patch.object(llm,'_router',router),patch('llm.reset_runtime'),patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='facts'),patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC)]),patch('hh_web.load_full',side_effect=lambda p,v:v),patch('decide.hard_filters',return_value=None),patch('decide.score',side_effect=score),patch('decide.cover_letter',return_value='Prepared letter'),patch('run_web._log',side_effect=rows.append),patch('llm.requests.post',side_effect=[response(503),response()]):
+        with patch.object(llm,'_router',router),patch('llm.reset_runtime'),patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='facts'),patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC)]),patch('hh_web.load_full',side_effect=lambda p,v,**_kwargs:v),patch('decide.hard_filters',return_value=None),patch('decide.score',side_effect=score),patch('decide.cover_letter',return_value='Prepared letter'),patch('run_web._log',side_effect=rows.append),patch('llm.requests.post',side_effect=[response(503),response()]):
             self.assertEqual(run_web.main(),0)
         entry=next(row for row in rows if row.get('vacancy_id'))
         event=entry['llm_routing'][0]
@@ -981,7 +981,7 @@ class RunTerminalTests(unittest.TestCase):
                 browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
                 vacancies=[dict(test_safe_mvp.VAC,id=str(i)) for i in (123,456,789)]
                 rows=[]
-                with patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='facts'),patch('hh_web.search_page',return_value=vacancies),patch('hh_web.load_full',side_effect=lambda p,v:v) as full,patch('decide.hard_filters',return_value=None),patch('decide.score',side_effect=LLMUnavailable() if stage=='matching' else None,return_value=test_safe_mvp.RESULT),patch('decide.cover_letter',side_effect=LLMUnavailable()),patch('run_web._log',side_effect=rows.append),patch('hh_web.apply') as apply:
+                with patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='facts'),patch('hh_web.search_page',return_value=vacancies),patch('hh_web.load_full',side_effect=lambda p,v,**_kwargs:v) as full,patch('decide.hard_filters',return_value=None),patch('decide.score',side_effect=LLMUnavailable() if stage=='matching' else None,return_value=test_safe_mvp.RESULT),patch('decide.cover_letter',side_effect=LLMUnavailable()),patch('run_web._log',side_effect=rows.append),patch('hh_web.apply') as apply:
                     run_web.main()
                 self.assertEqual(full.call_count,1); apply.assert_not_called()
                 self.assertEqual(rows[-1]['status'],'STOPPED')
@@ -1002,7 +1002,7 @@ class RunTerminalTests(unittest.TestCase):
                 page,form,letter,submit,route,journal,order,fill,model = test_live.LiveTests.fixture(self, questions=[dict(test_live.Q, required=required)])
                 browser=MagicMock(); browser.__enter__.return_value=(None,page)
                 rows=[]
-                with patch('application.answer_question',side_effect=real_answer),patch('llm.generate',side_effect=LLMUnavailable()),patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value=test_live.FACT),patch('hh_web.search_page',return_value=[dict(test_live.VAC),dict(test_live.VAC,id='999')]),patch('hh_web.load_full',side_effect=lambda p,v:v) as full,patch('decide.hard_filters',return_value=None),patch('decide.score',return_value=test_safe_mvp.RESULT),patch('decide.cover_letter',return_value='Prepared letter'),patch('run_web._log',side_effect=rows.append):
+                with patch('application.answer_question',side_effect=real_answer),patch('llm.generate',side_effect=LLMUnavailable()),patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value=test_live.FACT),patch('hh_web.search_page',return_value=[dict(test_live.VAC),dict(test_live.VAC,id='999')]),patch('hh_web.load_full',side_effect=lambda p,v,**_kwargs:v) as full,patch('decide.hard_filters',return_value=None),patch('decide.score',return_value=test_safe_mvp.RESULT),patch('decide.cover_letter',return_value='Prepared letter'),patch('run_web._log',side_effect=rows.append):
                     run_web.main()
                 submit.click.assert_not_called(); fill.assert_not_called()
                 self.assertEqual(full.call_count,1)
@@ -1012,7 +1012,7 @@ class RunTerminalTests(unittest.TestCase):
     def test_actual_router_daily_terminal_stops_vacancy_loop(self):
         browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
         rows=[]
-        with patch.multiple(config,LLM_PROVIDER='gemini',LLM_MODEL='model-x',LLM_API_KEY='SECRET_A'),patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='facts'),patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC,id=str(i)) for i in range(100,131)]),patch('hh_web.load_full',side_effect=lambda p,v:v) as full,patch('decide.hard_filters',return_value=None),patch('run_web._log',side_effect=rows.append),patch('llm.requests.post',return_value=response(429,DAILY)) as post:
+        with patch.multiple(config,LLM_PROVIDER='gemini',LLM_MODEL='model-x',LLM_API_KEY='SECRET_A'),patch('run_web.browser_context',return_value=browser),patch('run_web.has_session',return_value=True),patch('run_web.load_candidate_context',return_value=('','')),patch('run_web._get_resume',return_value='facts'),patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC,id=str(i)) for i in range(100,131)]),patch('hh_web.load_full',side_effect=lambda p,v,**_kwargs:v) as full,patch('decide.hard_filters',return_value=None),patch('run_web._log',side_effect=rows.append),patch('llm.requests.post',return_value=response(429,DAILY)) as post:
             run_web.main()
         self.assertEqual(post.call_count,1); self.assertEqual(full.call_count,1)
         self.assertEqual(rows[-1]['stop_reason'],'llm_infrastructure_unavailable')

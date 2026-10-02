@@ -69,6 +69,19 @@ def _safe_path(url: object) -> str:
     return path if path.startswith("/") else "[unknown]"
 
 
+def _safe_hh_path(url: object) -> str:
+    """Keep only an HH path; never retain an unexpected external URL."""
+    if not isinstance(url, str):
+        return "[unknown]"
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc:
+        if (parsed.scheme != "https" or parsed.hostname not in ("hh.ru", "www.hh.ru")
+                or parsed.username or parsed.password):
+            return "[external]"
+    path = parsed.path
+    return path if path.startswith("/") else "[unknown]"
+
+
 _SAFE_DATA_QA = re.compile(r"[a-z][a-z0-9_-]{0,79}")
 
 
@@ -92,6 +105,135 @@ def _empty_page_data_qa_snapshot(page) -> list[dict]:
             counts[identifier] = counts.get(identifier, 0) + 1
     return [{"data_qa": identifier, "count": counts[identifier]}
             for identifier in sorted(counts)]
+
+
+_DETAIL_DATA_QA_LIMIT = 75
+_DETAIL_DATA_QA_SCAN_LIMIT = 500
+_DETAIL_PROBE_DELAYS_MS = (100, 200, 300)
+
+
+def _safe_count(page, selector: str) -> int | None:
+    try:
+        return page.locator(selector).count()
+    except Exception:
+        return None
+
+
+def _limited_data_qa_snapshot(page) -> tuple[list[dict], bool]:
+    """Bounded structural data-qa names only; no text, values or HTML."""
+    elements = page.locator("[data-qa]")
+    total = elements.count()
+    counts: dict[str, int] = {}
+    distinct_overflow = False
+    for index in range(min(total, _DETAIL_DATA_QA_SCAN_LIMIT)):
+        identifier = _safe_data_qa_identifier(
+            elements.nth(index).get_attribute("data-qa"))
+        if identifier is None:
+            continue
+        if identifier in counts:
+            counts[identifier] += 1
+        elif len(counts) < _DETAIL_DATA_QA_LIMIT:
+            counts[identifier] = 1
+        else:
+            distinct_overflow = True
+    return ([{"data_qa": identifier, "count": counts[identifier]}
+             for identifier in sorted(counts)],
+            distinct_overflow or total > _DETAIL_DATA_QA_SCAN_LIMIT)
+
+
+def _vacancy_detail_diagnostic(page, vac: dict, response, *,
+                               initial_description_count: int,
+                               initial_check_elapsed_ms: int,
+                               stopped=None) -> dict:
+    """Collect structural evidence after the canonical description selector misses."""
+    requested_path = _safe_hh_path(vac.get("url"))
+    try:
+        final_url = page.url
+    except Exception:
+        final_url = None
+    final_path = _safe_hh_path(final_url)
+    expected_path = f'/vacancy/{vac.get("id", "")}'
+    try:
+        raw_status = getattr(response, "status", None)
+    except Exception:
+        raw_status = None
+    navigation_status = (raw_status if isinstance(raw_status, int)
+                         and not isinstance(raw_status, bool) else None)
+    title_count = _safe_count(page, SEL["vac_title"])
+    captcha_count = _safe_count(page, '[data-qa*="captcha"]')
+    response_control_count = _safe_count(page, SEL["respond_btn"])
+    modal_count = _safe_count(page, '[role="dialog"], [data-qa="modal"]')
+    try:
+        snapshot, snapshot_truncated = _limited_data_qa_snapshot(page)
+        snapshot_status = "collected"
+    except Exception:
+        snapshot, snapshot_truncated, snapshot_status = [], False, "unavailable"
+
+    appeared = False
+    appeared_after_ms = None
+    waited_ms = 0
+    probe_checks = 0
+    stopped_during_wait = False
+    for delay_ms in _DETAIL_PROBE_DELAYS_MS:
+        if stopped is not None and stopped():
+            stopped_during_wait = True
+            break
+        try:
+            page.wait_for_timeout(delay_ms)
+        except Exception:
+            break
+        waited_ms += delay_ms
+        probe_checks += 1
+        if _safe_count(page, SEL["vac_desc"]):
+            appeared = True
+            appeared_after_ms = waited_ms
+            break
+
+    normalized_requested_path = requested_path.rstrip("/")
+    normalized_final_path = final_path.rstrip("/")
+    login = normalized_final_path == "/account/login"
+    captcha = (True if normalized_final_path == "/captcha" else
+               "unknown" if captcha_count is None else captcha_count > 0)
+    hh_error = ("unknown" if navigation_status is None
+                else navigation_status >= 400)
+    not_found = ("unknown" if navigation_status is None
+                 else navigation_status == 404)
+    vacancy_content = ("unknown" if title_count is None else title_count > 0)
+    return {
+        "diagnostic_schema_version": 1,
+        "requested_path": requested_path,
+        "final_path": final_path,
+        "same_vacancy_path": (normalized_requested_path == expected_path
+                              and normalized_final_path == expected_path),
+        "redirect_observed": (requested_path not in ("[unknown]", "[external]")
+                              and final_path not in ("[unknown]", "[external]")
+                              and normalized_final_path != normalized_requested_path),
+        "navigation_status": navigation_status,
+        "title_selector_count": title_count,
+        "description_selector_count": initial_description_count,
+        "page_state_markers": {
+            "login_marker_present": login,
+            "captcha_marker_present": captcha,
+            "captcha_marker_count": captcha_count,
+            "hh_error_marker_present": hh_error,
+            "not_found_marker_present": not_found,
+            "vacancy_content_marker_present": vacancy_content,
+            "response_control_count": response_control_count,
+            "known_modal_count": modal_count,
+            "interstitial_marker": "unknown",
+        },
+        "limited_safe_data_qa_snapshot": snapshot,
+        "data_qa_snapshot_distinct_count": len(snapshot),
+        "data_qa_snapshot_truncated": snapshot_truncated,
+        "data_qa_snapshot_status": snapshot_status,
+        "initial_description_check_elapsed_ms": max(0, initial_check_elapsed_ms),
+        "post_navigation_pause_performed": True,
+        "description_appeared_during_diagnostic_wait": appeared,
+        "description_appeared_after_ms": appeared_after_ms,
+        "diagnostic_wait_elapsed_ms": waited_ms,
+        "diagnostic_probe_checks": probe_checks,
+        "diagnostic_wait_stopped": stopped_during_wait,
+    }
 
 
 def _search_page_diagnostic(*, requested_path: str, final_url: object,
@@ -227,12 +369,32 @@ def search_page(page, *, text: str, area: str, salary_min: int,
     return out
 
 
-def load_full(page, vac: dict) -> dict:
+def load_full(page, vac: dict, *, diagnostics: dict | None = None, stopped=None) -> dict:
     """Открывает страницу вакансии, дозаполняет описание/зарплату."""
-    page.goto(vac["url"], wait_until="domcontentloaded")
+    response = page.goto(vac["url"], wait_until="domcontentloaded")
+    navigation_complete = time.monotonic()
     _pause()
     desc = page.locator(SEL["vac_desc"]).first
-    if not desc.count():
+    description_count = desc.count()
+    if not description_count:
+        if diagnostics is not None:
+            try:
+                diagnostics.update(_vacancy_detail_diagnostic(
+                    page, vac, response,
+                    initial_description_count=description_count,
+                    initial_check_elapsed_ms=round(
+                        (time.monotonic() - navigation_complete) * 1000),
+                    stopped=stopped,
+                ))
+            except Exception:
+                # Passive telemetry must never replace the established outcome.
+                diagnostics.update({
+                    "diagnostic_schema_version": 1,
+                    "requested_path": _safe_hh_path(vac.get("url")),
+                    "final_path": "[unknown]",
+                    "description_selector_count": description_count,
+                    "diagnostic_collection_status": "unavailable",
+                })
         raise ValueError("vacancy_description_not_found")
     vac["description"] = (desc.inner_text() or "").strip()
     if not vac["description"]:

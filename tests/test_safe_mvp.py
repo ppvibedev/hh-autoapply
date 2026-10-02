@@ -137,7 +137,7 @@ class SafeTests(unittest.TestCase):
              patch('run_web.browser_context', return_value=browser), \
              patch('run_web._get_resume', side_effect=refreshed_resume), \
              patch('hh_web.search_page', return_value=[dict(VAC)]), \
-             patch('hh_web.load_full', side_effect=lambda page, vac: vac), \
+             patch('hh_web.load_full', side_effect=lambda page, vac, **_kwargs: vac), \
              patch('decide.hard_filters', return_value=None), \
              patch('decide.score', return_value=RESULT) as score, \
              patch('decide.cover_letter', return_value='Letter'):
@@ -151,7 +151,7 @@ class SafeTests(unittest.TestCase):
              patch('run_web.browser_context', return_value=browser), \
              patch('run_web._get_resume', return_value='Current resume facts') as resume, \
              patch('hh_web.search_page', return_value=[dict(VAC), second]), \
-             patch('hh_web.load_full', side_effect=lambda page, vac: vac), \
+             patch('hh_web.load_full', side_effect=lambda page, vac, **_kwargs: vac), \
              patch('decide.hard_filters', return_value=None), \
              patch('decide.score', return_value=RESULT), \
              patch('decide.cover_letter', return_value='Letter'):
@@ -417,7 +417,7 @@ class SafeTests(unittest.TestCase):
 
     def test_two_runs_preserve_history_without_submission(self):
         browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
-        with patch('run_web.browser_context',return_value=browser), patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), patch('run_web._get_resume',return_value='Опыт'), patch('hh_web.search_page',return_value=[dict(VAC)]), patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), patch('decide.score',return_value=RESULT), patch('decide.cover_letter',return_value='Письмо'), patch('hh_web.apply') as apply:
+        with patch('run_web.browser_context',return_value=browser), patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), patch('run_web._get_resume',return_value='Опыт'), patch('hh_web.search_page',return_value=[dict(VAC)]), patch('hh_web.load_full',side_effect=lambda page,vac,**_kwargs:vac), patch('decide.hard_filters',return_value=None), patch('decide.score',return_value=RESULT), patch('decide.cover_letter',return_value='Письмо'), patch('hh_web.apply') as apply:
             self.assertEqual(run_web.main(),0); self.assertEqual(run_web.main(),0)
             apply.assert_not_called()
         rows=[json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()]
@@ -433,7 +433,7 @@ class SafeTests(unittest.TestCase):
                         role_alignment_reason='Основная функция вакансии — продажи.',
                         role_evidence=['В обязанностях указан план продаж.'])
         browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
-        with patch('run_web.browser_context',return_value=browser), patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), patch('run_web._get_resume',return_value='Опыт'), patch('hh_web.search_page',return_value=[dict(VAC)]), patch('hh_web.load_full',side_effect=lambda page,vac:vac), patch('decide.hard_filters',return_value=None), patch('decide.score',return_value=mismatch), patch('decide.cover_letter') as letter, patch('hh_web.apply') as apply:
+        with patch('run_web.browser_context',return_value=browser), patch('run_web.has_session',return_value=True), patch('run_web.load_candidate_context',return_value=('','')), patch('run_web._get_resume',return_value='Опыт'), patch('hh_web.search_page',return_value=[dict(VAC)]), patch('hh_web.load_full',side_effect=lambda page,vac,**_kwargs:vac), patch('decide.hard_filters',return_value=None), patch('decide.score',return_value=mismatch), patch('decide.cover_letter') as letter, patch('hh_web.apply') as apply:
             self.assertEqual(run_web.main(), 0)
         letter.assert_not_called(); apply.assert_not_called()
         row = next(json.loads(line) for line in Path(config.DECISIONS_LOG).read_text().splitlines()
@@ -467,7 +467,7 @@ class SafeTests(unittest.TestCase):
                      patch('run_web.load_candidate_context', return_value=('', '')), \
                      patch('run_web._get_resume', return_value='Опыт'), \
                      patch('hh_web.search_page', return_value=[vacancy]), \
-                     patch('hh_web.load_full', side_effect=lambda page, item: item), \
+                     patch('hh_web.load_full', side_effect=lambda page, item, **_kwargs: item), \
                      patch('decide.hard_filters', return_value=None), \
                      patch('decide.score', return_value=result), \
                      patch('decide.cover_letter', return_value='Письмо') as letter:
@@ -497,7 +497,7 @@ class SafeTests(unittest.TestCase):
              patch('run_web.load_candidate_context', return_value=('', '')), \
              patch('run_web._get_resume', return_value='Опыт'), \
              patch('hh_web.search_page', return_value=vacancies), \
-             patch('hh_web.load_full', side_effect=lambda page, item: item), \
+             patch('hh_web.load_full', side_effect=lambda page, item, **_kwargs: item), \
              patch('decide.hard_filters', return_value=None), \
              patch('decide.score', side_effect=score), \
              patch('decide.cover_letter', return_value='Письмо'):
@@ -549,7 +549,7 @@ class SafeTests(unittest.TestCase):
                      patch('run_web._get_resume', return_value='Опыт'), \
                      patch('run_web.selected_resume_title', return_value=resume_title), \
                      patch('hh_web.search_page', return_value=[vacancy]), \
-                     patch('hh_web.load_full', side_effect=lambda page, item: item), \
+                     patch('hh_web.load_full', side_effect=lambda page, item, **_kwargs: item), \
                      patch('decide.hard_filters', return_value=None), \
                      patch('decide.score', return_value=result), \
                      patch('decide.cover_letter', return_value='Письмо') as letter, \
@@ -579,7 +579,7 @@ class SafeTests(unittest.TestCase):
              patch('run_web._get_resume', return_value='CCO подтверждённый опыт'), \
              patch('run_web.selected_resume_title', return_value='Commercial Director / CCO'), \
              patch('hh_web.search_page', return_value=[vacancy]), \
-             patch('hh_web.load_full', side_effect=lambda page, item: item), \
+             patch('hh_web.load_full', side_effect=lambda page, item, **_kwargs: item), \
              patch('decide.hard_filters', return_value=None), \
              patch('decide.score', side_effect=matching), \
              patch('decide.cover_letter', return_value='Письмо') as letter:
