@@ -665,7 +665,9 @@ Privacy boundary учитывает все загруженные credentials, �
 `privacy_match_shape`: enum Basic/Bearer, тип whitespace-разделителя, bucket длины,
 три признака состава символов и, только для Basic, boolean Base64/decoded-colon.
 Matched value, контекст, точная длина, decoded bytes и fragments не сохраняются.
-Regex, порядок privacy rules и fail-closed поведение не изменены.
+Basic блокируется только при strict canonical Base64, декодирующемся в credential
+с `:`; обычный текст `Basic knowledge` не считается secret. Bearer сохраняет
+прежнюю fail-closed семантику без Base64-требований; порядок остальных privacy rules не менялся.
 
 Проверки: `test_llm_connections`, `test_llm_ui` и связанные targeted task tests
 используют искусственные credentials, временное storage, подмену HTTP/HH и локальный

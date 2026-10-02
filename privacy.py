@@ -6,7 +6,10 @@ import re
 
 _MATCH_SHAPE_SCHEMES = frozenset({'basic','bearer'})
 _MATCH_SHAPE_SEPARATORS = frozenset({'space','tab','newline','mixed_whitespace','other_whitespace'})
-_MATCH_SHAPE_LENGTHS = frozenset({'8_11','12_23','24_47','48_plus'})
+_MATCH_SHAPE_LENGTHS = frozenset({'4_7','8_11','12_23','24_47','48_plus'})
+_BEARER_AUTH = re.compile(r"\b(Bearer)(\s+)([A-Za-z0-9+/_.=-]{8,})", re.I)
+_BASIC_AUTH = re.compile(
+    r"\b(Basic)(\s+)([A-Za-z0-9+/]+={0,2})(?=$|[\s.,;:!?()\[\]{}'\"<>])", re.I)
 
 
 def _safe_match_shape(value):
@@ -57,17 +60,43 @@ SECRET_RULES = (
     ("json_credential_field",
      r'"(?:api_key|access_token|refresh_token|password|credentials|authorization)"\s*:\s*"[^" ]+'),
     ("json_cookie_or_origin_array", r'"(?:cookies|origins)"\s*:\s*\['),
-    ("auth_scheme", r"\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=-]{8,}"),
+    ("auth_scheme", None),
     ("credential_url", r"https?://[^\s/:]+:[^\s/@]+@"),
     ("credential_query_parameter", r"[?&](?:api[_-]?key|token|access_token|signature|password|secret)="),
 )
 
 
+def _basic_credential_shape(suffix):
+    """Return strict Base64/colon facts without exposing decoded credential bytes."""
+    if (not isinstance(suffix,str) or len(suffix) % 4
+            or re.fullmatch(r'[A-Za-z0-9+/]+={0,2}',suffix) is None):
+        return False,False
+    try:
+        decoded = base64.b64decode(suffix,validate=True)
+    except (ValueError,binascii.Error):
+        return False,False
+    # Reject permissive/non-canonical decodes; real Basic clients emit canonical Base64.
+    if base64.b64encode(decoded).decode('ascii') != suffix:
+        return False,False
+    return True,b':' in decoded
+
+
+def _auth_scheme_match(text):
+    """Find the earliest protected auth scheme; Bearer keeps its prior semantics."""
+    bearer = _BEARER_AUTH.search(text)
+    basic = next((match for match in _BASIC_AUTH.finditer(text)
+                  if _basic_credential_shape(match.group(3)) == (True,True)),None)
+    if bearer is None:
+        return basic
+    if basic is None:
+        return bearer
+    return bearer if bearer.start() <= basic.start() else basic
+
+
 def _auth_scheme_match_shape(match):
-    parsed = re.fullmatch(r'(Bearer|Basic)(\s+)([A-Za-z0-9+/_.=-]{8,})',match.group(),re.I)
-    if parsed is None:
+    if match is None:
         return None
-    scheme, separator, suffix = parsed.groups()
+    scheme, separator, suffix = match.groups()
     scheme = scheme.lower()
     chars = set(separator)
     if chars == {' '}:
@@ -81,17 +110,12 @@ def _auth_scheme_match_shape(match):
     else:
         separator_shape = 'other_whitespace'
     length = len(suffix)
-    length_bucket = ('8_11' if length <= 11 else '12_23' if length <= 23
+    length_bucket = ('4_7' if length <= 7 else '8_11' if length <= 11
+                     else '12_23' if length <= 23
                      else '24_47' if length <= 47 else '48_plus')
     base64_valid = decoded_has_colon = None
     if scheme == 'basic':
-        try:
-            decoded = base64.b64decode(suffix,validate=True)
-            base64_valid = True
-            decoded_has_colon = b':' in decoded
-        except (ValueError,binascii.Error):
-            base64_valid = False
-            decoded_has_colon = False
+        base64_valid,decoded_has_colon = _basic_credential_shape(suffix)
     return _safe_match_shape({
         'scheme':scheme,'separator':separator_shape,'suffix_length_bucket':length_bucket,
         'letters_only':re.fullmatch(r'[A-Za-z]+',suffix) is not None,
@@ -109,7 +133,8 @@ def sanitize_candidate_text(text: str, forbidden_values=()) -> str:
 
     # Не пытаться интерпретировать файлы с credentials как профессиональный текст.
     for rule_id, pattern in SECRET_RULES:
-        match = re.search(pattern, text, re.I)
+        match = (_auth_scheme_match(text) if rule_id == 'auth_scheme'
+                 else re.search(pattern,text,re.I))
         if match:
             shape = _auth_scheme_match_shape(match) if rule_id == 'auth_scheme' else None
             raise PrivacyError(rule_id=rule_id,match_shape=shape)

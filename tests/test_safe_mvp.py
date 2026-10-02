@@ -289,20 +289,13 @@ class SafeTests(unittest.TestCase):
             self.assertEqual(caught.exception.privacy_rule_id,'auth_scheme')
             return caught.exception.privacy_match_shape
 
-        natural=shape('Basic knowledge')
-        self.assertEqual(natural,{
-            'scheme':'basic','separator':'space','suffix_length_bucket':'8_11',
-            'letters_only':True,'has_digit':False,'has_token_punctuation':False,
-            'basic_base64_valid':False,'basic_decoded_has_colon':False,
-        })
+        self.assertEqual(sanitize_candidate_text('Basic knowledge'),'Basic knowledge')
         credential=base64.b64encode(b'synthetic-user:synthetic-pass').decode()
         credential_shape=shape('Basic '+credential)
         self.assertTrue(credential_shape['basic_base64_valid'])
         self.assertTrue(credential_shape['basic_decoded_has_colon'])
         no_colon=base64.b64encode(b'synthetic-payload').decode()
-        no_colon_shape=shape('Basic '+no_colon)
-        self.assertTrue(no_colon_shape['basic_base64_valid'])
-        self.assertFalse(no_colon_shape['basic_decoded_has_colon'])
+        self.assertEqual(sanitize_candidate_text('Basic '+no_colon),'Basic '+no_colon)
 
     def test_auth_scheme_match_shape_separator_length_and_characters(self):
         def shape(text):
