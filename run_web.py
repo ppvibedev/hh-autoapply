@@ -32,6 +32,51 @@ _worker_stop_observed_logged = False
 _active_stop_attempt_id = None
 _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 LIVE_HISTORY_REREAD_DELAY_SECONDS = 0.02
+CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS = 120
+CAPTCHA_POLL_INTERVAL_SECONDS = 1
+
+
+class HHCaptchaTimeout(RuntimeError):
+    """Manual CAPTCHA was not resolved within the product timeout."""
+
+    def __init__(self):
+        super().__init__("hh_captcha_timeout")
+
+
+def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
+                             stopped=None, telemetry=None, on_stage=None, clock=None, sleep=None,
+                             timeout_seconds=CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS,
+                             poll_seconds=CAPTCHA_POLL_INTERVAL_SECONDS):
+    """Wait for a user to clear a proven HH CAPTCHA without doing other work."""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    stopped = stopped or _observe_stop
+
+    def emit(event):
+        if telemetry is None:
+            return
+        row = {"event": event, "run_id": run_id, "operation": operation,
+               "timeout_seconds": timeout_seconds}
+        if vacancy_id is not None:
+            row["vacancy_id"] = str(vacancy_id)
+        telemetry(row)
+
+    if on_stage is not None:
+        on_stage("captcha_wait")
+    emit("captcha_wait_started")
+    deadline = clock() + timeout_seconds
+    while True:
+        if stopped():
+            emit("captcha_wait_stopped")
+            raise LLMStopped()
+        if not hh_web.captcha_present(page):
+            break
+        remaining = deadline - clock()
+        if remaining <= 0:
+            emit("captcha_wait_timeout")
+            raise HHCaptchaTimeout()
+        sleep(min(poll_seconds, remaining))
+    emit("captcha_wait_resolved")
 
 
 class LiveHistoryCorrupt(ValueError):
@@ -418,49 +463,55 @@ def main():
             for page_num in range(config.PAGES_PER_RUN):
                 if _observe_stop() or halt:
                     break
-                mark_stage("search_start")
-                search_diagnostic = {"event": "search_page_diagnostic", "run_id": run_id,
-                                     "page_num": page_num}
-                try:
-                    vacs = hh_web.search_page(page, text=config.SEARCH_QUERY, area=config.AREA,
-                        salary_min=config.SALARY_MIN, work_format_codes=["REMOTE"], page_num=page_num,
-                        extra_params=config.HH_SEARCH_PARAMS, diagnostics=search_diagnostic)
-                except Exception:
+                while True:
+                    mark_stage("search_start")
+                    search_diagnostic = {"event": "search_page_diagnostic", "run_id": run_id,
+                                         "page_num": page_num}
+                    try:
+                        vacs = hh_web.search_page(page, text=config.SEARCH_QUERY, area=config.AREA,
+                            salary_min=config.SALARY_MIN, work_format_codes=["REMOTE"], page_num=page_num,
+                            extra_params=config.HH_SEARCH_PARAMS, diagnostics=search_diagnostic)
+                    except Exception:
+                        search_diagnostic.setdefault("requested_path", "/search/vacancy")
+                        search_diagnostic.setdefault("final_path", "[unknown]")
+                        search_diagnostic.setdefault("redirect_observed", False)
+                        search_diagnostic.setdefault("navigation_http_status", None)
+                        search_diagnostic.setdefault("raw_card_count", None)
+                        search_diagnostic.setdefault("parsed_vacancy_count", None)
+                        search_diagnostic.setdefault("new_unique_vacancy_count", None)
+                        search_diagnostic.setdefault("empty_results_marker", "unknown")
+                        search_diagnostic.setdefault("next_page_marker", "unknown")
+                        search_diagnostic.setdefault("login_marker_present", "unknown")
+                        search_diagnostic.setdefault("captcha_marker_present", "unknown")
+                        search_diagnostic.setdefault("hh_error_marker_present", "unknown")
+                        search_diagnostic.setdefault("interstitial_marker", "unknown")
+                        search_diagnostic.setdefault("outcome", "search_page_exception")
+                        _log(search_diagnostic)
+                        raise
+                    new_ids = {str(vac.get("id", "")) for vac in vacs
+                               if str(vac.get("id", "")).isdigit()
+                               and str(vac.get("id", "")) not in seen_this_run}
                     search_diagnostic.setdefault("requested_path", "/search/vacancy")
                     search_diagnostic.setdefault("final_path", "[unknown]")
                     search_diagnostic.setdefault("redirect_observed", False)
                     search_diagnostic.setdefault("navigation_http_status", None)
                     search_diagnostic.setdefault("raw_card_count", None)
-                    search_diagnostic.setdefault("parsed_vacancy_count", None)
-                    search_diagnostic.setdefault("new_unique_vacancy_count", None)
+                    search_diagnostic.setdefault("parsed_vacancy_count", len(vacs))
+                    search_diagnostic["new_unique_vacancy_count"] = len(new_ids)
                     search_diagnostic.setdefault("empty_results_marker", "unknown")
                     search_diagnostic.setdefault("next_page_marker", "unknown")
                     search_diagnostic.setdefault("login_marker_present", "unknown")
                     search_diagnostic.setdefault("captcha_marker_present", "unknown")
                     search_diagnostic.setdefault("hh_error_marker_present", "unknown")
                     search_diagnostic.setdefault("interstitial_marker", "unknown")
-                    search_diagnostic.setdefault("outcome", "search_page_exception")
+                    search_diagnostic.setdefault(
+                        "outcome", "vacancies_parsed" if vacs else "empty_unclassified")
                     _log(search_diagnostic)
-                    raise
-                new_ids = {str(vac.get("id", "")) for vac in vacs
-                           if str(vac.get("id", "")).isdigit()
-                           and str(vac.get("id", "")) not in seen_this_run}
-                search_diagnostic.setdefault("requested_path", "/search/vacancy")
-                search_diagnostic.setdefault("final_path", "[unknown]")
-                search_diagnostic.setdefault("redirect_observed", False)
-                search_diagnostic.setdefault("navigation_http_status", None)
-                search_diagnostic.setdefault("raw_card_count", None)
-                search_diagnostic.setdefault("parsed_vacancy_count", len(vacs))
-                search_diagnostic["new_unique_vacancy_count"] = len(new_ids)
-                search_diagnostic.setdefault("empty_results_marker", "unknown")
-                search_diagnostic.setdefault("next_page_marker", "unknown")
-                search_diagnostic.setdefault("login_marker_present", "unknown")
-                search_diagnostic.setdefault("captcha_marker_present", "unknown")
-                search_diagnostic.setdefault("hh_error_marker_present", "unknown")
-                search_diagnostic.setdefault("interstitial_marker", "unknown")
-                search_diagnostic.setdefault(
-                    "outcome", "vacancies_parsed" if vacs else "empty_unclassified")
-                _log(search_diagnostic)
+                    if search_diagnostic.get("outcome") != "captcha_detected":
+                        break
+                    _wait_for_manual_captcha(
+                        page, operation="search", run_id=run_id, stopped=_observe_stop,
+                        telemetry=_log, on_stage=mark_stage)
                 if not vacs:
                     stop_reason = "no_results_or_page_not_recognized"
                     break
@@ -491,15 +542,20 @@ def main():
                             counts["hard_rejected"] += 1
                             entry.update(decision="rejected_hard_filter", reason=reason)
                         else:
-                            mark_stage("vacancy_open")
-                            detail_diagnostic = {}
-                            try:
-                                full = hh_web.load_full(
-                                    page, vac, diagnostics=detail_diagnostic,
-                                    stopped=_observe_stop)
-                            except Exception as error:
-                                if _error_code(error) == "vacancy_description_not_found":
-                                    consecutive_description_not_found += 1
+                            while True:
+                                mark_stage("vacancy_open")
+                                detail_diagnostic = {}
+                                try:
+                                    full = hh_web.load_full(
+                                        page, vac, diagnostics=detail_diagnostic,
+                                        stopped=_observe_stop)
+                                except Exception as error:
+                                    if _error_code(error) != "vacancy_description_not_found":
+                                        raise
+                                    captcha = ((detail_diagnostic.get("page_state_markers") or {})
+                                               .get("captcha_marker_present") is True)
+                                    if not captcha:
+                                        consecutive_description_not_found += 1
                                     detail_diagnostic.update(
                                         event="vacancy_detail_diagnostic",
                                         run_id=run_id,
@@ -508,9 +564,18 @@ def main():
                                             consecutive_description_not_found),
                                     )
                                     _log(detail_diagnostic)
-                                raise
-                            else:
-                                consecutive_description_not_found = 0
+                                    if not captcha:
+                                        raise
+                                    _wait_for_manual_captcha(
+                                        page, operation="vacancy_detail", run_id=run_id,
+                                        vacancy_id=vid, stopped=_observe_stop,
+                                        telemetry=_log, on_stage=mark_stage)
+                                    # Retry the exact same known vacancy URL. This covers both
+                                    # HH auto-return and a CAPTCHA page that does not navigate back.
+                                    continue
+                                else:
+                                    consecutive_description_not_found = 0
+                                    break
                             if _observe_stop():
                                 break
                             mark_stage("matching")
@@ -576,6 +641,8 @@ def main():
                     except LLMStopped:
                         halt, run_status, stop_reason = True, "STOPPED", "user_stop"
                         break
+                    except HHCaptchaTimeout:
+                        raise
                     except LLMUnavailable as error:
                         halt, run_status, stop_reason = True, "STOPPED", "llm_infrastructure_unavailable"
                         entry.update(_exception_details(error, stage))
@@ -605,6 +672,8 @@ def main():
             run_status, stop_reason = "STOPPED", "user_stop"
     except LLMStopped:
         run_status, stop_reason = "STOPPED", "user_stop"
+    except HHCaptchaTimeout:
+        run_status, stop_reason = "STOPPED", "hh_captcha_timeout"
     except LLMUnavailable as error:
         run_status, stop_reason = "STOPPED", "llm_infrastructure_unavailable"
         _log(dict(event="run_error", run_id=run_id, reason_code=stop_reason,

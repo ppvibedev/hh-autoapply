@@ -146,7 +146,7 @@ class CurrentProductSemanticsTests(unittest.TestCase):
         self.assertEqual(final["status"], "COMPLETED")
         self.assertEqual(final["stop_reason"], "no_results_or_page_not_recognized")
 
-    def test_detail_captcha_is_vacancy_local_and_run_continues(self):
+    def test_description_failure_without_captcha_remains_vacancy_local(self):
         browser = MagicMock()
         browser.__enter__.return_value = (None, MagicMock())
         first = dict(test_safe_mvp.VAC, id="101")
@@ -155,7 +155,7 @@ class CurrentProductSemanticsTests(unittest.TestCase):
 
         def load(_page, vacancy, *, diagnostics, **_kwargs):
             if vacancy["id"] == "101":
-                diagnostics.update(page_state_markers={"captcha_marker_present": True})
+                diagnostics.update(page_state_markers={"captcha_marker_present": False})
                 raise ValueError("vacancy_description_not_found")
             return vacancy
 
@@ -174,7 +174,7 @@ class CurrentProductSemanticsTests(unittest.TestCase):
         self.assertEqual([(row["vacancy_id"], row["decision"]) for row in outcomes],
                          [("101", "needs_manual_review"), ("102", "rejected_score")])
         diagnostic = next(row for row in rows if row.get("event") == "vacancy_detail_diagnostic")
-        self.assertTrue(diagnostic["page_state_markers"]["captcha_marker_present"])
+        self.assertFalse(diagnostic["page_state_markers"]["captcha_marker_present"])
 
 
 if __name__ == "__main__":

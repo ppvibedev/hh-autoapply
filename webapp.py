@@ -181,6 +181,14 @@ def _run_log(rows, limit=100):
     return "\n".join(json.dumps(r, ensure_ascii=False) for r in reversed(events))
 
 
+def _captcha_waiting(rows):
+    """Derive the current manual-action state from the newest CAPTCHA lifecycle event."""
+    lifecycle = {"captcha_wait_started", "captcha_wait_resolved",
+                 "captcha_wait_timeout", "captcha_wait_stopped"}
+    latest = next((row for row in rows if row.get("event") in lifecycle), None)
+    return bool(latest and latest.get("event") == "captcha_wait_started")
+
+
 def _counts(rows: list[dict]) -> dict[str, int]:
     c = {"safe_ready": 0, "rejected_score": 0, "rejected_hard_filter": 0,
          "rejected_remote": 0, "needs_manual_review": 0, "applied_confirmed": 0,
@@ -410,6 +418,7 @@ def api_state():
     env = envfile.read_env()
     run_id, rows = _current_run_rows()
     vacancy_rows = _vacancy_rows(rows, run_id) if run_id else []
+    captcha_waiting = _captcha_waiting(rows)
     return jsonify({
         "running": _running() or _any_run_alive(),  # учитывает и осиротевшие процессы
         "login_running": _login_running(),
@@ -423,6 +432,10 @@ def api_state():
         "resumes": _read_resumes(),
         "resumes_refreshing": _resumes_running(),
         "run_id": run_id,
+        "captcha_waiting": captcha_waiting,
+        "captcha_message": ("HH просит CAPTCHA. Решите её в открытом окне браузера. "
+                            "Прогон приостановлен до 120 секунд."
+                            if captcha_waiting else None),
         "run_log": _run_log(rows),
         "counts": _counts(rows),
         # Vacancy cards are loaded separately and incrementally. Keeping this

@@ -53,6 +53,11 @@ Worker создаёт private Unix socket и `state/run.pid` v2 с PID/run ID/co
 не попадает в diagnostics. Same-dashboard Stop использует process handle; recovered Stop —
 authenticated socket. Correlation выполняется через `stop_attempt_id`.
 
+Доказанная HH CAPTCHA на search/detail navigation переводит worker в общий
+`captcha_wait`: stop-aware polling раз в секунду, timeout 120 секунд. После
+ручного решения worker повторяет ту же search page или exact vacancy URL;
+таймаут завершает run как `STOPPED: hh_captcha_timeout`.
+
 ## LLM Router и privacy boundary
 
 `llm.generate(task=...)` выбирает enabled connections, фиксирует порядок операции,

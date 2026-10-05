@@ -119,6 +119,18 @@ def _safe_count(page, selector: str) -> int | None:
         return None
 
 
+def captcha_present(page) -> bool:
+    """Strict current-page CAPTCHA signal used by diagnostics and run control."""
+    try:
+        path = _safe_hh_path(page.url).rstrip("/")
+    except Exception:
+        path = "[unknown]"
+    if path in ("/captcha", "/account/captcha"):
+        return True
+    count = _safe_count(page, '[data-qa*="captcha"]')
+    return count is not None and count > 0
+
+
 def _limited_data_qa_snapshot(page) -> tuple[list[dict], bool]:
     """Bounded structural data-qa names only; no text, values or HTML."""
     elements = page.locator("[data-qa]")
@@ -192,7 +204,7 @@ def _vacancy_detail_diagnostic(page, vac: dict, response, *,
     normalized_requested_path = requested_path.rstrip("/")
     normalized_final_path = final_path.rstrip("/")
     login = normalized_final_path == "/account/login"
-    captcha = (True if normalized_final_path == "/captcha" else
+    captcha = (True if normalized_final_path in ("/captcha", "/account/captcha") else
                "unknown" if captcha_count is None else captcha_count > 0)
     hh_error = ("unknown" if navigation_status is None
                 else navigation_status >= 400)
@@ -245,7 +257,7 @@ def _search_page_diagnostic(*, requested_path: str, final_url: object,
     status = (navigation_http_status if isinstance(navigation_http_status, int)
               and not isinstance(navigation_http_status, bool) else None)
     captcha = captcha_marker_present if isinstance(captcha_marker_present, bool) else "unknown"
-    if final_path.rstrip("/") == "/captcha":
+    if final_path.rstrip("/") in ("/captcha", "/account/captcha"):
         captcha = True
     login = final_path.rstrip("/") == "/account/login"
     hh_error = status is not None and status >= 400

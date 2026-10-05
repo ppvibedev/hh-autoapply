@@ -96,8 +96,8 @@ Description в stopwords/blacklist не участвует. Элементы с�
 
 **CURRENT.** После hard filters открывается exact vacancy URL, считываются полное
 описание и признаки формата работы. Отсутствие canonical description даёт локальный
-failure вакансии с privacy-safe structural diagnostics. Worker продолжает следующую
-вакансию, если не сработал общий Stop или terminal LLM failure.
+failure вакансии с privacy-safe structural diagnostics, если строгие CAPTCHA-сигналы
+отсутствуют. При доказанной CAPTCHA worker переходит в общий manual pause из раздела 15.
 
 ## 9. Matching
 
@@ -164,11 +164,17 @@ connections на операцию, выполняет bounded retries/failover �
 
 ## 15. CAPTCHA CURRENT behavior
 
-**CURRENT.** CAPTCHA не обходится. На search page она распознаётся в diagnostics, но если
-парсер возвращает 0 вакансий, run сейчас завершается `COMPLETED` с общим
-`no_results_or_page_not_recognized`. На detail page CAPTCHA обычно проявляется как
-`vacancy_description_not_found`: эта вакансия получает manual failure, после чего run
-может продолжить следующую. Автоматических pause/wait/resume нет.
+**CURRENT.** CAPTCHA не обходится автоматически. Строго подтверждённая CAPTCHA на search
+или detail navigation ставит текущую операцию на паузу и оставляет видимый Chromium
+открытым. Dashboard просит решить challenge вручную; worker проверяет CAPTCHA примерно раз
+в секунду не более 120 секунд и в это время не переходит к другим вакансиям, matching или
+application.
+
+После решения повторяется та же логическая search page либо открывается тот же exact vacancy
+URL, затем обычный pipeline продолжается. Успешно решённая CAPTCHA не является outcome
+вакансии и сама по себе не меняет counters. Stop прерывает ожидание с обычной причиной
+`user_stop`. Если CAPTCHA не исчезла за 120 секунд, весь run получает `STOPPED` с причиной
+`hh_captcha_timeout`; текущая вакансия не превращается в manual/application failure.
 
 ## 16. Resume selection и exact-ID safety
 
@@ -276,7 +282,6 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 - Нет доказанного explicit HH empty-results marker; 0/0 остаётся `empty_unclassified`.
 - `raw_card_count > 0` и `parsed=0` диагностируется, но run завершается тем же общим reason.
 - Search login redirect не имеет отдельного terminal run status.
-- CAPTCHA не ставит run на паузу.
 - `pages_exhausted` — не доказательство конца HH-выдачи.
 - Standalone response form может не дать доказанно переключить exact resume ID.
 - `needs_manual_review` смешивает бизнес- и технические причины.
@@ -292,7 +297,7 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 
 | Тема | CURRENT | OPEN QUESTION |
 |---|---|---|
-| CAPTCHA | diagnostics; detail local failure; без pause | Нужны ли pause/wait/resume и UI-сигнал? |
+| Automatic CAPTCHA solving | manual solve; pause/resume до 120 секунд | После LIVE evidence о частоте CAPTCHA решить, нужна ли внешняя solving integration. |
 | `pages_exhausted` | исчерпан configured budget | Переименовать ли, чтобы не звучало как конец HH? |
 | Standalone resume form | без exact ID submit запрещён | Какой штатный HH-механизм выбора exact ID? |
 | `answer_missing` | manual с имеющейся diagnostic taxonomy | Нужна ли более точная пользовательская причина? |

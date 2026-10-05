@@ -462,7 +462,9 @@ async function refresh(){
   }
   document.getElementById('modeBadge').textContent = s.mode === 'LIVE' ? 'LIVE — реальные отклики' : 'SAFE';
   document.getElementById('modeBadge').className = s.mode === 'LIVE' ? 'badge b-live' : 'badge b-shadow';
-  document.getElementById('runBannerMode').textContent = s.mode === 'LIVE' ? 'LIVE: реальные отклики разрешены' : 'SAFE: отклики не отправляются';
+  document.getElementById('runBannerMode').textContent = s.captcha_waiting
+    ? s.captcha_message
+    : (s.mode === 'LIVE' ? 'LIVE: реальные отклики разрешены' : 'SAFE: отклики не отправляются');
   const sb = document.getElementById('sessBadge');
   sb.textContent = s.has_session ? 'сессия есть' : 'нет сессии';
   sb.className = 'badge ' + (s.has_session?'b-ok':'b-off');
@@ -470,7 +472,9 @@ async function refresh(){
   document.getElementById('runBtn').disabled = s.running || !s.has_session;
   document.getElementById('stopBtn').disabled = !s.running;
   document.getElementById('resultsHeading').textContent = s.running ? 'Итоги текущего прогона' : 'Итоги последнего прогона';
-  document.getElementById('runState').textContent = s.running ? `${s.mode}: идёт прогон…` : (s.last_run ? `Последний прогон: ${s.last_run.status}: ${s.last_run.stop_reason}` : 'готов');
+  document.getElementById('runState').textContent = s.captcha_waiting
+    ? s.captcha_message
+    : (s.running ? `${s.mode}: идёт прогон…` : (s.last_run ? `Последний прогон: ${s.last_run.status}: ${s.last_run.stop_reason}` : 'готов'));
 
   const rb = document.getElementById('runBanner');
   rb.style.display = s.running ? 'flex' : 'none';

@@ -147,9 +147,10 @@ class VacancyDetailDiagnosticTests(unittest.TestCase):
     def test_known_login_and_captcha_states_are_structural(self):
         login = self.missing(_Page(url="https://hh.ru/account/login?from=vacancy"))
         self.assertTrue(login["page_state_markers"]["login_marker_present"])
-        captcha = self.missing(_Page(url="https://hh.ru/captcha?key=private", captcha_count=1))
+        captcha = self.missing(_Page(url="https://hh.ru/account/captcha?key=private",
+                                     captcha_count=0))
         self.assertTrue(captcha["page_state_markers"]["captcha_marker_present"])
-        self.assertEqual(captcha["page_state_markers"]["captcha_marker_count"], 1)
+        self.assertEqual(captcha["page_state_markers"]["captcha_marker_count"], 0)
         self.assertNotIn("key=private", json.dumps(captcha))
 
     def test_data_qa_snapshot_is_names_only_deduplicated_bounded_and_private_free(self):
