@@ -68,15 +68,34 @@ class CurrentProductSemanticsTests(unittest.TestCase):
                 "description": "Проект для ACME",
             }))
 
-    def test_current_remote_unclear_precedes_below_threshold(self):
-        # CURRENT behavior. Whether low score should precede unclear remote is an open product decision.
-        result = dict(test_safe_mvp.RESULT, score=10, capability_score=10,
-                      remote_status="unclear", remote_reason="Remote format is unclear")
-        rows, letter = self._run([dict(test_safe_mvp.VAC)], [result])
-        outcome = next(row for row in rows if row.get("vacancy_id"))
-        self.assertEqual(outcome["decision"], "needs_manual_review")
-        self.assertEqual(outcome["reason"], "Remote format is unclear")
-        letter.assert_not_called()
+    def test_definite_remote_rejection_then_score_then_remote_uncertainty(self):
+        cases = (
+            ("unclear low mismatch", "unclear", 10, "functional_mismatch",
+             "rejected_score", "score_rejected"),
+            ("unclear low aligned", "unclear", 10, "aligned",
+             "rejected_score", "score_rejected"),
+            ("ineligible low", "ineligible", 10, "aligned",
+             "rejected_remote", "hard_rejected"),
+            ("ineligible high", "ineligible", 90, "aligned",
+             "rejected_remote", "hard_rejected"),
+            ("unclear high", "unclear", 90, "aligned",
+             "needs_manual_review", "manual_review"),
+        )
+        for name, remote, score, role, expected, counter in cases:
+            with self.subTest(name=name):
+                result = dict(test_safe_mvp.RESULT, score=score, capability_score=score,
+                              remote_status=remote, remote_reason="Remote format result",
+                              role_alignment=role)
+                rows, letter = self._run([dict(test_safe_mvp.VAC)], [result])
+                outcome = next(row for row in rows if row.get("vacancy_id"))
+                final = next(row for row in rows if row.get("event") == "run_finished")
+                self.assertEqual(outcome["decision"], expected)
+                self.assertEqual(final["counts"][counter], 1)
+                self.assertEqual(final["counts"]["score_rejected"],
+                                 1 if expected == "rejected_score" else 0)
+                self.assertEqual(final["counts"]["manual_review"],
+                                 1 if expected == "needs_manual_review" else 0)
+                letter.assert_not_called()
 
     def test_configured_page_budget_finishes_with_pages_exhausted(self):
         pages = [[dict(test_safe_mvp.VAC, id="101")],

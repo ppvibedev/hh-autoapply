@@ -527,12 +527,12 @@ def main():
                             if result["remote_status"] == "ineligible":
                                 counts["hard_rejected"] += 1
                                 entry.update(decision="rejected_remote", reason=result["remote_reason"])
-                            elif result["remote_status"] == "unclear":
-                                counts["manual_review"] += 1
-                                entry.update(decision="needs_manual_review", reason=result["remote_reason"])
                             elif result["score"] < config.SCORE_THRESHOLD:
                                 counts["score_rejected"] += 1
                                 entry["decision"] = "rejected_score"
+                            elif result["remote_status"] == "unclear":
+                                counts["manual_review"] += 1
+                                entry.update(decision="needs_manual_review", reason=result["remote_reason"])
                             elif result["role_alignment"] != "aligned":
                                 counts["manual_review"] += 1
                                 entry.update(decision="needs_manual_review",

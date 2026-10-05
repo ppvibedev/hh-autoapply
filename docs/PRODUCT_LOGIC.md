@@ -115,22 +115,23 @@ form в matching не участвуют.
 **CURRENT.** После валидного matching применяется именно такой порядок:
 
 1. `remote_status=ineligible` → `rejected_remote`;
-2. `remote_status=unclear` → `needs_manual_review`;
-3. score ниже threshold → `rejected_score`;
+2. score ниже threshold → `rejected_score`;
+3. `remote_status=unclear` → `needs_manual_review`;
 4. `role_alignment != aligned` → `needs_manual_review`;
 5. иначе вакансия допускается к письму/application.
 
-Следствие: `remote=unclear` и низкий score сейчас дают manual review, потому что remote
-проверяется раньше score. Это CURRENT, а желаемый порядок остаётся открытым решением.
+Это означает: доказанная remote-несовместимость отсекается раньше score, но remote
+uncertainty проверяется после threshold. Поэтому `remote=unclear` и низкий score дают
+`rejected_score`: даже ручное подтверждение remote не позволит вакансии пройти threshold.
 
 ## 11. Decision matrix
 
 | Условие после matching | CURRENT outcome | Application |
 |---|---|---|
-| remote ineligible | `rejected_remote` | нет |
-| remote unclear, любой score | `needs_manual_review` | нет |
-| remote eligible, score ниже threshold | `rejected_score` | нет |
-| score прошёл, role adjacent/mismatch/unclear | `needs_manual_review` | нет |
+| remote ineligible, любой score | `rejected_remote` | нет |
+| remote eligible или unclear, score ниже threshold | `rejected_score` | нет |
+| remote unclear, score прошёл | `needs_manual_review` | нет |
+| remote eligible, score прошёл, role adjacent/mismatch/unclear | `needs_manual_review` | нет |
 | remote eligible, score прошёл, role aligned, SAFE | `safe_ready` | заблокирован |
 | то же, LIVE | application flow | только после всех gate |
 | matching/privacy/детальная ошибка | `needs_manual_review` или terminal run state | зависит от класса ошибки |
@@ -258,7 +259,7 @@ ledger хранится отдельно. Dashboard после перезапу�
 | `safe_ready` | SAFE-анализ и письмо готовы, отправки не было |
 | `rejected_hard_filter` | сработал локальный hard filter |
 | `rejected_remote` | matching подтвердил неподходящую удалённость |
-| `rejected_score` | score ниже threshold после remote gate |
+| `rejected_score` | score ниже threshold после gate доказанной remote-несовместимости |
 | `needs_manual_review` | решение/форма не подтверждены безопасно |
 | `applied_confirmed` | HH явно подтвердил новый отклик |
 | `already_applied` | HH явно показал существующий отклик |
@@ -291,7 +292,6 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 
 | Тема | CURRENT | OPEN QUESTION |
 |---|---|---|
-| Low score + remote unclear | manual по remote | Должен ли низкий score отсекаться раньше? |
 | CAPTCHA | diagnostics; detail local failure; без pause | Нужны ли pause/wait/resume и UI-сигнал? |
 | `pages_exhausted` | исчерпан configured budget | Переименовать ли, чтобы не звучало как конец HH? |
 | Standalone resume form | без exact ID submit запрещён | Какой штатный HH-механизм выбора exact ID? |
