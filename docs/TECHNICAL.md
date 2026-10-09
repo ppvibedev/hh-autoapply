@@ -25,7 +25,7 @@ production application flow и имеет собственные огранич�
 | `llm_provider.py` | provider transports и нормализация failures |
 | `candidate_context.py`, `privacy.py` | локальные материалы и privacy boundary |
 | `resume_metadata.py` | atomic metadata catalog, exact-ID lookup |
-| `question_sources.py` | локальные resolvers/preference routing |
+| `application_profile.py`, `question_sources.py` | приватный application contact и локальные resolvers/preference routing |
 | `application.py` | response state machine, questions, resume, submit confirmation |
 | `history_store.py` | JSONL locking/retention и application safety ledger |
 | `webapp.py`, `web/index.html` | API/dashboard/current-run UI/history paging/Stop |
@@ -33,8 +33,8 @@ production application flow и имеет собственные огранич�
 ## State и private files
 
 `state/` содержит HH session, resume metadata/cache, decisions journal, application safety,
-worker state и control socket. `private/` содержит candidate context, preferences и LLM
-connections. Оба каталога runtime-private и игнорируются Git.
+worker state и control socket. `private/` содержит candidate context, preferences, локальный
+`application_profile.json` и LLM connections. Оба каталога runtime-private и игнорируются Git.
 
 `state/decisions.jsonl` — append-only operational journal с retention: пять последних
 завершённых runs плюс активный. `state/application_safety.json` — компактный exact vacancy
@@ -67,7 +67,9 @@ authenticated socket. Correlation выполняется через `stop_attemp
 До router профессиональные источники проходят `sanitize_candidate_text`; persisted records
 проходят `sanitize_record`. Provider request не должен включать local credentials кроме
 credential самого выбранного provider transport. Raw prompts/responses и секреты не
-пишутся в diagnostics.
+пишутся в diagnostics. Telegram для employer questions читается только из локального
+application profile и никогда не передаётся router. Resume cache не является источником
+Telegram; phone/email сохраняют прежний per-resume resolver.
 
 ## Application state machine
 

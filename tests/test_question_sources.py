@@ -58,7 +58,7 @@ class SourceTests(unittest.TestCase):
         page,form,letter,submit,route,journal,order,fill,model=owner.fixture(questions=[q],signal='applied_confirmed')
         model.side_effect=real
         contact='@synthetic_handle'
-        with patch('question_sources._read',return_value={'resumes':{'aaaa':{'contacts':{'telegram':contact}}}}),patch('llm.generate') as cloud:
+        with patch('application_profile.telegram',return_value=contact),patch('llm.generate') as cloud:
             outcome=app.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal)
             cloud.assert_not_called()
         self.assertEqual(outcome['application_status'],'applied_confirmed')
@@ -77,40 +77,50 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn('1234567890123456',model.call_args.args[0])
         self.assertIn('__hh_option_0',model.call_args.args[0])
 
-    def test_telegram_resume_cache_filled_locally_without_disclosure(self):
-        from privacy import sanitize_candidate_text
+    def test_telegram_profile_filled_locally_without_disclosure(self):
         import tempfile
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
         cache=Path(tmp.name).resolve()
         real=app.answer_question
         contact='@synthetic_local'
-        raw='Телеграм для связи: '+contact
-        (cache/'aaaa.txt').write_text(raw)
-        self.assertNotIn(contact,sanitize_candidate_text(raw))
         owner=test_live.LiveTests();owner.setUp();self.addCleanup(owner.doCleanups)
         q=self.q('Как мы можем найти вас в телеграм?','textarea')
         page,form,letter,submit,route,journal,order,fill,model=owner.fixture(questions=[q],signal='applied_confirmed')
         model.side_effect=real
-        with patch.object(config,'RESUME_CACHE_DIR',str(cache.resolve())),patch('question_sources._read',return_value={}),patch('llm.generate') as cloud:
+        with patch('application_profile.telegram',return_value=contact),patch('llm.generate') as cloud:
             outcome=app.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal)
             cloud.assert_not_called()
         self.assertEqual(outcome['application_status'],'applied_confirmed')
         self.assertEqual(fill.call_args.args[2]['answer'],contact)
         self.assertNotIn(contact,json.dumps(outcome))
 
-    def test_telegram_absent_for_selected_resume_stays_manual(self):
+    def test_telegram_absent_does_not_use_resume_cache_and_stays_manual(self):
         import tempfile
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
         cache=Path(tmp.name).resolve()
         real=app.answer_question
-        (cache/'bbbb.txt').write_text('Телеграм для связи: @another_person')
+        cached='Телеграм для связи: @cached_person'
+        (cache/'aaaa.txt').write_text(cached)
         owner=test_live.LiveTests();owner.setUp();self.addCleanup(owner.doCleanups)
         q=self.q('Как найти вас в Telegram?','textarea')
         page,form,letter,submit,route,journal,order,fill,model=owner.fixture(questions=[q],signal='applied_confirmed')
         model.side_effect=real
-        with patch.object(config,'RESUME_CACHE_DIR',str(cache.resolve())),patch('question_sources._read',return_value={}),patch('llm.generate') as cloud:
+        with patch.object(config,'RESUME_CACHE_DIR',str(cache.resolve())), \
+             patch('application_profile.telegram',return_value=''),patch('llm.generate') as cloud:
             outcome=app.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal)
             cloud.assert_not_called()
         self.assertEqual(outcome['application_status'],'needs_manual_review')
         self.assertEqual(outcome['reason_code'],'contact_answer_unavailable')
         fill.assert_not_called()
+        self.assertEqual((cache/'aaaa.txt').read_text(),cached)
+
+    def test_existing_email_and_phone_sources_are_unchanged(self):
+        profile={'resumes':{'aaaa':{'contacts':{
+            'email':'person@example.test','phone':'+7 (999) 123-45-67'}}}}
+        with patch('question_sources._read',return_value=profile), \
+             patch('application_profile.telegram') as telegram:
+            email=sources.resolve(self.q('Укажите email','email'),'aaaa')
+            phone=sources.resolve(self.q('Укажите телефон','tel'),'aaaa')
+        self.assertEqual(email['answer'],'person@example.test')
+        self.assertEqual(phone['answer'],'+7 (999) 123-45-67')
+        telegram.assert_not_called()

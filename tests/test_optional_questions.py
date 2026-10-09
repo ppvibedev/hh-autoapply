@@ -77,9 +77,12 @@ class OptionalQuestionTests(unittest.TestCase):
         real_answer = application.answer_question
         for contact in (False,True):
             for required in (False,True):
-                q=dict(TEXT,required=required,question='Укажите email' if contact else TEXT['question'])
+                q=dict(TEXT,required=required,question='Укажите Telegram' if contact else TEXT['question'])
                 page,form,letter,submit,route,journal,order,fill,model=self.fixture(signal='applied_confirmed',questions=[q])
-                with patch('application.answer_question',side_effect=real_answer), patch('llm.generate',return_value=None) as llm, patch('application._clear_optional_question',return_value=True) as clear:
+                with patch('application.answer_question',side_effect=real_answer), \
+                     patch('application_profile.telegram',return_value=''), \
+                     patch('llm.generate',return_value=None) as llm, \
+                     patch('application._clear_optional_question',return_value=True) as clear:
                     result=application.apply(page,test_live.VAC,'Prepared letter',resume_id='aaaa',dry_run=False,before_submit=journal,resume_text=test_live.FACT)
                 if contact: llm.assert_not_called()
                 else: llm.assert_called_once()

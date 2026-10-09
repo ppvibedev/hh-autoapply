@@ -2,6 +2,7 @@
 import json
 import re
 from pathlib import Path
+import application_profile
 import config
 
 PRIVATE = Path(__file__).resolve().parent / 'private'
@@ -17,20 +18,6 @@ def _read(name):
 
 def _norm(text):
     return re.sub(r'\s+', ' ', str(text).casefold().replace('ё','е')).strip().rstrip('.!?')
-
-
-def _resume_telegram(resume_id):
-    """Read only an explicit contact line from this resume's existing local cache."""
-    if not re.fullmatch(r'[0-9a-f]+',resume_id or '',re.I): return None
-    root=Path(config.RESUME_CACHE_DIR)
-    path=root / f'{resume_id}.txt'
-    if path.is_symlink() or any(p.is_symlink() for p in path.parents): return None
-    try:
-        with path.open(encoding='utf-8') as stream: text=stream.read(120001)
-    except (OSError,UnicodeError): return None
-    if len(text)>120000: return None
-    values=set(re.findall(r'(?im)^\s*(?:телеграм|telegram)(?:\s+для\s+связи)?\s*:\s*(@[A-Za-z0-9_]{5,32}|https://t\.me/[A-Za-z0-9_]{5,32})\s*$',text))
-    return next(iter(values)) if len(values)==1 else None
 
 
 def _option(question, text, yes=False, aliases=()):
@@ -59,13 +46,16 @@ def resolve(question, resume_id=''):
     contact=next((key for key,pattern in (
         ('telegram',r'telegram|телеграм'),('email',r'e-?mail|электронн.*почт'),('phone',r'телефон')) if re.search(pattern,text)),None)
     if contact:
-        # Explicit per-resume local contact only. No source text or contact enters LLM.
-        profiles=_read('application_profile.json').get('resumes',{})
-        profile=profiles.get(resume_id,{}) if isinstance(profiles,dict) else {}
-        value=profile.get('contacts',{}).get(contact) if isinstance(profile,dict) else None
-        if contact=='telegram' and not value:
-            value=_resume_telegram(resume_id)
-        patterns={'telegram':r'(?:@[A-Za-z0-9_]{5,32}|https://t\.me/[A-Za-z0-9_]{5,32})',
+        # Telegram is one explicit application setting. Existing phone/email remain per-resume.
+        if contact=='telegram':
+            try: value=application_profile.telegram()
+            except application_profile.ApplicationProfileError:
+                raise ValueError('contact_answer_unavailable') from None
+        else:
+            profiles=_read('application_profile.json').get('resumes',{})
+            profile=profiles.get(resume_id,{}) if isinstance(profiles,dict) else {}
+            value=profile.get('contacts',{}).get(contact) if isinstance(profile,dict) else None
+        patterns={'telegram':r'@[A-Za-z0-9_]{5,32}',
                   'email':r'[^\s@]+@[^\s@]+\.[^\s@]+','phone':r'\+?[\d ()-]{7,25}'}
         if not isinstance(value,str) or not re.fullmatch(patterns[contact],value): raise ValueError('contact_answer_unavailable')
         if kind not in ('text','textarea','email','tel'): raise ValueError('contact_answer_unavailable')

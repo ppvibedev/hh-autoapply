@@ -126,6 +126,7 @@ class CurrentProductSemanticsTests(unittest.TestCase):
         question = {"question": "Как найти вас в Telegram?", "type": "text",
                     "required": True, "options": []}
         with patch.object(question_sources, "PRIVATE", private), \
+             patch("application_profile.telegram", return_value=""), \
              patch("hh_web.load_resume_text", return_value=(
                  "Project delivery experience\nTelegram: @synthetic_user")):
             refreshed = run_web._get_resume(None, "aaaa")

@@ -191,10 +191,12 @@ display/matching metadata, но не могут преобразовать title
 ## 17. Employer questions
 
 **CURRENT.** Вопросы — ветка внутри application flow. Простые подтверждённые настройки и
-preferences могут разрешаться локально. Явные contact questions не идут в LLM; значение
-берётся только из разрешённого локального профиля, а Telegram дополнительно пытается
-читаться из cache выбранного resume. Профессиональные открытые вопросы идут в LLM с
-question, vacancy, sanitized resume/context и instructions.
+preferences могут разрешаться локально. Явные contact questions не идут в LLM. Telegram
+для откликов задаётся в dashboard только в формате `@username`, хранится локально в
+`private/application_profile.json` и является единственным источником автоматического
+ответа на Telegram-вопрос. Resume cache для этого не используется; оригинальное резюме HH
+не изменяется. Телефон и email сохраняют прежнюю логику. Профессиональные открытые вопросы
+идут в LLM с question, vacancy, sanitized resume/context и instructions.
 
 Ответ должен иметь подтверждающее evidence. Strict literal validation остаётся финальным
 gate; локальный recovery может только найти один однозначный дословный fragment в trusted
@@ -285,8 +287,6 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 - `pages_exhausted` — не доказательство конца HH-выдачи.
 - Standalone response form может не дать доказанно переключить exact resume ID.
 - `needs_manual_review` смешивает бизнес- и технические причины.
-- После normal resume refresh контакты санитизируются перед cache write; поэтому Telegram
-  cache-fallback из этого файла недоступен, если отдельный local profile не содержит contact.
 - Stop latency ограничена timeout уже начатой операции.
 - Основной browser path и legacy API path сосуществуют; application через API не считается
   текущим production-маршрутом.
@@ -305,7 +305,6 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 | Empty search page | 0/0 `empty_unclassified` | Какой stable marker доказывает normal exhaustion? |
 | Raw-card parser failure | diagnostic + общий terminal reason | Нужен ли отдельный run status/reason? |
 | Manual-review split | один outcome | Разделить business uncertainty и technical failure? |
-| Telegram source | local profile; cache fallback ограничен sanitation | Какой канонический локальный источник контактов? |
 | Expired HH session | search redirect не даёт отдельный terminal status | Нужен ли fail-fast re-login state? |
 | Stop latency | ждёт возврата blocking operation | Нужно ли кооперативное прерывание глубже? |
 | History reset wording | журнал/seen/legacy cache, safety остаётся | Как точнее назвать кнопку и confirmation? |

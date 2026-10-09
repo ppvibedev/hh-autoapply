@@ -22,6 +22,7 @@ from uuid import uuid4
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
+import application_profile
 import config
 import envfile
 import history_store
@@ -484,6 +485,17 @@ def api_llm_connections():
         return jsonify({"error": "Не удалось прочитать настройки подключений"}), 400
 
 
+@app.get("/api/application-profile")
+def api_application_profile():
+    """Return only the one local contact needed by the settings form."""
+    try:
+        response = jsonify({"telegram": application_profile.telegram()})
+    except application_profile.ApplicationProfileError:
+        return jsonify({"error": "Не удалось прочитать локальный профиль откликов"}), 400
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.post("/api/llm-connections")
 @app.patch("/api/llm-connections/<connection_id>")
 def api_llm_connection_save(connection_id=None):
@@ -532,6 +544,16 @@ def api_config():
     payload = request.get_json(force=True) or {}
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": "Некорректные настройки"}), 400
+    telegram_supplied = "APPLICATION_TELEGRAM" in payload
+    if telegram_supplied:
+        if (request.headers.get("Origin")
+                and request.headers["Origin"].rstrip("/") != request.host_url.rstrip("/")):
+            return jsonify({"ok": False, "error": "Некорректный источник запроса"}), 400
+        try:
+            telegram = application_profile.normalize_telegram(payload["APPLICATION_TELEGRAM"])
+        except application_profile.ApplicationProfileError:
+            return jsonify({"ok": False, "error":
+                "Telegram должен начинаться с @ и содержать 5–32 латинских букв, цифр или _"}), 400
     updates = {k: str(v) for k, v in payload.items() if k in EDITABLE}
     if updates.get("RUN_MODE", "SAFE") not in ("SAFE", "LIVE"):
         return jsonify({"ok": False, "error": "Неизвестный режим"}), 400
@@ -564,7 +586,15 @@ def api_config():
             updates[k] = val
     if updates:
         envfile.update_env(updates)
-    return jsonify({"ok": True, "updated": [k for k in updates if k not in SECRET_KEYS]})
+    if telegram_supplied:
+        try:
+            application_profile.save_telegram(telegram)
+        except application_profile.ApplicationProfileError:
+            return jsonify({"ok": False, "error": "Не удалось сохранить Telegram локально"}), 400
+    public_updates = [k for k in updates if k not in SECRET_KEYS]
+    if telegram_supplied:
+        public_updates.append("APPLICATION_TELEGRAM")
+    return jsonify({"ok": True, "updated": public_updates})
 
 
 @app.post("/api/run")

@@ -186,6 +186,13 @@
       <span id="resumesHint" class="muted"></span>
     </div>
 
+    <h2 style="margin-top:20px">Контакты для откликов</h2>
+    <div class="grid2">
+      <div style="grid-column:1/3"><label for="APPLICATION_TELEGRAM">Telegram для откликов</label>
+        <input id="APPLICATION_TELEGRAM" placeholder="@username" autocomplete="off" spellcheck="false">
+        <div class="muted" style="font-size:12px;margin-top:4px">Укажите Telegram в формате @username. Используется для ответов на вопросы работодателей. Хранится локально и не передаётся в ИИ.</div></div>
+    </div>
+
     <h2 style="margin-top:20px">Подключения ИИ</h2>
     <p class="muted">Для анализа вакансий, писем и ответов. Изменения применяются со следующего прогона.
       Сначала используется первое включённое подключение; при сбое — та же модель того же провайдера, затем остальные по порядку.</p>
@@ -615,10 +622,23 @@ async function saveConnection(){
 }
 loadConnections();
 
+async function loadApplicationProfile(){
+  const input=document.getElementById('APPLICATION_TELEGRAM');
+  try {
+    const response=await fetch('/api/application-profile',{cache:'no-store'});
+    const data=await response.json();
+    if(!response.ok) throw new Error();
+    if(input.dataset.touched!=='true') input.value=data.telegram||'';
+  } catch { showToast('Не удалось прочитать Telegram для откликов','err'); }
+}
+document.getElementById('APPLICATION_TELEGRAM').addEventListener('input',event=>event.currentTarget.dataset.touched='true');
+
 async function postForm(silent){
   const body = {};
   document.querySelectorAll('input,select').forEach(el=>{ if(el.id && !el.id.startsWith('connection')) body[el.id]=el.value; });
+  body.APPLICATION_TELEGRAM=(body.APPLICATION_TELEGRAM||'').trim();
   const d = await postAction('/api/config', silent?null:'Настройки сохранены', body);
+  if(d) document.getElementById('APPLICATION_TELEGRAM').value=body.APPLICATION_TELEGRAM;
   cfgTouched = false;
   return d;
 }
@@ -690,13 +710,13 @@ async function loginFinish(){ await postAction('/api/login/finish','Сохран
 async function loginCancel(){ await postAction('/api/login/cancel','Вход отменён'); refresh(); }
 
 async function saveCfg(){
-  await postForm();
+  if(!await postForm()) return;
   document.getElementById('cfgSaved').textContent = 'сохранено';
   setTimeout(()=>document.getElementById('cfgSaved').textContent='',2000);
   refresh();
 }
 
-loadAreas().then(refresh);
+Promise.all([loadAreas(),loadApplicationProfile()]).then(refresh);
 setInterval(()=>{ if(!pollingPaused) refresh(); }, 3000);
 document.getElementById('feed').addEventListener('scroll',event=>{
   const feed=event.currentTarget;
