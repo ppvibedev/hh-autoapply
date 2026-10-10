@@ -924,8 +924,56 @@ RESUME_WARNING_SNAPSHOT = r'''(form, expectedId) => {
         .filter(el=>el === warning ? el.matches(selector) : true).slice(0,24);
     const root=meta(warning), controlMetadata=controls.map(meta);
     const exactIdentifiers=[...root.resume_identifiers,...controlMetadata.flatMap(item=>item.resume_identifiers)];
-    return {present:true,visible:visible(warning),root,control_count:controlMetadata.length,
-        controls:controlMetadata,exact_resume_identifiers:exactIdentifiers};
+    const style=getComputedStyle(warning), rects=[...warning.getClientRects()], rect=warning.getBoundingClientRect();
+    const number=value=>Number.isFinite(value) ? Math.round(value*100)/100 : null;
+    const box={x:number(rect.x),y:number(rect.y),width:number(rect.width),height:number(rect.height)};
+    const left=Math.max(0,rect.left),top=Math.max(0,rect.top);
+    const right=Math.min(innerWidth,rect.right),bottom=Math.min(innerHeight,rect.bottom);
+    const intersectionWidth=Math.max(0,right-left),intersectionHeight=Math.max(0,bottom-top);
+    const intersectionArea=intersectionWidth*intersectionHeight,area=Math.max(0,rect.width*rect.height);
+    const intersectsViewport=intersectionArea > 0;
+    let clipped='unknown', clippedByAncestor=false;
+    if (rects.length && area > 0) {
+        let clipLeft=rect.left,clipTop=rect.top,clipRight=rect.right,clipBottom=rect.bottom;
+        for(let parent=warning.parentElement;parent && parent !== form.parentElement;parent=parent.parentElement) {
+            const parentStyle=getComputedStyle(parent);
+            if (/(hidden|clip|scroll|auto)/.test(parentStyle.overflowX+' '+parentStyle.overflowY)) {
+                const parentRect=parent.getBoundingClientRect();
+                clipLeft=Math.max(clipLeft,parentRect.left);clipTop=Math.max(clipTop,parentRect.top);
+                clipRight=Math.min(clipRight,parentRect.right);clipBottom=Math.min(clipBottom,parentRect.bottom);
+            }
+            if (parent === form) break;
+        }
+        const clippedArea=Math.max(0,clipRight-clipLeft)*Math.max(0,clipBottom-clipTop);
+        clippedByAncestor=clippedArea+0.5 < area;
+        clipped=clippedByAncestor ? 'clipped' : 'not_clipped';
+    }
+    let occlusion='unknown';
+    if (intersectsViewport && rect.width > 0 && rect.height > 0) {
+        const x=Math.min(innerWidth-1,Math.max(0,rect.left+rect.width/2));
+        const y=Math.min(innerHeight-1,Math.max(0,rect.top+rect.height/2));
+        const hit=document.elementFromPoint(x,y);
+        if (hit) occlusion=(hit === warning || warning.contains(hit)) ? 'not_occluded_at_center' : 'occluded_at_center';
+    }
+    const ids=[...new Set(exactIdentifiers.map(item=>item.resume_id))];
+    const relation=ids.length === 0 ? 'no_identifier'
+        : ids.length === 1 && ids[0] === expectedId ? 'target_match'
+        : ids.length === 1 ? 'other_resume' : 'ambiguous';
+    const actionable=controls.filter(el=>visible(el) && !el.matches(':disabled')
+        && el.getAttribute('aria-disabled') !== 'true' && !el.closest('[inert]'));
+    const ariaHidden=warning.getAttribute('aria-hidden');
+    const opacity=Number.parseFloat(style.opacity);
+    return {present:true,visible:visible(warning),display:style.display,visibility:style.visibility,
+        opacity:Number.isFinite(opacity) ? number(opacity) : null,
+        aria_hidden:['true','false'].includes(ariaHidden) ? ariaHidden === 'true' : null,
+        inert:warning.hasAttribute('inert') || warning.inert === true,client_rect_count:rects.length,
+        bounding_rect:box,intersects_viewport:intersectsViewport,
+        viewport_intersection_area:number(intersectionArea),
+        viewport_intersection_ratio:area > 0 ? number(intersectionArea/area) : null,
+        clipping:clipped,clipped_by_ancestor:clippedByAncestor,occlusion,
+        root,control_count:controlMetadata.length,actionable_control_count:actionable.length,
+        controls:controlMetadata,exact_resume_identifiers:exactIdentifiers,
+        selected_resume_relation:relation};
 }'''
 
 
@@ -946,6 +994,45 @@ def _resume_warning_was_visible(snapshots):
     return False
 
 
+def _resume_warning_transition_observed(snapshots):
+    for snapshot in snapshots:
+        for event in snapshot.get('mutation_events',[]):
+            if event.get('target',{}).get('qa') != 'hidden-resume-warning':
+                continue
+            if event.get('attribute_name') == 'hidden' and event.get('state_value',{}).get('present') is False:
+                return True
+            if event.get('attribute_name') == 'style':
+                state = event.get('state_value',{})
+                if state.get('display') != 'none' and state.get('visibility') != 'hidden':
+                    return True
+    return False
+
+
+def _stabilize_resume_warning(form, resume_id, initial, stopped=lambda:False, timeout_ms=400):
+    """Observe one bounded follow-up state without changing the application decision."""
+    started = time.monotonic()
+    deadline = started + timeout_ms / 1000
+    interrupted = False
+    while time.monotonic() < deadline:
+        if stopped():
+            interrupted = True
+            break
+        form.page.wait_for_timeout(min(50, max(1, round((deadline-time.monotonic())*1000))))
+    current = _current_or_fallback_scope(form.page, form)
+    stabilized = _resume_warning_snapshot(current, resume_id) if current is not None else None
+    initial_visible = bool(initial and (initial.get('visible') is True
+                           or initial.get('visibility_evidence') == 'visible_transition_observed'))
+    stabilized_visible = bool(stabilized and stabilized.get('visible') is True)
+    return {
+        'warning_initial_state': initial,
+        'warning_stabilized_state': stabilized,
+        'warning_persisted': stabilized_visible if initial_visible else False,
+        'warning_disappeared': bool(initial and not stabilized_visible),
+        'stabilization_stopped': interrupted,
+        'stabilization_elapsed_ms': round((time.monotonic()-started)*1000),
+    }
+
+
 RESUME_DOM_OBSERVER = r'''(trigger, targetResumeId) => {
     let changed=false;
     const changedRoots=new Set();
@@ -964,6 +1051,7 @@ RESUME_DOM_OBSERVER = r'''(trigger, targetResumeId) => {
             const style=getComputedStyle(el);
             return {display:style.display,visibility:style.visibility,pointer_events:style.pointerEvents};
         }
+        if (name === 'hidden') return {present:el.hasAttribute('hidden')};
         const value=el.getAttribute(name) || '';
         if (['aria-expanded','aria-hidden','aria-disabled'].includes(name)) return ['true','false'].includes(value) ? value : '';
         if (name === 'tabindex') return /^-?\d{1,3}$/.test(value) ? value : '';
@@ -979,7 +1067,7 @@ RESUME_DOM_OBSERVER = r'''(trigger, targetResumeId) => {
             const added=elements(record.addedNodes), removed=elements(record.removedNodes);
             event={...event,added_node_count:added.length,removed_node_count:removed.length,
                 added_nodes:added.slice(0,4).map(nodeMeta),removed_nodes:removed.slice(0,4).map(nodeMeta)};
-        } else if (record.type === 'attributes' && ['aria-expanded','aria-hidden','aria-disabled','tabindex','role','class','style'].includes(record.attributeName)) {
+        } else if (record.type === 'attributes' && ['aria-expanded','aria-hidden','aria-disabled','tabindex','role','class','style','hidden'].includes(record.attributeName)) {
             event={...event,attribute_name:record.attributeName,state_value:stateValue(record.target,record.attributeName)};
         } else return;
         const key=JSON.stringify(event);
@@ -1125,6 +1213,52 @@ def _resume_dom_snapshot(observer, snapshots, label, started, page=None, navigat
         snapshots.append(technical)
 
 
+def _resume_chooser_failure_summary(page, form, diagnostics, snapshots, started):
+    """Collapse the bounded structural trace into privacy-safe failure metadata."""
+    first = snapshots[0] if snapshots else {}
+    last = snapshots[-1] if snapshots else {}
+    trigger = first.get('trigger',{})
+    hit = first.get('click_hit_test',{})
+    trigger_diagnostics = diagnostics.get('trigger_diagnostics',{})
+    identity = diagnostics.get('resume_identity_snapshots',[])
+    popup_counts = [max(snapshot.get('drop_base_count',0),snapshot.get('listbox_count',0),
+                        snapshot.get('menu_count',0)) for snapshot in snapshots]
+    option_counts = [snapshot.get('resume_option_count',0) for snapshot in snapshots]
+    opened = diagnostics.get('opened',{})
+    opened_popup = bool(opened.get('popup_found'))
+    opened_options = len(opened.get('options',[]))
+    try:
+        scope_established = form.evaluate('(root)=>root.isConnected') is True
+    except Exception:
+        scope_established = False
+    path = _safe_url_path(page.url)
+    return {
+        'response_path_category': ('standalone' if path == '/applicant/vacancy_response'
+                                   else 'vacancy' if path.startswith('/vacancy/') else 'other'),
+        'response_state': 'modal' if last.get('dialog_count',0) else 'standalone',
+        'response_path': path,
+        'current_response_form_count': last.get('form_count'),
+        'current_response_scope_established': scope_established,
+        'resume_trigger_count': trigger_diagnostics.get('candidate_trigger_count'),
+        'trigger_visible': trigger.get('visible'),
+        'trigger_enabled': trigger.get('enabled'),
+        'trigger_bounding_rect': hit.get('bounding_box'),
+        'trigger_role': trigger.get('role',''),
+        'trigger_aria_expanded': trigger.get('aria_expanded'),
+        'trigger_aria_controls_present': bool(trigger.get('aria_controls')),
+        'trigger_disabled': trigger.get('enabled') is False,
+        'chooser_count_before_click': popup_counts[0] if popup_counts else None,
+        'chooser_count_after_click': max(max(popup_counts,default=0),int(opened_popup)),
+        'resume_option_count_before_click': option_counts[0] if option_counts else None,
+        'resume_option_count_after_click': max(max(option_counts,default=0),opened_options),
+        'popup_appeared_transiently': opened_popup or opened_options > 0
+            or any(count > 0 for count in popup_counts),
+        'exact_selected_resume_id_found_in_active_scope': any(
+            item.get('exact_target_occurrence_count',0) > 0 for item in identity),
+        'elapsed_wait_ms': round((time.monotonic()-started)*1000),
+    }
+
+
 def _resume_evidence_record(evidence, resume_id, vacancy_id, page, source):
     if evidence is None:
         return
@@ -1213,7 +1347,7 @@ def _open_resume_chooser(scope, timeout=1500):
     return scope, state
 
 
-def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_id=None):
+def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_id=None, stopped=lambda:False):
     before = _custom_resume_state(form)
     diagnostics.update(expected_resume_id=resume_id, before=before)
     if before.get('selected_ids') == [resume_id]:
@@ -1301,6 +1435,8 @@ def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_i
         except Exception: pass
     opened = diagnostics['opened']
     if not opened.get('popup_found'):
+        diagnostics['chooser_failure_diagnostics'] = _resume_chooser_failure_summary(
+            page,form,diagnostics,snapshots,started)
         warning = None
         if standalone_identity_diagnostics:
             try:
@@ -1309,10 +1445,13 @@ def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_i
                     warning = _resume_warning_snapshot(current,resume_id)
             except Exception as error:
                 diagnostics['resume_warning_diagnostic_error_type']=type(error).__name__
-        if warning and (warning.get('visible') is True or _resume_warning_was_visible(snapshots)):
+        transition_visible = _resume_warning_was_visible(snapshots)
+        if warning and (warning.get('visible') is True or transition_visible):
+            diagnostics['warning_visibility_transition_observed'] = _resume_warning_transition_observed(snapshots)
             warning['visibility_evidence'] = ('visible_after_click' if warning.get('visible') is True
                                               else 'visible_transition_observed')
             diagnostics['resume_warning_snapshot'] = warning
+            diagnostics.update(_stabilize_resume_warning(form,resume_id,warning,stopped))
             diagnostics.update(reason_code='resume_hidden_warning_requires_action',
                                state_reason_code='hidden_resume_warning_visible')
         else:
@@ -1401,7 +1540,7 @@ def _selected_resume(form, resume_id, evidence=None, vacancy_id=None):
 
 
 
-def _choose_resume(form, resume_id, diagnostics=None, evidence=None, vacancy_id=None):
+def _choose_resume(form, resume_id, diagnostics=None, evidence=None, vacancy_id=None, stopped=lambda:False):
     # Match actual control value, never title or list position.
     if diagnostics is not None:
         diagnostics.update(expected_resume_id=resume_id,before=_custom_resume_state(form))
@@ -1434,7 +1573,7 @@ def _choose_resume(form, resume_id, diagnostics=None, evidence=None, vacancy_id=
         if diagnostics is not None:
             diagnostics.update(reason_code='resume_selection_not_changed',state_reason_code='conflicting_resume_id')
         return False
-    return _custom_resume_choose(form,resume_id,diagnostics if diagnostics is not None else {},evidence,vacancy_id)
+    return _custom_resume_choose(form,resume_id,diagnostics if diagnostics is not None else {},evidence,vacancy_id,stopped)
 
 
 def _clear_optional_question(form, question):
@@ -1908,7 +2047,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         stage = 'apply_resume'
         result['resume_dropdown_diagnostics'] = {}
         if not _choose_resume(form,resume_id,result['resume_dropdown_diagnostics'],
-                              resume_evidence,str(vacancy['id'])):
+                              resume_evidence,str(vacancy['id']),stopped):
             return finish(reason='selected_resume_not_verified',stage=stage,
                           resume_diagnostics=_resume_diagnostics(form,resume_id),
                           form_diagnostics=form_diagnostics(page))

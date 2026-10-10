@@ -88,6 +88,20 @@ tokens или request/response bodies.
 Основные семейства: search page, vacancy detail, LLM transport/routing, question evidence,
 resume chooser/validation, application request/confirmation и Stop lifecycle.
 
+Для `resume_hidden_warning_requires_action` в standalone response form сохраняются только
+структурные признаки warning: display/visibility/opacity, `aria-hidden`, `inert`, геометрия,
+пересечение viewport, ограниченная оценка clipping/occlusion, число actionable controls и
+отношение найденных exact resume ID к target ID. Перед безопасным отказом выполняется одна
+stop-aware стабилизационная проверка длительностью до 400 мс; initial/stabilized snapshots
+показывают, сохранился warning или исчез. Hit-test одной точки и clipping являются
+диагностическими сигналами, а не доказательством пользовательской видимости.
+
+При неоткрывшемся chooser отдельная bounded-сводка фиксирует тип response state, наличие
+active scope, безопасное состояние trigger, popup/option counts до и после клика, transient
+popup, наличие exact target ID в scope и время ожидания. Диагностика не содержит DOM text,
+значений полей, названий резюме или URL query. Она не меняет outcome: без exact selected
+resume ID application остаётся заблокированной до cover letter и submit.
+
 ## Test groups
 
 - `test_safe_mvp.py`, `test_current_product_semantics.py` — pipeline и CURRENT contracts;

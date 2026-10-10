@@ -523,7 +523,7 @@ class DOMTests(unittest.TestCase):
           <a id="external" href="https://private.example/SECRET_PATH?token=SECRET">PRIVATE_EXTERNAL</a>
           <input type="radio" name="resumeId" value="bbbb" checked aria-label="PRIVATE_RADIO">
         </div></form><script>window.warningClicks=0</script>''')
-        snapshot=app._resume_warning_snapshot(self.page.locator('form'),'aaaa')
+        snapshot=app._resume_warning_snapshot(self.page.locator('form').first,'aaaa')
         self.assertTrue(snapshot['visible'])
         self.assertEqual(snapshot['root']['data_qa'],'hidden-resume-warning')
         self.assertIn('data-private',snapshot['root']['data_attribute_names'])
@@ -545,6 +545,62 @@ class DOMTests(unittest.TestCase):
         self.assertNotIn('aria-label',encoded)
         self.assertNotIn('?token=',encoded)
 
+    def test_resume_warning_visibility_diagnostics_are_structural(self):
+        self.page.set_content('''<style>
+          #clip {width:40px;height:20px;overflow:hidden;position:relative}
+          #warning {width:200px;height:80px;opacity:0}
+          #cover {position:absolute;inset:0;background:white;z-index:3}
+          #outside {position:absolute;top:5000px}
+          </style>
+          <form><div id="clip"><div id="warning" data-qa="hidden-resume-warning"
+            aria-hidden="true" inert><a href="https://hh.ru/resume/bbbb">PRIVATE OTHER</a></div>
+            <div id="cover"></div></div></form>
+          <div id="outside" data-qa="hidden-resume-warning">PRIVATE OUTSIDE</div><form id="other"></form>''')
+        snapshot=app._resume_warning_snapshot(self.page.locator('form').first,'aaaa')
+        self.assertEqual(snapshot['opacity'],0)
+        self.assertIs(snapshot['aria_hidden'],True)
+        self.assertIs(snapshot['inert'],True)
+        self.assertGreater(snapshot['client_rect_count'],0)
+        self.assertEqual(snapshot['clipping'],'clipped')
+        self.assertEqual(snapshot['occlusion'],'occluded_at_center')
+        self.assertEqual(snapshot['selected_resume_relation'],'other_resume')
+        self.assertEqual(snapshot['actionable_control_count'],0)
+        self.assertEqual(len(snapshot['exact_resume_identifiers']),1)
+        self.assertNotIn('PRIVATE OUTSIDE',json.dumps(snapshot))
+        self.assertIsNone(app._resume_warning_snapshot(self.page.locator('#other'),'aaaa'))
+        self.page.locator('#warning a').evaluate('(el)=>el.remove()')
+        snapshot=app._resume_warning_snapshot(self.page.locator('form').first,'aaaa')
+        self.assertEqual(snapshot['selected_resume_relation'],'no_identifier')
+        self.assertEqual(snapshot['actionable_control_count'],0)
+
+    def test_resume_warning_outside_viewport_and_ambiguous_ids(self):
+        self.page.set_content('''<form><div data-qa="hidden-resume-warning" style="position:absolute;top:5000px">
+          <a href="https://hh.ru/resume/aaaa">PRIVATE TARGET</a>
+          <a href="https://hh.ru/resume/bbbb">PRIVATE OTHER</a></div></form>''')
+        snapshot=app._resume_warning_snapshot(self.page.locator('form'),'aaaa')
+        self.assertFalse(snapshot['intersects_viewport'])
+        self.assertEqual(snapshot['viewport_intersection_area'],0)
+        self.assertEqual(snapshot['occlusion'],'unknown')
+        self.assertEqual(snapshot['selected_resume_relation'],'ambiguous')
+
+    def test_resume_warning_stabilization_records_transient_persistent_and_stop(self):
+        self.page.set_content('''<form><div id="warning" data-qa="hidden-resume-warning">PRIVATE</div></form>''')
+        form=self.page.locator('form')
+        initial=app._resume_warning_snapshot(form,'aaaa')
+        self.page.evaluate("setTimeout(()=>document.getElementById('warning').remove(),80)")
+        transient=app._stabilize_resume_warning(form,'aaaa',initial,timeout_ms=150)
+        self.assertTrue(transient['warning_disappeared'])
+        self.assertFalse(transient['warning_persisted'])
+        self.page.set_content('''<form><div data-qa="hidden-resume-warning">PRIVATE</div></form>''')
+        form=self.page.locator('form'); initial=app._resume_warning_snapshot(form,'aaaa')
+        persistent=app._stabilize_resume_warning(form,'aaaa',initial,timeout_ms=100)
+        self.assertTrue(persistent['warning_persisted'])
+        stopped=app._stabilize_resume_warning(form,'aaaa',initial,stopped=lambda:True,timeout_ms=400)
+        self.assertTrue(stopped['stabilization_stopped'])
+        self.assertLess(stopped['stabilization_elapsed_ms'],100)
+        for data in (transient,persistent,stopped):
+            self.assertNotIn('PRIVATE',json.dumps(data))
+
     def test_standalone_visible_resume_warning_gets_specific_diagnostic_without_action(self):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>
           <div id="trigger" role="button" data-qa="resume-trigger"
@@ -562,10 +618,37 @@ class DOMTests(unittest.TestCase):
         self.assertEqual(diagnostics['resume_warning_snapshot']['visibility_evidence'],'visible_after_click')
         self.assertEqual(diagnostics['resume_warning_snapshot']['exact_resume_identifiers'],[
             {'source_type':'href-path','resume_id':'aaaa','matches_expected':True}])
+        self.assertEqual(diagnostics['resume_warning_snapshot']['selected_resume_relation'],'target_match')
+        self.assertTrue(diagnostics['warning_visibility_transition_observed'])
+        self.assertTrue(diagnostics['warning_persisted'])
+        self.assertFalse(diagnostics['warning_disappeared'])
+        self.assertIn('warning_initial_state',diagnostics)
+        self.assertIn('warning_stabilized_state',diagnostics)
+        chooser=diagnostics['chooser_failure_diagnostics']
+        self.assertEqual(chooser['response_path_category'],'standalone')
+        self.assertTrue(chooser['current_response_scope_established'])
+        self.assertEqual(chooser['resume_trigger_count'],1)
+        self.assertFalse(chooser['popup_appeared_transiently'])
+        self.assertGreaterEqual(chooser['elapsed_wait_ms'],2900)
         self.assertEqual(self.page.evaluate('warningClicks'),0)
-        encoded=json.dumps(diagnostics['resume_warning_snapshot'])
+        encoded=json.dumps(diagnostics)
         for private in ('PRIVATE WARNING','PRIVATE ACTION','PRIVATE RESUME','PRIVATE_QUERY'):
             self.assertNotIn(private,encoded)
+
+    def test_standalone_warning_stabilization_stop_keeps_safe_failure(self):
+        self.page.set_content('''<form><section><div>Резюме для отклика</div>
+          <div role="button" data-qa="resume-trigger"
+            onclick="document.getElementById('warning').hidden=false">PRIVATE RESUME</div>
+          <div id="warning" data-qa="hidden-resume-warning" hidden>PRIVATE WARNING</div>
+          <button type="submit" onclick="window.submitClicks++">PRIVATE SUBMIT</button>
+          </section></form><script>window.submitClicks=0</script>''')
+        diagnostics={}
+        with patch('application._safe_url_path',return_value='/applicant/vacancy_response'):
+            self.assertFalse(app._custom_resume_choose(
+                self.page.locator('form'),'aaaa',diagnostics,stopped=lambda:True))
+        self.assertEqual(diagnostics['reason_code'],'resume_hidden_warning_requires_action')
+        self.assertTrue(diagnostics['stabilization_stopped'])
+        self.assertEqual(self.page.evaluate('submitClicks'),0)
 
     def _real_resume_portal(self, update):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>
