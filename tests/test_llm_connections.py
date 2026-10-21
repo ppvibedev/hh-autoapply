@@ -47,6 +47,12 @@ def chat_response(status=200, text='OK'):
     return response(status, body={'choices': [{'message': {'content': text}}]})
 
 
+def posted_json(call):
+    if 'json' in call.kwargs:
+        return call.kwargs['json']
+    return json.loads(call.kwargs['data'].decode('utf-8'))
+
+
 def connection(index=1, provider='gemini', model='model-x', enabled=True, folder_id=''):
     return Connection(f'{index:032x}', provider, model, enabled, f'SECRET_{chr(64+index)}', folder_id)
 
@@ -462,7 +468,7 @@ class ConnectionTests(unittest.TestCase):
     def test_http_413_is_operation_scoped_and_eligible_in_future_operation(self):
         groq=connection(1,'groq','openai/gpt-oss-120b')
         backup=connection(2,'zai','glm-4.7-flash')
-        too_large=ProviderFailure('provider_http_error',413)
+        too_large=ProviderFailure('request_too_large',413)
         daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
         router=llm.Router([groq,backup])
         with patch('llm.execute',side_effect=[(None,too_large),('FIRST',None),
@@ -476,6 +482,31 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(first_failure['http_status'],413)
         self.assertEqual(first_failure['failure_scope'],'operation_scoped')
         self.assertFalse(first_failure['retry_scheduled'])
+
+    def test_identical_groq_413_is_not_repeated_but_other_connections_remain_independent(self):
+        groq_a=connection(1,'groq','openai/gpt-oss-120b')
+        groq_b=connection(2,'groq','openai/gpt-oss-120b')
+        backup=connection(3,'zai','glm-4.7-flash')
+        too_large=ProviderFailure('request_too_large',413)
+        events=[]
+        with patch('llm.execute',side_effect=[(None,too_large),(None,too_large),
+                                              ('OK',None)]) as execute:
+            self.assertEqual(llm.Router([groq_a,groq_b,backup],
+                                        telemetry=events.append).generate('same payload'),'OK')
+        self.assertEqual([call.args[0].id for call in execute.call_args_list],
+                         [groq_a.id,groq_b.id,backup.id])
+        self.assertNotIn('llm_router_round_started',
+                         [event['event'] for event in events])
+
+        events=[]
+        with patch('llm.execute',return_value=(None,too_large)) as execute, \
+             self.assertRaises(LLMUnavailable):
+            llm.Router([groq_a],telemetry=events.append).generate('same payload')
+        self.assertEqual(execute.call_count,1)
+        skipped=next(event for event in events
+                     if event['event']=='llm_router_round_connection_skipped')
+        self.assertEqual(skipped['reason_category'],
+                         'identical_payload_request_too_large')
 
     def test_zai_transient_429_can_recover_again_in_second_router_round(self):
         zai=connection(1,'zai','glm-4.7-flash')
@@ -492,6 +523,119 @@ class ConnectionTests(unittest.TestCase):
                                  if event['event']=='llm_attempt_finished'][2:]
         self.assertEqual(second_operation_rounds,[1,1,2])
         self.assertEqual(sleep.call_count,3)
+
+    def test_transient_429_uses_one_bounded_recovery_cycle_then_succeeds(self):
+        item=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429)
+        clock=FakeClock(); events=[]
+        router=llm.Router([item],clock=clock,sleep=clock.advance,
+                          telemetry=events.append)
+        with patch.object(llm,'RATE_RETRIES',0), \
+             patch('llm.execute',side_effect=[(None,rate),(None,rate),('OK',None)]) as execute:
+            self.assertEqual(router.generate('facts',task='matching'),'OK')
+        self.assertEqual(execute.call_count,3)
+        self.assertEqual(router.recovery_wait_used,2.0)
+        self.assertEqual(len([event for event in events
+                              if event['event']=='llm_rate_limit_recovery_started']),1)
+        wait=next(event for event in events
+                  if event['event']=='llm_rate_limit_recovery_wait_started')
+        self.assertEqual(wait['requested_delay_ms'],2000)
+        self.assertEqual(router.consume_routing_events()[0]['recovery'],
+                         'bounded_rate_limit_recovery')
+
+    def test_transient_429_recovery_exhaustion_has_explicit_terminal_reason(self):
+        item=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429)
+        clock=FakeClock(); events=[]
+        router=llm.Router([item],clock=clock,sleep=clock.advance,
+                          telemetry=events.append)
+        with patch.object(llm,'RATE_RETRIES',0), \
+             patch('llm.execute',return_value=(None,rate)) as execute, \
+             self.assertRaises(LLMUnavailable) as caught:
+            router.generate('PRIVATE_RESUME_TEXT')
+        self.assertEqual(execute.call_count,3)
+        exhausted=next(event for event in events
+                       if event['event']=='llm_connections_exhausted')
+        self.assertEqual(exhausted['reason_category'],
+                         'transient_rate_limit_recovery_exhausted')
+        self.assertEqual(exhausted['recovery_attempt_count'],1)
+        self.assertEqual(exhausted['operation_recovery_wait_used_ms'],2000)
+        public=json.dumps(events)+json.dumps(caught.exception.failures)
+        for private in ('PRIVATE_RESUME_TEXT','SECRET_A'):
+            self.assertNotIn(private,public)
+
+    def test_recovery_terminal_reason_preserves_non_rate_limit_failure(self):
+        item=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429)
+        cases=(ProviderFailure('auth/provider_access',401),
+               ProviderFailure('request_too_large',413))
+        for terminal in cases:
+            with self.subTest(category=terminal.category):
+                clock=FakeClock(); events=[]
+                router=llm.Router([item],clock=clock,sleep=clock.advance,
+                                  telemetry=events.append)
+                with patch.object(llm,'RATE_RETRIES',0), \
+                     patch('llm.execute',side_effect=[(None,rate),(None,rate),
+                                                      (None,terminal)]), \
+                     self.assertRaises(LLMUnavailable):
+                    router.generate('facts')
+                exhausted=next(event for event in events
+                               if event['event']=='llm_connections_exhausted')
+                self.assertEqual(exhausted['reason_category'],terminal.category)
+
+    def test_bounded_recovery_honors_retry_after(self):
+        item=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429,retry_delay=7.5)
+        clock=FakeClock(); events=[]
+        router=llm.Router([item],clock=clock,sleep=clock.advance,
+                          telemetry=events.append)
+        with patch.object(llm,'RATE_RETRIES',0), \
+             patch('llm.execute',side_effect=[(None,rate),(None,rate),('OK',None)]):
+            self.assertEqual(router.generate('facts'),'OK')
+        waits=[event['requested_delay_ms'] for event in events
+               if event['event']=='llm_rate_limit_recovery_wait_started']
+        self.assertEqual(waits,[7500])
+
+    def test_run_recovery_wait_budget_caps_multiple_operations(self):
+        item=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429)
+        clock=FakeClock(); events=[]
+        router=llm.Router([item],clock=clock,sleep=clock.advance,
+                          telemetry=events.append)
+        with patch.object(llm,'RATE_RETRIES',0), \
+             patch.object(llm,'RECOVERY_RUN_WAIT_LIMIT',4.0), \
+             patch('llm.execute',return_value=(None,rate)) as execute:
+            for _ in range(3):
+                with self.assertRaises(LLMUnavailable):
+                    router.generate('facts')
+        self.assertEqual(execute.call_count,8)
+        self.assertEqual(router.recovery_wait_used,4.0)
+        exhausted=[event for event in events
+                   if event['event']=='llm_connections_exhausted']
+        self.assertEqual(exhausted[-1]['reason_category'],
+                         'recovery_wait_budget_exhausted')
+        self.assertEqual(exhausted[-1]['recovery_attempt_count'],0)
+
+    def test_stop_interrupts_bounded_recovery_wait(self):
+        item=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429)
+        stopped={'value':False}; in_recovery={'value':False}; events=[]
+        def telemetry(event):
+            events.append(event)
+            if event['event']=='llm_rate_limit_recovery_wait_started':
+                in_recovery['value']=True
+        def sleep(_delay):
+            if in_recovery['value']:
+                stopped['value']=True
+        router=llm.Router([item],sleep=sleep,telemetry=telemetry,
+                          stopped=lambda:stopped['value'])
+        with patch.object(llm,'RATE_RETRIES',0), \
+             patch('llm.execute',return_value=(None,rate)) as execute, \
+             self.assertRaises(LLMStopped):
+            router.generate('facts')
+        self.assertEqual(execute.call_count,2)
+        self.assertEqual(events[-1]['event'],'llm_operation_finished')
+        self.assertEqual(events[-1]['outcome'],'user_stop')
 
     def test_two_recoverable_rounds_exhaust_without_third_round(self):
         a,b=connection(),connection(2)
@@ -608,7 +752,7 @@ class ConnectionTests(unittest.TestCase):
         a,b,c,d=[connection(index) for index in range(1,5)]
         daily=ProviderFailure('quota_daily',429,quota_types=('daily_requests',))
         transient=ProviderFailure('provider_server_error',503)
-        too_large=ProviderFailure('provider_http_error',413)
+        too_large=ProviderFailure('request_too_large',413)
         transport=ProviderFailure('provider_transport_timeout',transport_phase='read',
                                   transport_failure_detail='read_timeout')
         events=[]; router=llm.Router([a,b,c,d],sleep=MagicMock(),
@@ -681,16 +825,41 @@ class ConnectionTests(unittest.TestCase):
                 item = connection(index, provider, model)
                 self.assertEqual(llm.Router([item]).generate('neutral facts', 123, 'question'), 'FINAL')
                 request = post.call_args
+                payload = posted_json(request)
                 self.assertEqual(request.args[0], url)
                 self.assertEqual(request.kwargs['headers']['Authorization'], f'Bearer SECRET_{chr(64+index)}')
-                self.assertEqual(request.kwargs['json']['model'], model)
-                self.assertEqual(request.kwargs['json'][limit_field], 123)
+                self.assertEqual(payload['model'], model)
+                self.assertEqual(payload[limit_field], 123)
                 self.assertNotIn('max_tokens' if limit_field == 'max_completion_tokens'
-                                 else 'max_completion_tokens', request.kwargs['json'])
-                self.assertEqual(request.kwargs['json']['messages'], [{'role': 'user', 'content': 'neutral facts'}])
+                                 else 'max_completion_tokens', payload)
+                self.assertEqual(payload['messages'], [{'role': 'user', 'content': 'neutral facts'}])
                 for key, value in extra.items():
-                    self.assertEqual(request.kwargs['json'][key], value)
+                    self.assertEqual(payload[key], value)
                 self.assertEqual(request.kwargs['timeout'], 60)
+
+    def test_groq_transport_uses_semantically_equal_compact_utf8_json(self):
+        item = connection(provider='groq', model='openai/gpt-oss-120b')
+        prompt = 'Кириллица, emoji 😀, quote " and slash \\.' * 200
+        payload = llm_provider._openai_payload(item, prompt, 1800)
+        legacy_body = json.dumps(payload, ensure_ascii=True, allow_nan=False).encode('utf-8')
+        compact_body = llm_provider._groq_request_body(item, prompt, 1800)
+        prepared = requests.Request(
+            'POST', llm_provider.OPENAI_COMPATIBLE['groq']['url'],
+            headers={'Content-Type': 'application/json'}, data=compact_body).prepare()
+
+        self.assertEqual(json.loads(compact_body.decode('utf-8')), payload)
+        self.assertLess(len(compact_body), len(legacy_body))
+        self.assertNotIn(b'\\u041a', compact_body)
+        self.assertEqual(prepared.body, compact_body)
+        self.assertEqual(prepared.headers['Content-Type'], 'application/json')
+        self.assertEqual(int(prepared.headers['Content-Length']), len(compact_body))
+
+        with patch('llm_provider.requests.post', return_value=chat_response()) as post:
+            text, failure = llm_provider.execute(item, prompt, 1800)
+        self.assertEqual(text, 'OK')
+        self.assertIsNone(failure)
+        self.assertEqual(post.call_args.kwargs['data'], compact_body)
+        self.assertNotIn('json', post.call_args.kwargs)
 
     def test_groq_reasoning_only_length_response_fails_closed(self):
         real_shape = {'choices': [{'finish_reason': 'length', 'message': {
@@ -721,6 +890,68 @@ class ConnectionTests(unittest.TestCase):
                 self.assertIsNone(text)
                 self.assertEqual(failure.category, 'rate_limit_unknown')
                 self.assertEqual(failure.http_status, 429)
+
+    def test_groq_413_is_classified_with_size_only_diagnostics(self):
+        body = {'error': {'type': 'invalid_request_error', 'code': 'request_too_large',
+                          'message': 'PRIVATE_RESUME_TEXT SECRET_A'}}
+        prompt = 'PRIVATE_RESUME_TEXT ' + ('факты ' * 40)
+        with patch('llm_provider.requests.post', return_value=response(413, body=body)):
+            text, failure = llm_provider.execute(
+                connection(provider='groq', model='openai/gpt-oss-120b'), prompt, 1800)
+        self.assertIsNone(text)
+        self.assertEqual(failure.category, 'request_too_large')
+        self.assertEqual(failure.http_status, 413)
+        self.assertEqual(failure.provider_error_type, 'invalid_request_error')
+        self.assertEqual(failure.provider_error_code, 'request_too_large')
+        self.assertEqual(failure.prompt_char_count, len(prompt))
+        self.assertGreater(failure.estimated_input_tokens, 0)
+        self.assertGreater(failure.request_body_bytes, len(prompt))
+        self.assertEqual(failure.requested_output_tokens, 1800)
+        public = json.dumps(failure.public())
+        for private in ('PRIVATE_RESUME_TEXT', 'SECRET_A', 'факты'):
+            self.assertNotIn(private, public)
+
+        events = []
+        with patch('llm_provider.requests.post', return_value=response(413, body=body)):
+            with self.assertRaises(LLMUnavailable):
+                llm.Router([connection(provider='groq', model='openai/gpt-oss-120b')],
+                           telemetry=events.append).generate(prompt, 1800, 'matching')
+        attempt = next(event for event in events
+                       if event['event'] == 'llm_attempt_finished')
+        self.assertEqual(attempt['provider_error_category'], 'request_too_large')
+        self.assertEqual(attempt['request_body_bytes'], failure.request_body_bytes)
+        self.assertEqual(attempt['requested_output_tokens'], 1800)
+        self.assertNotIn('PRIVATE_RESUME_TEXT', json.dumps(events))
+
+    def test_groq_uses_each_real_task_budget_without_affecting_other_providers(self):
+        for task, limit in (('matching', 1800), ('cover_letter', 900), ('question', 650)):
+            with self.subTest(task=task), patch(
+                    'llm_provider.requests.post', return_value=chat_response()) as post:
+                router = llm.Router([
+                    connection(provider='groq', model='openai/gpt-oss-120b')])
+                self.assertEqual(router.generate('synthetic facts', limit, task), 'OK')
+                payload = posted_json(post.call_args)
+                self.assertEqual(payload['max_completion_tokens'], limit)
+                self.assertNotIn('max_tokens', payload)
+
+        zai = connection(2, 'zai', 'glm-4.7-flash')
+        with patch('llm_provider.requests.post', return_value=chat_response()) as post:
+            self.assertEqual(llm.Router([zai]).generate('facts', 650, 'question'), 'OK')
+        self.assertEqual(post.call_args.kwargs['json']['max_tokens'], 650)
+
+    def test_daily_gemini_and_unavailable_zai_fail_over_to_working_groq(self):
+        gemini_a, gemini_b = connection(), connection(2)
+        zai = connection(3, 'zai', 'glm-4.7-flash')
+        groq = connection(4, 'groq', 'openai/gpt-oss-120b')
+        for pool, replies in (
+                ([gemini_a, gemini_b, groq],
+                 [response(429, DAILY), response(429, DAILY), chat_response()]),
+                ([zai, groq], [response(503), response(503), chat_response()])):
+            with self.subTest(first=pool[0].provider), patch(
+                    'llm_provider.requests.post', side_effect=replies):
+                router = llm.Router(pool, sleep=MagicMock())
+                self.assertEqual(router.generate('facts', 650, 'question'), 'OK')
+                self.assertEqual(router.active.provider, 'groq')
 
     def test_gemini_groq_zai_failover_and_saved_order(self):
         gemini = connection(1)
@@ -816,7 +1047,8 @@ class ConnectionTests(unittest.TestCase):
             target = rows[1]['id']
             with patch('llm_provider.execute', return_value=('CONNECTED', None)) as execute:
                 tested = client.post(f'/api/llm-connections/{target}/test', json={})
-            self.assertEqual(tested.json, {'ok': True, 'status': 'CONNECTED'})
+            self.assertEqual(tested.json, {'ok': True, 'status': 'CONNECTED',
+                                           'readiness': 'smoke_test_only'})
             item, prompt, limit = execute.call_args.args
             self.assertEqual((item.provider, item.model, limit),
                              ('groq', 'openai/gpt-oss-120b', 128))
@@ -947,6 +1179,37 @@ class ClassificationTests(unittest.TestCase):
 
 class RunTerminalTests(unittest.TestCase):
     setUp = test_safe_mvp.SafeTests.setUp
+    def test_rate_limit_recovery_continues_once_without_repeating_application(self):
+        browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
+        item=connection(1,'zai','glm-4.7-flash')
+        rate=ProviderFailure('rate_limit_unknown',429)
+        clock=FakeClock(); router=llm.Router([item],clock=clock,sleep=clock.advance)
+        rows=[]
+
+        def score(*_args, **_kwargs):
+            self.assertEqual(router.generate('facts',task='matching'),'OK')
+            return test_safe_mvp.RESULT
+
+        outcome={'application_status':'applied_confirmed'}
+        with patch.object(config,'DRY_RUN',False), \
+             patch.object(llm,'_router',router),patch('llm.reset_runtime'), \
+             patch.object(llm,'RATE_RETRIES',0), \
+             patch('llm.execute',side_effect=[(None,rate),(None,rate),('OK',None)]), \
+             patch('run_web.browser_context',return_value=browser), \
+             patch('run_web.has_session',return_value=True), \
+             patch('run_web.load_candidate_context',return_value=('','')), \
+             patch('run_web._get_resume',return_value='facts'), \
+             patch('hh_web.search_page',return_value=[dict(test_safe_mvp.VAC)]), \
+             patch('hh_web.load_full',side_effect=lambda p,v,**_kwargs:v), \
+             patch('decide.hard_filters',return_value=None), \
+             patch('decide.score',side_effect=score), \
+             patch('decide.cover_letter',return_value='Prepared letter'), \
+             patch('hh_web.apply',return_value=outcome) as apply, \
+             patch('run_web._log',side_effect=rows.append):
+            self.assertEqual(run_web.main(),0)
+        apply.assert_called_once()
+        self.assertEqual(rows[-1]['counts']['applied_confirmed'],1)
+
     def test_recovered_route_is_persisted_without_private_data(self):
         browser=MagicMock(); browser.__enter__.return_value=(None,MagicMock())
         router=llm.Router([connection(),connection(2)],sleep=MagicMock())

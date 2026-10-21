@@ -536,7 +536,7 @@ def api_llm_connection_test(connection_id):
                         "category": failure.category, "http_status": failure.http_status})
     if not isinstance(text, str) or not text.strip():
         return jsonify({"ok": False, "status": "provider_invalid_response"})
-    return jsonify({"ok": True, "status": "CONNECTED"})
+    return jsonify({"ok": True, "status": "CONNECTED", "readiness": "smoke_test_only"})
 
 
 @app.post("/api/config")

@@ -34,6 +34,14 @@ _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 LIVE_HISTORY_REREAD_DELAY_SECONDS = 0.02
 CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS = 120
 CAPTCHA_POLL_INTERVAL_SECONDS = 1
+HH_NAVIGATION_MAX_ATTEMPTS = 3
+HH_NAVIGATION_RETRY_DELAYS_SECONDS = (1.0, 2.0)
+HH_NAVIGATION_RETRY_POLL_SECONDS = 0.1
+_HH_TRANSIENT_NETWORK_MARKERS = {
+    "net::ERR_INTERNET_DISCONNECTED": "internet_disconnected",
+    "net::ERR_NAME_NOT_RESOLVED": "name_not_resolved",
+    "net::ERR_NETWORK_IO_SUSPENDED": "network_io_suspended",
+}
 
 
 class HHCaptchaTimeout(RuntimeError):
@@ -41,6 +49,86 @@ class HHCaptchaTimeout(RuntimeError):
 
     def __init__(self):
         super().__init__("hh_captcha_timeout")
+
+
+class HHNetworkUnavailable(RuntimeError):
+    """Bounded safe navigation retries could not restore HH connectivity."""
+
+    def __init__(self, *, operation, network_error_code, attempts):
+        super().__init__("hh_network_unavailable")
+        self.operation = operation
+        self.network_error_code = network_error_code
+        self.attempts = attempts
+
+
+def _navigation_error_code(error):
+    """Recognize only proven transient failures from a wrapped safe navigation."""
+    message = str(error)
+    for marker, code in _HH_TRANSIENT_NETWORK_MARKERS.items():
+        if marker in message:
+            return code
+    error_type = type(error)
+    if (error_type.__name__ == "TimeoutError"
+            and error_type.__module__.startswith("playwright.")
+            and "Page.goto" in message):
+        return "navigation_timeout"
+    return None
+
+
+def _sleep_with_stop(delay_seconds, *, stopped, sleep=None):
+    """Wait in short slices so dashboard Stop is observed between retries."""
+    sleep = sleep or time.sleep
+    remaining = max(0.0, float(delay_seconds))
+    while remaining > 0:
+        if stopped():
+            raise LLMStopped()
+        interval = min(HH_NAVIGATION_RETRY_POLL_SECONDS, remaining)
+        sleep(interval)
+        remaining = max(0.0, remaining - interval)
+    if stopped():
+        raise LLMStopped()
+
+
+def _safe_navigation(call, *, operation, run_id, stopped=None, telemetry=None,
+                     vacancy_id=None, attempts=HH_NAVIGATION_MAX_ATTEMPTS,
+                     delays=HH_NAVIGATION_RETRY_DELAYS_SECONDS, sleep=None):
+    """Retry only search/detail navigation; never application or submit actions."""
+    stopped = stopped or _observe_stop
+    telemetry = telemetry or _log
+    for attempt in range(1, attempts + 1):
+        if stopped():
+            raise LLMStopped()
+        try:
+            return call()
+        except Exception as error:
+            network_error_code = _navigation_error_code(error)
+            if network_error_code is None:
+                raise
+            common = {
+                "run_id": run_id,
+                "operation": operation,
+                "attempt": attempt,
+                "max_attempts": attempts,
+                "network_error_code": network_error_code,
+            }
+            if vacancy_id is not None:
+                common["vacancy_id"] = str(vacancy_id)
+            if attempt >= attempts:
+                telemetry(dict(event="hh_navigation_retries_exhausted", **common))
+                raise HHNetworkUnavailable(
+                    operation=operation,
+                    network_error_code=network_error_code,
+                    attempts=attempts,
+                ) from error
+            delay = delays[min(attempt - 1, len(delays) - 1)]
+            telemetry(dict(event="hh_navigation_retry_wait_started",
+                           delay_seconds=delay, **common))
+            try:
+                _sleep_with_stop(delay, stopped=stopped, sleep=sleep)
+            except LLMStopped:
+                telemetry(dict(event="hh_navigation_retry_wait_stopped", **common))
+                raise
+            telemetry(dict(event="hh_navigation_retry_wait_finished", **common))
 
 
 def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
@@ -242,6 +330,10 @@ def _exception_details(error, stage):
             details["privacy_rule_id"] = error.privacy_rule_id
         if error.privacy_match_shape:
             details["privacy_match_shape"] = error.privacy_match_shape
+    if isinstance(error, HHNetworkUnavailable):
+        details.update(operation=error.operation,
+                       network_error_code=error.network_error_code,
+                       attempts=error.attempts)
     if isinstance(error, LLMUnavailable):
         details["llm_failures"] = error.failures
     if isinstance(error, LiveHistoryCorrupt):
@@ -468,9 +560,14 @@ def main():
                     search_diagnostic = {"event": "search_page_diagnostic", "run_id": run_id,
                                          "page_num": page_num}
                     try:
-                        vacs = hh_web.search_page(page, text=config.SEARCH_QUERY, area=config.AREA,
-                            salary_min=config.SALARY_MIN, work_format_codes=["REMOTE"], page_num=page_num,
-                            extra_params=config.HH_SEARCH_PARAMS, diagnostics=search_diagnostic)
+                        vacs = _safe_navigation(
+                            lambda: hh_web.search_page(
+                                page, text=config.SEARCH_QUERY, area=config.AREA,
+                                salary_min=config.SALARY_MIN, work_format_codes=["REMOTE"],
+                                page_num=page_num, extra_params=config.HH_SEARCH_PARAMS,
+                                diagnostics=search_diagnostic),
+                            operation="search", run_id=run_id, stopped=_observe_stop,
+                            telemetry=_log)
                     except Exception:
                         search_diagnostic.setdefault("requested_path", "/search/vacancy")
                         search_diagnostic.setdefault("final_path", "[unknown]")
@@ -546,9 +643,13 @@ def main():
                                 mark_stage("vacancy_open")
                                 detail_diagnostic = {}
                                 try:
-                                    full = hh_web.load_full(
-                                        page, vac, diagnostics=detail_diagnostic,
-                                        stopped=_observe_stop)
+                                    full = _safe_navigation(
+                                        lambda: hh_web.load_full(
+                                            page, vac, diagnostics=detail_diagnostic,
+                                            stopped=_observe_stop),
+                                        operation="vacancy_detail", run_id=run_id,
+                                        vacancy_id=vid, stopped=_observe_stop,
+                                        telemetry=_log)
                                 except Exception as error:
                                     if _error_code(error) != "vacancy_description_not_found":
                                         raise
@@ -638,6 +739,11 @@ def main():
                                     # the run remains free to process other vacancies.
                                     if counts["applied_confirmed"] >= config.TARGET_APPLICATIONS_PER_RUN:
                                         halt, stop_reason = True, "target_reached"
+                    except HHNetworkUnavailable:
+                        # The current vacancy was never opened and therefore was not
+                        # processed. Do not turn a shared outage into a manual outcome.
+                        counts["scanned"] = max(0, counts["scanned"] - 1)
+                        raise
                     except LLMStopped:
                         halt, run_status, stop_reason = True, "STOPPED", "user_stop"
                         break
@@ -670,6 +776,10 @@ def main():
                     print(f"{mode}: обработано {counts['scanned']}, подготовлено {counts['safe_ready']}", flush=True)
         if _observe_stop():
             run_status, stop_reason = "STOPPED", "user_stop"
+    except HHNetworkUnavailable as error:
+        run_status, stop_reason = "STOPPED", "hh_network_unavailable"
+        _log(dict(event="run_error", run_id=run_id, reason_code=stop_reason,
+                  **_exception_details(error, stage)))
     except LLMStopped:
         run_status, stop_reason = "STOPPED", "user_stop"
     except HHCaptchaTimeout:

@@ -60,7 +60,7 @@ class ConnectionsUITests(unittest.TestCase):
                     page.get_by_text('3. groq / openai/gpt-oss-120b',exact=False).wait_for()
                     self.assertEqual(page.locator('#connectionCredential').input_value(),'')
                     page.get_by_role('button',name='Проверить подключение 3',exact=True).click()
-                    page.get_by_text('CONNECTED',exact=True).wait_for()
+                    page.get_by_text('CONNECTED · только короткая проверка',exact=True).wait_for()
 
                     page.get_by_role('button',name='Добавить подключение',exact=True).click()
                     page.locator('#connectionProvider').select_option('zai')

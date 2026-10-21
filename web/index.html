@@ -590,7 +590,10 @@ async function testConnection(id,button,state){
   try {
     const response=await fetch('/api/llm-connections/'+encodeURIComponent(id)+'/test',{
       method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const data=await response.json(); state.textContent=data.status||'Ошибка';
+    const data=await response.json();
+    state.textContent=data.readiness==='smoke_test_only'
+      ? `${data.status} · только короткая проверка`
+      : (data.status||'Ошибка');
     if(!data.ok) showToast(`Подключение: ${state.textContent}`,'err');
   } catch { state.textContent='Ошибка сети'; }
   finally { button.disabled=false; }

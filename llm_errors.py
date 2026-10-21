@@ -24,14 +24,27 @@ class ProviderFailure:
     retry_delay: float | None = None
     quota_types: tuple = ()
     provider_status: str | None = None
+    provider_error_type: str | None = None
+    provider_error_code: str | None = None
     transport_phase: str | None = None
     transport_failure_detail: str | None = None
+    prompt_char_count: int | None = None
+    estimated_input_tokens: int | None = None
+    request_body_bytes: int | None = None
+    requested_output_tokens: int | None = None
 
     def public(self):
         return dict(provider_error_category=self.category, http_status=self.http_status,
                     retry_delay=self.retry_delay, quota_types=list(self.quota_types),
-                    provider_status=self.provider_status, transport_phase=self.transport_phase,
-                    transport_failure_detail=self.transport_failure_detail)
+                    provider_status=self.provider_status,
+                    provider_error_type=self.provider_error_type,
+                    provider_error_code=self.provider_error_code,
+                    transport_phase=self.transport_phase,
+                    transport_failure_detail=self.transport_failure_detail,
+                    prompt_char_count=self.prompt_char_count,
+                    estimated_input_tokens=self.estimated_input_tokens,
+                    request_body_bytes=self.request_body_bytes,
+                    requested_output_tokens=self.requested_output_tokens)
 
 
 def _seconds(value):
@@ -44,15 +57,34 @@ def _seconds(value):
         return None
 
 
-def classify_http(provider, response):
+def _safe_provider_error_value(value):
+    """Keep only short machine identifiers; never retain provider messages."""
+    if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:/-]{1,80}', value):
+        return value
+    return None
+
+
+def classify_http(provider, response, request_metadata=None):
     status = response.status_code
     category = ('auth/provider_access' if status in (401, 403) else 'rate_limit_unknown'
                 if status == 429 else 'provider_server_error' if 500 <= status <= 599
+                else 'request_too_large' if provider == 'groq' and status == 413
                 else 'provider_http_error')
     delays, quotas, provider_status = [], set(), None
-    if status != 429:
-        return ProviderFailure(category, status)
+    provider_error_type = provider_error_code = None
+    metadata = {key: value for key, value in (request_metadata or {}).items() if key in {
+        'prompt_char_count', 'estimated_input_tokens', 'request_body_bytes',
+        'requested_output_tokens'}}
     try:
+        body = response.json()
+        error = body.get('error') if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            provider_error_type = _safe_provider_error_value(error.get('type'))
+            provider_error_code = _safe_provider_error_value(error.get('code'))
+        if status != 429:
+            return ProviderFailure(category, status,
+                                   provider_error_type=provider_error_type,
+                                   provider_error_code=provider_error_code, **metadata)
         value = response.headers.get('Retry-After')
         delay = _seconds(value)
         if delay is None and isinstance(value, str):
@@ -65,8 +97,6 @@ def classify_http(provider, response):
         if delay is not None:
             delays.append(delay)
         if provider == 'gemini':
-            body = response.json()
-            error = body.get('error') if isinstance(body, dict) else None
             if isinstance(error, dict):
                 if error.get('status') == 'RESOURCE_EXHAUSTED':
                     provider_status = 'RESOURCE_EXHAUSTED'
@@ -110,4 +140,5 @@ def classify_http(provider, response):
     elif quotas and 'unknown' not in quotas:
         category = 'rate_limit_tokens' if 'tokens_per_minute' in quotas else 'rate_limit_requests'
     return ProviderFailure(category, status, max(delays) if delays else None,
-                           tuple(sorted(quotas)), provider_status)
+                           tuple(sorted(quotas)), provider_status,
+                           provider_error_type, provider_error_code, **metadata)

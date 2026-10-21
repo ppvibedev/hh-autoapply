@@ -159,8 +159,16 @@ instructions и данные вакансии. Контакты и технич�
 несколько локальных connections и позволяет включать/выключать их. Legacy `.env` connection
 используется, если отдельная конфигурация отсутствует. Router фиксирует порядок доступных
 connections на операцию, выполняет bounded retries/failover и максимум два router rounds.
-Долгие provider retry delays не обходятся ранним повтором. Исчерпание инфраструктуры LLM
-останавливает run с `llm_infrastructure_unavailable`, а не запускает application без анализа.
+Groq отправляет тот же JSON компактным UTF-8; HTTP 413 не повторяет неизменный запрос на той
+же connection в пределах операции, но не блокирует другие connections или будущие операции.
+После двух rounds временный HTTP 429 может получить один дополнительный stop-aware recovery
+cycle: не более 30 секунд ожидания на операцию и 120 секунд суммарно на run. Дневная квота и
+другие постоянные ошибки этого ожидания не получают. Долгие provider retry delays не обходятся
+ранним повтором. Исчерпание ограниченного recovery или всей инфраструктуры LLM останавливает
+run с `llm_infrastructure_unavailable`, а не запускает application без анализа.
+Кнопка проверки подключения выполняет только короткий синтетический smoke-test без данных HH
+и кандидата. Статус `CONNECTED` подтверждает доступ к API на этом маленьком запросе, но не
+означает `READY` для полноразмерных matching, cover-letter или employer-question prompts.
 
 ## 15. CAPTCHA CURRENT behavior
 
@@ -175,6 +183,21 @@ URL, затем обычный pipeline продолжается. Успешно
 вакансии и сама по себе не меняет counters. Stop прерывает ожидание с обычной причиной
 `user_stop`. Если CAPTCHA не исчезла за 120 секунд, весь run получает `STOPPED` с причиной
 `hh_captcha_timeout`; текущая вакансия не превращается в manual/application failure.
+
+### 15.1. HH navigation resilience
+
+**CURRENT.** Только безопасные переходы на search page и detail page вакансии получают до
+трёх попыток. После первой и второй доказанной временной сетевой ошибки ожидание составляет
+1 и 2 секунды; ожидание проверяет Stop короткими интервалами. Retry разрешён для
+`ERR_INTERNET_DISCONNECTED`, `ERR_NAME_NOT_RESOLVED`, `ERR_NETWORK_IO_SUSPENDED` и
+Playwright timeout именно операции `Page.goto`.
+
+Одна восстановившаяся ошибка не создаёт manual outcome. Если все три попытки исчерпаны,
+текущая неоткрытая вакансия также не записывается как `needs_manual_review`, а весь run
+заканчивается `STOPPED: hh_network_unavailable`. Diagnostics сохраняют operation, число
+попыток и безопасную категорию сетевой ошибки без URL/query/session data. Уже записанные
+outcomes и safety ledger сохраняются. Application/submit и проверка результата отправки
+этими retries не охватываются.
 
 ## 16. Resume selection и exact-ID safety
 
@@ -277,7 +300,8 @@ ledger хранится отдельно. Dashboard после перезапу�
 Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейчас означает
 исчерпание настроенного page budget. `no_results_or_page_not_recognized` объединяет
 0/0, parser failure и некоторые login/CAPTCHA search states и потому не доказывает
-нормальный конец выдачи.
+нормальный конец выдачи. Исчерпание bounded retries безопасной HH-навигации даёт
+`STOPPED: hh_network_unavailable`.
 
 ## 25. Known limitations
 
@@ -287,7 +311,8 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 - `pages_exhausted` — не доказательство конца HH-выдачи.
 - Standalone response form может не дать доказанно переключить exact resume ID.
 - `needs_manual_review` смешивает бизнес- и технические причины.
-- Stop latency ограничена timeout уже начатой операции.
+- Stop latency ограничена timeout уже начатой операции, включая активный `Page.goto`;
+  retry-ожидания сами по себе stop-aware.
 - Основной browser path и legacy API path сосуществуют; application через API не считается
   текущим production-маршрутом.
 

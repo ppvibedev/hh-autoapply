@@ -58,11 +58,20 @@ authenticated socket. Correlation выполняется через `stop_attemp
 ручного решения worker повторяет ту же search page или exact vacancy URL;
 таймаут завершает run как `STOPPED: hh_captcha_timeout`.
 
+Search/detail `Page.goto` дополнительно обёрнуты только на уровне безопасной навигации:
+три попытки с stop-aware задержками 1 и 2 секунды для доказанных transient network codes
+и Playwright navigation timeout. Исчерпание попыток завершает run с
+`STOPPED: hh_network_unavailable`; текущая неоткрытая vacancy не становится manual outcome.
+Application/submit этим retry-контуром не охватываются.
+
 ## LLM Router и privacy boundary
 
 `llm.generate(task=...)` выбирает enabled connections, фиксирует порядок операции,
-нормализует provider failures и выполняет bounded retries/failover. Caller получает текст
-или terminal `LLMUnavailable`/`LLMStopped`.
+нормализует provider failures и выполняет bounded retries/failover. Неизменный Groq request
+после HTTP 413 не повторяется на той же connection. После обычных двух rounds допускается один
+дополнительный recovery cycle только для временного rate limit с бюджетом ожидания 30 секунд
+на операцию и 120 секунд на run; ожидание прерывается Stop. Caller получает текст или terminal
+`LLMUnavailable`/`LLMStopped`.
 
 До router профессиональные источники проходят `sanitize_candidate_text`; persisted records
 проходят `sanitize_record`. Provider request не должен включать local credentials кроме

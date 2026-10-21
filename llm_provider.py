@@ -1,5 +1,6 @@
 """Existing provider HTTP contracts, isolated from routing and task validation."""
 import errno
+import json
 import socket
 import ssl
 
@@ -99,34 +100,73 @@ def classify_transport_failure(error):
     return 'unknown_transport'
 
 
-def _openai_compatible(connection, prompt, max_tokens):
+def _openai_payload(connection, prompt, max_tokens):
     settings = OPENAI_COMPATIBLE[connection.provider]
-    payload = {
+    return {
         'model': connection.model,
         settings['token_limit_field']: max_tokens,
         'messages': [{'role': 'user', 'content': prompt}],
         **settings['extra'],
     }
-    response = requests.post(
-        settings['url'],
-        headers={'Authorization': f'Bearer {connection.credential}',
-                 'Content-Type': 'application/json'},
-        json=payload,
-        timeout=60,
-    )
+
+
+def _groq_request_body(connection, prompt, max_tokens):
+    """Serialize Groq JSON as compact UTF-8 without changing its JSON value."""
+    if connection.provider != 'groq':
+        return None
+    payload = _openai_payload(connection, prompt, max_tokens)
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                      separators=(',', ':')).encode('utf-8')
+
+
+def _groq_request_metadata(connection, prompt, max_tokens, body=None):
+    """Return size counters only; prompt and serialized body are never retained."""
+    if connection.provider != 'groq':
+        return {}
+    if body is None:
+        body = _groq_request_body(connection, prompt, max_tokens)
+    prompt_bytes = len(prompt.encode('utf-8'))
+    return {
+        'prompt_char_count': len(prompt),
+        # A deliberately approximate, tokenizer-free diagnostic.
+        'estimated_input_tokens': max(1, (prompt_bytes + 3) // 4),
+        'request_body_bytes': len(body),
+        'requested_output_tokens': max_tokens,
+    }
+
+
+def _openai_compatible(connection, prompt, max_tokens, request_body=None):
+    settings = OPENAI_COMPATIBLE[connection.provider]
+    payload = _openai_payload(connection, prompt, max_tokens)
+    request = {
+        'headers': {'Authorization': f'Bearer {connection.credential}',
+                    'Content-Type': 'application/json'},
+        'timeout': 60,
+    }
+    if connection.provider == 'groq':
+        request['data'] = request_body if request_body is not None else _groq_request_body(
+            connection, prompt, max_tokens)
+    else:
+        request['json'] = payload
+    response = requests.post(settings['url'], **request)
     response.raise_for_status()
     return response.json()['choices'][0]['message']['content'].strip()
 
 
 def execute(connection, prompt, max_tokens):
     failure = None
+    request_body = _groq_request_body(connection, prompt, max_tokens)
+    request_metadata = _groq_request_metadata(
+        connection, prompt, max_tokens, body=request_body)
     try:
-        text = _request(connection, prompt, max_tokens)
+        text = _request(connection, prompt, max_tokens, request_body=request_body)
         if not isinstance(text, str) or not text.strip():
             return None, ProviderFailure('provider_invalid_response')
         return text, None
     except requests.HTTPError as error:
-        failure = classify_http(connection.provider, error.response) if error.response is not None else ProviderFailure('provider_http_error')
+        failure = (classify_http(connection.provider, error.response, request_metadata)
+                   if error.response is not None else ProviderFailure(
+                       'provider_http_error', **request_metadata))
     except requests.ConnectTimeout as error:
         failure = ProviderFailure('provider_transport_timeout', transport_phase='connect',
                                   transport_failure_detail=classify_transport_failure(error))
@@ -148,7 +188,7 @@ def execute(connection, prompt, max_tokens):
     return None, failure
 
 
-def _request(connection, prompt, max_tokens):
+def _request(connection, prompt, max_tokens, request_body=None):
     prov, key, model = connection.provider, connection.credential, connection.model
     if prov == "anthropic":
         r = requests.post(
@@ -169,7 +209,7 @@ def _request(connection, prompt, max_tokens):
         return r.json()["content"][0]["text"].strip()
 
     if prov in OPENAI_COMPATIBLE:
-        return _openai_compatible(connection, prompt, max_tokens)
+        return _openai_compatible(connection, prompt, max_tokens, request_body=request_body)
 
     if prov == "yandex":
         folder = connection.folder_id
