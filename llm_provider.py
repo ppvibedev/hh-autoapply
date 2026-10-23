@@ -135,13 +135,13 @@ def _groq_request_metadata(connection, prompt, max_tokens, body=None):
     }
 
 
-def _openai_compatible(connection, prompt, max_tokens, request_body=None):
+def _openai_compatible(connection, prompt, max_tokens, request_body=None, timeout=60):
     settings = OPENAI_COMPATIBLE[connection.provider]
     payload = _openai_payload(connection, prompt, max_tokens)
     request = {
         'headers': {'Authorization': f'Bearer {connection.credential}',
                     'Content-Type': 'application/json'},
-        'timeout': 60,
+        'timeout': timeout,
     }
     if connection.provider == 'groq':
         request['data'] = request_body if request_body is not None else _groq_request_body(
@@ -153,13 +153,13 @@ def _openai_compatible(connection, prompt, max_tokens, request_body=None):
     return response.json()['choices'][0]['message']['content'].strip()
 
 
-def execute(connection, prompt, max_tokens):
+def execute(connection, prompt, max_tokens, *, timeout=60):
     failure = None
     request_body = _groq_request_body(connection, prompt, max_tokens)
     request_metadata = _groq_request_metadata(
         connection, prompt, max_tokens, body=request_body)
     try:
-        text = _request(connection, prompt, max_tokens, request_body=request_body)
+        text = _request(connection, prompt, max_tokens, request_body=request_body, timeout=timeout)
         if not isinstance(text, str) or not text.strip():
             return None, ProviderFailure('provider_invalid_response')
         return text, None
@@ -188,7 +188,7 @@ def execute(connection, prompt, max_tokens):
     return None, failure
 
 
-def _request(connection, prompt, max_tokens, request_body=None):
+def _request(connection, prompt, max_tokens, request_body=None, timeout=60):
     prov, key, model = connection.provider, connection.credential, connection.model
     if prov == "anthropic":
         r = requests.post(
@@ -203,13 +203,13 @@ def _request(connection, prompt, max_tokens, request_body=None):
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=60,
+            timeout=timeout,
         )
         r.raise_for_status()
         return r.json()["content"][0]["text"].strip()
 
     if prov in OPENAI_COMPATIBLE:
-        return _openai_compatible(connection, prompt, max_tokens, request_body=request_body)
+        return _openai_compatible(connection, prompt, max_tokens, request_body=request_body, timeout=timeout)
 
     if prov == "yandex":
         folder = connection.folder_id
@@ -222,7 +222,7 @@ def _request(connection, prompt, max_tokens, request_body=None):
                 "completionOptions": {"stream": False, "temperature": 0.4, "maxTokens": str(max_tokens)},
                 "messages": [{"role": "user", "text": prompt}],
             },
-            timeout=60,
+            timeout=timeout,
         )
         r.raise_for_status()
         return r.json()["result"]["alternatives"][0]["message"]["text"].strip()
@@ -236,7 +236,7 @@ def _request(connection, prompt, max_tokens, request_body=None):
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4},
             },
-            timeout=60,
+            timeout=timeout,
         )
         r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()

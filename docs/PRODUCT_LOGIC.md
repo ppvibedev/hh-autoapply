@@ -158,14 +158,22 @@ instructions и данные вакансии. Контакты и технич�
 **CURRENT.** Поддержаны Anthropic, OpenAI, Yandex, Gemini, Groq и Z.AI; dashboard хранит
 несколько локальных connections и позволяет включать/выключать их. Legacy `.env` connection
 используется, если отдельная конфигурация отсутствует. Router фиксирует порядок доступных
-connections на операцию, выполняет bounded retries/failover и максимум два router rounds.
-Groq отправляет тот же JSON компактным UTF-8; HTTP 413 не повторяет неизменный запрос на той
-же connection в пределах операции, но не блокирует другие connections или будущие операции.
-После двух rounds временный HTTP 429 может получить один дополнительный stop-aware recovery
-cycle: не более 30 секунд ожидания на операцию и 120 секунд суммарно на run. Дневная квота и
-другие постоянные ошибки этого ожидания не получают. Долгие provider retry delays не обходятся
-ранним повтором. Исчерпание ограниченного recovery или всей инфраструктуры LLM останавливает
-run с `llm_infrastructure_unavailable`, а не запускает application без анализа.
+connections на операцию. Операция ограничена общим wall-clock deadline 120 секунд и
+максимум 12 provider attempts. HTTP connect timeout — до 5 секунд, read timeout — до 20
+секунд; оба уменьшаются при приближении deadline. Перед ожиданием проверяются доступные
+альтернативы. После двух обычных rounds временные 429, 5xx и transport timeout/connection
+могут получить дополнительные recovery-проходы в пределах deadline и лимита attempts.
+Default backoff растёт 2 → 4 → 8 → 10 секунд для connection; provider Retry-After имеет
+приоритет и не сокращается ради раннего повтора. Recovery-ожидания ограничены 30 секундами
+на операцию и 120 секундами на run; все ожидания прерываются Stop.
+Groq отправляет тот же JSON компактным UTF-8; HTTP 413 исключает повтор идентичного payload
+на той же connection в пределах операции. Дневная квота и ошибки доступа исключают
+connection до конца run. Они не получают recovery-ожиданий.
+При исчерпании deadline, attempts или recovery wait budget run останавливается с
+`llm_infrastructure_unavailable`; diagnostics различают конкретный исчерпанный лимит.
+Поздний ответ provider после deadline/Stop не используется. Пока такой запрос ещё выполняется,
+router не начинает новую операцию. Уже принятый провайдером запрос нельзя гарантированно
+отменить; HH submit этим механизмом не повторяется.
 Кнопка проверки подключения выполняет только короткий синтетический smoke-test без данных HH
 и кандидата. Статус `CONNECTED` подтверждает доступ к API на этом маленьком запросе, но не
 означает `READY` для полноразмерных matching, cover-letter или employer-question prompts.
@@ -210,6 +218,12 @@ display/matching metadata, но не могут преобразовать title
 разрешены только при exact evidence. Standalone response form без доказанного exact ID
 остаётся blocked/manual. Request identity дополнительно проверяется там, где payload
 доступен; несовпадение блокирует отправку.
+
+Само наличие CSS-visible `hidden-resume-warning` не доказывает обязательное действие.
+Persistent warning с доступным action-control сохраняет
+`resume_hidden_warning_requires_action` и никогда не обходится автоматически. Warning без
+такого control классифицируется как `selected_resume_not_verified`: submit остаётся
+запрещён, потому что exact resume ID всё ещё не подтверждён.
 
 ## 17. Employer questions
 

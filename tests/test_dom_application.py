@@ -601,7 +601,7 @@ class DOMTests(unittest.TestCase):
         for data in (transient,persistent,stopped):
             self.assertNotIn('PRIVATE',json.dumps(data))
 
-    def test_standalone_visible_resume_warning_gets_specific_diagnostic_without_action(self):
+    def test_standalone_visible_resume_warning_with_action_requires_manual_action(self):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>
           <div id="trigger" role="button" data-qa="resume-trigger"
             onclick="document.getElementById('warning').hidden=false">PRIVATE RESUME TITLE</div>
@@ -614,7 +614,8 @@ class DOMTests(unittest.TestCase):
         with patch('application._safe_url_path',return_value='/applicant/vacancy_response'):
             self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diagnostics))
         self.assertEqual(diagnostics['reason_code'],'resume_hidden_warning_requires_action')
-        self.assertEqual(diagnostics['state_reason_code'],'hidden_resume_warning_visible')
+        self.assertEqual(diagnostics['state_reason_code'],'hidden_resume_warning_actionable')
+        self.assertEqual(diagnostics['warning_actionability'],'actionable_control_present')
         self.assertEqual(diagnostics['resume_warning_snapshot']['visibility_evidence'],'visible_after_click')
         self.assertEqual(diagnostics['resume_warning_snapshot']['exact_resume_identifiers'],[
             {'source_type':'href-path','resume_id':'aaaa','matches_expected':True}])
@@ -646,9 +647,33 @@ class DOMTests(unittest.TestCase):
         with patch('application._safe_url_path',return_value='/applicant/vacancy_response'):
             self.assertFalse(app._custom_resume_choose(
                 self.page.locator('form'),'aaaa',diagnostics,stopped=lambda:True))
-        self.assertEqual(diagnostics['reason_code'],'resume_hidden_warning_requires_action')
+        self.assertEqual(diagnostics['reason_code'],'selected_resume_not_verified')
+        self.assertEqual(diagnostics['state_reason_code'],'hidden_resume_warning_non_actionable')
+        self.assertEqual(diagnostics['warning_actionability'],'no_actionable_control')
         self.assertTrue(diagnostics['stabilization_stopped'])
         self.assertEqual(self.page.evaluate('submitClicks'),0)
+
+    def test_standalone_non_actionable_warning_and_submit_do_not_prove_resume_identity(self):
+        self.page.set_content('''<form><section><div>Resume section</div>
+          <div id="trigger" role="button" data-qa="resume-trigger"
+            onclick="document.getElementById('warning').hidden=false">PRIVATE RESUME TITLE</div>
+          <div id="warning" data-qa="hidden-resume-warning" hidden
+            style="position:absolute;top:5000px">PRIVATE INFORMATIONAL WARNING</div>
+          <button id="submit" type="submit" onclick="window.submitClicks++">PRIVATE SUBMIT</button>
+          </section></form><script>window.submitClicks=0</script>''')
+        diagnostics={}
+        with patch('application._safe_url_path',return_value='/applicant/vacancy_response'):
+            self.assertFalse(app._custom_resume_choose(self.page.locator('form'),'aaaa',diagnostics))
+        self.assertEqual(diagnostics['reason_code'],'selected_resume_not_verified')
+        self.assertEqual(diagnostics['state_reason_code'],'hidden_resume_warning_non_actionable')
+        self.assertEqual(diagnostics['warning_actionability'],'no_actionable_control')
+        self.assertFalse(diagnostics['resume_warning_snapshot']['intersects_viewport'])
+        self.assertEqual(self.page.evaluate('submitClicks'),0)
+        self.assertTrue(all(snapshot['exact_target_occurrence_count'] == 0
+                            for snapshot in diagnostics['resume_identity_snapshots']))
+        encoded=json.dumps(diagnostics)
+        for private in ('PRIVATE RESUME TITLE','PRIVATE INFORMATIONAL WARNING','PRIVATE SUBMIT'):
+            self.assertNotIn(private,encoded)
 
     def _real_resume_portal(self, update):
         self.page.set_content('''<form><section><div>Резюме для отклика</div>

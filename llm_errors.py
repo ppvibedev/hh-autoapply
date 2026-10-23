@@ -64,13 +64,27 @@ def _safe_provider_error_value(value):
     return None
 
 
+def _retry_after(response):
+    value = response.headers.get('Retry-After')
+    delay = _seconds(value)
+    if delay is None and isinstance(value, str):
+        try:
+            when = parsedate_to_datetime(value)
+            if when.tzinfo:
+                delay = max(0, (when-datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return delay
+
+
 def classify_http(provider, response, request_metadata=None):
     status = response.status_code
     category = ('auth/provider_access' if status in (401, 403) else 'rate_limit_unknown'
                 if status == 429 else 'provider_server_error' if 500 <= status <= 599
                 else 'request_too_large' if provider == 'groq' and status == 413
                 else 'provider_http_error')
-    delays, quotas, provider_status = [], set(), None
+    header_delay = _retry_after(response)
+    delays, quotas, provider_status = ([header_delay] if header_delay is not None else []), set(), None
     provider_error_type = provider_error_code = None
     metadata = {key: value for key, value in (request_metadata or {}).items() if key in {
         'prompt_char_count', 'estimated_input_tokens', 'request_body_bytes',
@@ -82,20 +96,9 @@ def classify_http(provider, response, request_metadata=None):
             provider_error_type = _safe_provider_error_value(error.get('type'))
             provider_error_code = _safe_provider_error_value(error.get('code'))
         if status != 429:
-            return ProviderFailure(category, status,
+            return ProviderFailure(category, status, retry_delay=header_delay,
                                    provider_error_type=provider_error_type,
                                    provider_error_code=provider_error_code, **metadata)
-        value = response.headers.get('Retry-After')
-        delay = _seconds(value)
-        if delay is None and isinstance(value, str):
-            try:
-                when = parsedate_to_datetime(value)
-                if when.tzinfo:
-                    delay = max(0, (when - datetime.now(timezone.utc)).total_seconds())
-            except (ValueError, TypeError, OverflowError):
-                pass
-        if delay is not None:
-            delays.append(delay)
         if provider == 'gemini':
             if isinstance(error, dict):
                 if error.get('status') == 'RESOURCE_EXHAUSTED':

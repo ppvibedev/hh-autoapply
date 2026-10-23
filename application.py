@@ -982,6 +982,15 @@ def _resume_warning_snapshot(form, resume_id):
     return value if isinstance(value,dict) else None
 
 
+def _resume_warning_actionability(snapshot):
+    """Classify only structural actionability; warning text remains private."""
+    if not isinstance(snapshot,dict) or snapshot.get('visible') is not True:
+        return 'warning_not_visible'
+    if snapshot.get('actionable_control_count',0) > 0:
+        return 'actionable_control_present'
+    return 'no_actionable_control'
+
+
 def _resume_warning_was_visible(snapshots):
     for snapshot in snapshots:
         for event in snapshot.get('mutation_events',[]):
@@ -1451,9 +1460,17 @@ def _custom_resume_choose(form, resume_id, diagnostics, evidence=None, vacancy_i
             warning['visibility_evidence'] = ('visible_after_click' if warning.get('visible') is True
                                               else 'visible_transition_observed')
             diagnostics['resume_warning_snapshot'] = warning
-            diagnostics.update(_stabilize_resume_warning(form,resume_id,warning,stopped))
-            diagnostics.update(reason_code='resume_hidden_warning_requires_action',
-                               state_reason_code='hidden_resume_warning_visible')
+            stabilization = _stabilize_resume_warning(form,resume_id,warning,stopped)
+            diagnostics.update(stabilization)
+            actionability = _resume_warning_actionability(
+                stabilization.get('warning_stabilized_state'))
+            diagnostics['warning_actionability'] = actionability
+            if stabilization.get('warning_persisted') and actionability == 'actionable_control_present':
+                diagnostics.update(reason_code='resume_hidden_warning_requires_action',
+                                   state_reason_code='hidden_resume_warning_actionable')
+            else:
+                diagnostics.update(reason_code='selected_resume_not_verified',
+                                   state_reason_code='hidden_resume_warning_non_actionable')
         else:
             diagnostics.update(reason_code='resume_popup_not_opened',state_reason_code='chooser_not_opened')
         return False

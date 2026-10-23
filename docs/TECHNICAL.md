@@ -68,10 +68,18 @@ Application/submit этим retry-контуром не охватываются
 
 `llm.generate(task=...)` выбирает enabled connections, фиксирует порядок операции,
 нормализует provider failures и выполняет bounded retries/failover. Неизменный Groq request
-после HTTP 413 не повторяется на той же connection. После обычных двух rounds допускается один
-дополнительный recovery cycle только для временного rate limit с бюджетом ожидания 30 секунд
-на операцию и 120 секунд на run; ожидание прерывается Stop. Caller получает текст или terminal
-`LLMUnavailable`/`LLMStopped`.
+после HTTP 413 не повторяется на той же connection. Сначала проверяются альтернативы,
+затем retries/recovery: operation deadline 120 с, максимум 12 attempts, connect/read timeout
+до 5/20 с. Default backoff 2/4/8/10 с; Retry-After не сокращается. После обычных двух rounds
+recovery временных 429/5xx/transport failures повторяется до лимитов: ожидание 30 с/operation,
+120 с/run. Stop прерывает ожидания и ожидание provider response.
+Provider I/O изолирован в daemon worker: caller ждёт результат до общего monotonic deadline,
+поздний ответ игнорируется; незавершённый worker блокирует новые операции этого router.
+Принудительная отмена уже принятого API-запроса не гарантирована. Caller получает текст или
+terminal `LLMUnavailable`/`LLMStopped`. Диагностика содержит UTC start/end, provider attempt
+и wait time, attempts, причины исключений/лимита и источник retry delay provider/default;
+без prompt/response и credentials.
+
 
 До router профессиональные источники проходят `sanitize_candidate_text`; persisted records
 проходят `sanitize_record`. Provider request не должен включать local credentials кроме
@@ -104,6 +112,10 @@ resume chooser/validation, application request/confirmation и Stop lifecycle.
 stop-aware стабилизационная проверка длительностью до 400 мс; initial/stabilized snapshots
 показывают, сохранился warning или исчез. Hit-test одной точки и clipping являются
 диагностическими сигналами, а не доказательством пользовательской видимости.
+
+CSS-visible warning классифицируется как `resume_hidden_warning_requires_action` только
+когда после стабилизации в нём остаётся доступный action-control. Без такого control reason
+становится `selected_resume_not_verified`; exact-ID guard и запрет submit не меняются.
 
 При неоткрывшемся chooser отдельная bounded-сводка фиксирует тип response state, наличие
 active scope, безопасное состояние trigger, popup/option counts до и после клика, transient

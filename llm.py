@@ -1,5 +1,8 @@
 """Shared LLM facade: stable task contract, bounded deterministic failover."""
 import time
+import queue
+import threading
+from datetime import datetime, timezone
 import requests  # Compatibility for existing offline patches of llm.requests.post.
 from uuid import uuid4
 import config
@@ -25,6 +28,11 @@ RUN_PERMANENT_CATEGORIES = frozenset({
 ROUTER_ROUNDS = 2
 RECOVERY_OPERATION_WAIT_LIMIT = 30.0
 RECOVERY_RUN_WAIT_LIMIT = 120.0
+OPERATION_DEADLINE = 120.0
+MAX_OPERATION_ATTEMPTS = 12
+CONNECT_TIMEOUT = 5.0
+READ_TIMEOUT = 20.0
+MAX_BACKOFF = 10.0
 
 
 def _failure_scope(failure):
@@ -46,6 +54,7 @@ class Router:
         self.operation_id_factory = operation_id_factory or (lambda: uuid4().hex)
         self.stopped = stopped
         self.recovery_wait_used = 0.0
+        self._pending_provider = None
 
     def set_telemetry(self, telemetry):
         self.telemetry = telemetry
@@ -107,12 +116,47 @@ class Router:
             active = connection
         return tuple(order)
 
+    def _execute_before_deadline(self, connection, prompt, max_tokens, deadline):
+        # A socket read timeout alone cannot bound DNS or a trickling response.
+        # Only this worker performs provider I/O; it never updates router/HH state.
+        result = queue.Queue(maxsize=1)
+        remaining = max(0.001, deadline - self.clock())
+        timeout = (min(CONNECT_TIMEOUT, remaining / 2),
+                   min(READ_TIMEOUT, remaining / 2))
+        def request():
+            try:
+                result.put((execute(connection, prompt, max_tokens, timeout=timeout), None))
+            except Exception as error:
+                result.put((None, error))
+        worker = threading.Thread(target=request, daemon=True)
+        self._pending_provider = worker
+        worker.start()
+        while True:
+            self._check_stopped()
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return None
+            try:
+                value, error = result.get(timeout=min(0.05, remaining))
+                if error is not None:
+                    raise error
+                self._pending_provider = None
+                return value
+            except queue.Empty:
+                continue
+
     def generate(self, prompt, max_tokens=600, task='text'):
         if task not in TASKS:
             raise ValueError('llm_task_unsupported')
         self._check_stopped()
         operation_id = self.operation_id_factory()
         operation_clock = self.clock()
+        deadline = operation_clock + OPERATION_DEADLINE
+        started_at = datetime.now(timezone.utc).isoformat()
+        provider_time_ms = 0
+        wait_time_ms = 0
+        exhaustion_reason = None
+        failure_counts = {}
         operation_start = len(self.failures)
         attempt_count = 0
         final_connection_id = None
@@ -138,16 +182,46 @@ class Router:
                        duration_ms=self._elapsed_ms(operation_clock), outcome=outcome,
                        final_connection_id=final_connection_id,
                        total_provider_attempt_count=attempt_count,
-                       router_rounds_started=rounds_started)
+                       router_rounds_started=rounds_started,
+                       started_at=started_at, finished_at=datetime.now(timezone.utc).isoformat(),
+                       provider_attempt_time_ms=provider_time_ms, wait_time_ms=wait_time_ms,
+                       exhaustion_reason=exhaustion_reason)
 
         self._emit('llm_operation_started', operation_id=operation_id, task=task,
-                   operation_elapsed_ms=0)
+                   operation_elapsed_ms=0, started_at=started_at,
+                   operation_deadline_ms=round(OPERATION_DEADLINE*1000),
+                   max_provider_attempts=MAX_OPERATION_ATTEMPTS)
         try:
             prompt = sanitize_candidate_text(
                 prompt, tuple(c.credential for c in self.connections) + (config.ACCESS_TOKEN,))
+            if self._pending_provider is not None and self._pending_provider.is_alive():
+                exhaustion_reason = 'previous_provider_request_in_flight'
+                self._emit('llm_connections_exhausted', operation_id=operation_id, task=task,
+                           reason_category=exhaustion_reason)
+                raise LLMUnavailable()
             operation_order = self._operation_candidates()
-            for router_round in range(1, ROUTER_ROUNDS + 2):
+            def check_limits():
+                nonlocal exhaustion_reason
+                if self.clock() >= deadline:
+                    exhaustion_reason = 'operation_deadline_exhausted'
+                elif attempt_count >= MAX_OPERATION_ATTEMPTS:
+                    exhaustion_reason = 'operation_attempt_limit_exhausted'
+                if exhaustion_reason:
+                    self._emit('llm_connections_exhausted', operation_id=operation_id, task=task,
+                               reason_category=exhaustion_reason,
+                               operation_elapsed_ms=self._elapsed_ms(operation_clock))
+                    raise LLMUnavailable(self.failures)
+            def wait(delay):
+                nonlocal wait_time_ms
+                before = self.clock()
+                try:
+                    self._interruptible_sleep(min(delay, max(0.0, deadline-self.clock())))
+                finally:
+                    wait_time_ms += self._elapsed_ms(before)
+                check_limits()
+            for router_round in range(1, MAX_OPERATION_ATTEMPTS + ROUTER_ROUNDS + 1):
                 self._check_stopped()
+                check_limits()
                 recovery_cycle = router_round > ROUTER_ROUNDS
                 if recovery_cycle:
                     candidates = [connection for connection in operation_order
@@ -161,7 +235,7 @@ class Router:
                     recovery_cycle_attempted = True
                     self._emit('llm_rate_limit_recovery_started',
                                operation_id=operation_id, task=task,
-                               recovery_cycle=1,
+                               recovery_cycle=router_round - ROUTER_ROUNDS,
                                eligible_connection_count=len(candidates),
                                operation_wait_budget_ms=round(
                                    RECOVERY_OPERATION_WAIT_LIMIT * 1000),
@@ -222,7 +296,7 @@ class Router:
                             recovery_budget_exhausted = True
                             self._emit('llm_rate_limit_recovery_connection_skipped',
                                        operation_id=operation_id, task=task,
-                                       recovery_cycle=1,
+                                       recovery_cycle=router_round - ROUTER_ROUNDS,
                                        connection_id=connection.id,
                                        provider=connection.provider, model=connection.model,
                                        reason_category='recovery_wait_budget_exhausted',
@@ -235,7 +309,7 @@ class Router:
                         if remaining_delay > 0:
                             wait_common = dict(
                                 operation_id=operation_id, task=task,
-                                recovery_cycle=1,
+                                recovery_cycle=router_round - ROUTER_ROUNDS,
                                 connection_id=connection.id,
                                 provider=connection.provider, model=connection.model,
                                 requested_delay_ms=round(remaining_delay * 1000),
@@ -245,7 +319,7 @@ class Router:
                             wait_clock = self.clock()
                             recovery_wait_used += remaining_delay
                             self.recovery_wait_used += remaining_delay
-                            self._interruptible_sleep(remaining_delay)
+                            wait(remaining_delay)
                             self._emit('llm_rate_limit_recovery_wait_finished', **wait_common,
                                        actual_duration_ms=self._elapsed_ms(wait_clock),
                                        operation_wait_used_ms=round(
@@ -267,7 +341,7 @@ class Router:
                             self._emit('llm_router_round_wait_started', **wait_common,
                                        operation_elapsed_ms=self._elapsed_ms(operation_clock))
                             wait_clock = self.clock()
-                            self._interruptible_sleep(remaining_delay)
+                            wait(remaining_delay)
                             self._emit('llm_router_round_wait_finished', **wait_common,
                                        actual_duration_ms=self._elapsed_ms(wait_clock),
                                        operation_elapsed_ms=self._elapsed_ms(operation_clock))
@@ -277,6 +351,7 @@ class Router:
                     attempts_for_connection = 1 if recovery_cycle else RATE_RETRIES + 1
                     for attempt in range(attempts_for_connection):
                         self._check_stopped()
+                        check_limits()
                         attempt_count += 1
                         if recovery_cycle:
                             recovery_attempt_count += 1
@@ -287,11 +362,24 @@ class Router:
                                       provider=connection.provider,
                                       model=connection.model, attempt=attempt_number)
                         if recovery_cycle:
-                            common['recovery_cycle'] = 1
+                            common['recovery_cycle'] = router_round - ROUTER_ROUNDS
                         self._emit('llm_attempt_started', **common,
                                    operation_elapsed_ms=self._elapsed_ms(operation_clock))
                         attempt_clock = self.clock()
-                        text, failure = execute(connection, prompt, max_tokens)
+                        try:
+                            value = self._execute_before_deadline(connection, prompt, max_tokens, deadline)
+                        finally:
+                            provider_time_ms += self._elapsed_ms(attempt_clock)
+                        if value is None:
+                            exhaustion_reason = 'operation_deadline_exhausted'
+                            self._emit('llm_attempt_finished', **common,
+                                       outcome='deadline', duration_ms=self._elapsed_ms(attempt_clock))
+                            self._emit('llm_connections_exhausted', operation_id=operation_id, task=task,
+                                       reason_category=exhaustion_reason)
+                            raise LLMUnavailable(self.failures)
+                        text, failure = value
+                        if self.clock() >= deadline:
+                            check_limits()
                         self._check_stopped()
                         attempt_duration = self._elapsed_ms(attempt_clock)
                         if failure is None:
@@ -329,12 +417,15 @@ class Router:
                         final_failure = failure
                         failure_scope = _failure_scope(failure)
                         run_permanent = failure_scope == 'run_permanent'
-                        delay = (failure.retry_delay if failure.retry_delay is not None
-                                 else DEFAULT_RETRY_DELAY)
+                        failure_counts[connection.id] = failure_counts.get(connection.id, 0) + 1
+                        delay_source = 'provider' if failure.retry_delay is not None else 'default'
+                        delay = (failure.retry_delay if failure.retry_delay is not None else
+                                 min(MAX_BACKOFF, DEFAULT_RETRY_DELAY *
+                                     2 ** min(3, failure_counts[connection.id]-1)))
                         if failure.category == 'request_too_large':
                             payload_rejected_connections.add(connection.id)
                         if (not run_permanent
-                                and failure.category in TRANSIENT_RATE_LIMIT_CATEGORIES):
+                                and failure.category in RETRYABLE_CATEGORIES):
                             transient_ready_at[connection.id] = (
                                 self.clock() + max(1.0, delay))
                         else:
@@ -343,7 +434,9 @@ class Router:
                                            and failure.category in RETRYABLE_CATEGORIES
                                            and attempt < RATE_RETRIES
                                            and delay <= MAX_RETRY_DELAY
-                                           and not recovery_cycle)
+                                           and not recovery_cycle
+                                           and not any(c.id not in self.unavailable
+                                                       for c in candidates[connection_index + 1:]))
                         remaining_this_round = [
                             candidate for candidate in candidates[connection_index + 1:]
                             if candidate.id not in self.unavailable
@@ -370,9 +463,9 @@ class Router:
                             connection_id=connection.id, provider=connection.provider,
                             task=task, router_round=router_round,
                             attempt=attempt_number, retry_scheduled=retry_scheduled,
-                            failure_scope=failure_scope, **failure.public())
+                            failure_scope=failure_scope, retry_delay_source=delay_source, **failure.public())
                         if recovery_cycle:
-                            failure_record['recovery_cycle'] = 1
+                            failure_record['recovery_cycle'] = router_round - ROUTER_ROUNDS
                         if retry_scheduled:
                             # Keep the diagnostic delay equal to the short wait actually used.
                             failure_record['retry_delay'] = max(1.0, delay)
@@ -382,6 +475,7 @@ class Router:
                                    operation_elapsed_ms=self._elapsed_ms(operation_clock),
                                    outcome='failure', provider_error_category=failure.category,
                                    http_status=failure.http_status,
+                                   retry_delay_source=delay_source, retry_delay_seconds=delay,
                                    transport_phase=failure.transport_phase,
                                    transport_failure_detail=failure.transport_failure_detail,
                                    provider_error_type=failure.provider_error_type,
@@ -395,6 +489,9 @@ class Router:
                                    failover_follows=failover_follows,
                                    connection_unavailable_after_attempt=(
                                        run_permanent and not retry_scheduled))
+                        if run_permanent or failure.category == 'request_too_large':
+                            self._emit('llm_connection_excluded', **common,
+                                       reason_category=failure.category, failure_scope=failure_scope)
                         if not retry_scheduled:
                             break
                         self._check_stopped()
@@ -404,7 +501,7 @@ class Router:
                                    operation_elapsed_ms=self._elapsed_ms(operation_clock))
                         wait_clock = self.clock()
                         # Never retry earlier than a provider's long delay merely to cap our wait.
-                        self._interruptible_sleep(requested_delay)
+                        wait(requested_delay)
                         self._emit('llm_retry_wait_finished', **common,
                                    requested_delay_ms=round(requested_delay * 1000),
                                    actual_duration_ms=self._elapsed_ms(wait_clock),
@@ -413,9 +510,7 @@ class Router:
                         self.unavailable.add(connection.id)
                     elif (router_round == 1
                           and final_failure.category in RETRYABLE_CATEGORIES):
-                        cooldown = (final_failure.retry_delay
-                                    if final_failure.retry_delay is not None
-                                    else DEFAULT_RETRY_DELAY)
+                        cooldown = delay
                         if cooldown > MAX_RETRY_DELAY:
                             round_two_excluded.add(connection.id)
                         else:
@@ -435,11 +530,11 @@ class Router:
                                    operation_elapsed_ms=self._elapsed_ms(operation_clock))
             if not exhaustion_emitted:
                 exhaustion_emitted = True
-                if (recovery_attempt_count and final_failure
+                if recovery_budget_exhausted:
+                    exhaustion_reason = 'recovery_wait_budget_exhausted'
+                elif (recovery_attempt_count and final_failure
                         and final_failure.category in TRANSIENT_RATE_LIMIT_CATEGORIES):
                     exhaustion_reason = 'transient_rate_limit_recovery_exhausted'
-                elif recovery_budget_exhausted:
-                    exhaustion_reason = 'recovery_wait_budget_exhausted'
                 else:
                     exhaustion_reason = (final_failure.category if final_failure
                                          else 'no_usable_connections')
