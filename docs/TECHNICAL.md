@@ -50,13 +50,30 @@ Title извлекается из атомарного `resumes.json`, посл�
 ## Control channel
 
 Worker создаёт private Unix socket и `state/run.pid` v2 с PID/run ID/control token. Token
-не попадает в diagnostics. Same-dashboard Stop использует process handle; recovered Stop —
-authenticated socket. Correlation выполняется через `stop_attempt_id`.
+не попадает в diagnostics. Same-dashboard и recovered Stop сначала используют
+authenticated socket; для same-dashboard остаётся fallback через process handle.
+Correlation выполняется через `stop_attempt_id`. Heartbeat каждые 10 секунд фиксирует
+этап и vacancy ID; после 180 секунд без прогресса watchdog пишет `operation_timeout`
+и запрашивает кооперативный Stop. Он не убивает начатый Playwright-вызов: перед ручной
+эскалацией необходимо проверить submit/safety ledger.
+Stage `application_route_setup` отделяет регистрацию Playwright request guard от
+`application_submit` и `application_confirm`; это позволяет отличить зависание до
+отправки от ожидания после потенциального побочного эффекта.
 
-Доказанная HH CAPTCHA на search/detail navigation переводит worker в общий
-`captcha_wait`: stop-aware polling раз в секунду, timeout 120 секунд. После
-ручного решения worker повторяет ту же search page или exact vacancy URL;
-таймаут завершает run как `STOPPED: hh_captcha_timeout`.
+Доказанная HH CAPTCHA на search/detail/application переводит worker в общий
+`captcha_wait`. События содержат только run ID, vacancy ID и безопасный URL path.
+Worker остаётся на текущем контексте до authenticated `captcha_continue` и проверки
+ожидаемой структуры HH. `CAPTCHA_REMINDER_SECONDS` пишет событие истечения срока,
+но не закрывает браузер. После потенциального submit сохраняется `submission_unknown`
+и submit не повторяется.
+
+`anti_captcha.py` классифицирует видимые iframe-маркеры по заранее разрешённым
+host/path префиксам. Worker вызывает только этот пассивный снимок при входе в
+`captcha_wait`; тип и ограниченные счётчики сохраняются в `captcha_wait_started` и
+показываются в dashboard. Клиент `getBalance` с кешем и безопасный `getTaskResult`
+с ограниченным Stop-aware polling не вызываются worker. Платные задачи не создаются,
+решение к HH не применяется. Бюджетный preflight закрыт по умолчанию; его недостаточно для
+гарантии дневного лимита после перезапуска.
 
 Search/detail `Page.goto` дополнительно обёрнуты только на уровне безопасной навигации:
 три попытки с stop-aware задержками 1 и 2 секунды для доказанных transient network codes

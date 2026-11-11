@@ -40,6 +40,34 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertTrue(result["stopped"])
         proc.terminate.assert_called_once()
 
+    def test_in_memory_stop_prefers_authenticated_worker_channel(self):
+        proc = MagicMock(); proc.poll.return_value = None; proc.pid = 4242
+        with patch.object(webapp, "_proc", proc), \
+             patch("webapp._read_run_state", return_value=self.state()), \
+             patch("webapp._control_request", return_value={"ok": True,
+                   "status": "stop_requested"}) as control:
+            result = webapp._kill_all_runs("attempt-12345678")
+        self.assertEqual(result["delivery_path"], "authenticated_control_socket")
+        self.assertTrue(result["delivery_accepted"])
+        self.assertEqual(control.call_args.args[1:], ("stop", "attempt-12345678"))
+        proc.terminate.assert_not_called()
+
+    def test_worker_stall_reports_safe_metadata_and_requests_cooperative_stop(self):
+        rows, now = [], [0.0]
+        progress = run_web._WorkerProgress("a" * 32, rows.append, clock=lambda: now[0])
+        progress.mark("application", "123456789")
+        now[0] = run_web.WORKER_OPERATION_STALL_SECONDS + 1
+        waits = iter((False, True))
+        with patch.object(progress.closed, "wait", side_effect=lambda _n: next(waits)), \
+             patch("run_web._request_stop") as stop:
+            progress._watch()
+        self.assertEqual([r["event"] for r in rows],
+                         ["operation_started", "worker_heartbeat", "operation_timeout"])
+        self.assertEqual(rows[-2]["state"], "stalled")
+        self.assertEqual(rows[-1]["vacancy_context_id"], "123456789")
+        stop.assert_called_once()
+        self.assertNotIn("resume", json.dumps(rows).lower())
+
     def test_recovered_authenticated_worker_receives_stop(self):
         attempt_id = "stop-attempt-recovered-1234"
         state = self.state(token="t" * 43)

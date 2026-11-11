@@ -585,7 +585,8 @@ class SafeTests(unittest.TestCase):
     def test_history_and_errors_do_not_reveal_contacts(self):
         run_web._log(dict(reason='person@example.test +7 (999) 123-45-67'))
         text=Path(config.DECISIONS_LOG).read_text()
-        self.assertNotIn('person@example.test',text); self.assertNotIn('999',text)
+        self.assertNotIn('person@example.test',text)
+        self.assertNotIn('999',json.loads(text)['reason'])  # timestamps may contain these digits
         self.assertEqual(run_web._error_code(RuntimeError('arbitrary_private_value')), 'RuntimeError')
 
     def test_matching_result_is_sanitized_before_persistence(self):

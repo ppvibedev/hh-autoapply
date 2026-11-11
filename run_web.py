@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import config
+import anti_captcha
 import decide
 import llm
 from llm_errors import LLMUnavailable, LLMStopped
@@ -30,10 +31,14 @@ _active_stage = "run_setup"
 _worker_stop_ack_logged = False
 _worker_stop_observed_logged = False
 _active_stop_attempt_id = None
+_captcha_resume_requested = threading.Event()
+_captcha_wait_active = threading.Event()
 _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 LIVE_HISTORY_REREAD_DELAY_SECONDS = 0.02
-CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS = 120
+CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS = config.CAPTCHA_REMINDER_SECONDS
 CAPTCHA_POLL_INTERVAL_SECONDS = 1
+WORKER_HEARTBEAT_SECONDS = 10
+WORKER_OPERATION_STALL_SECONDS = 180
 HH_NAVIGATION_MAX_ATTEMPTS = 3
 HH_NAVIGATION_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 HH_NAVIGATION_RETRY_POLL_SECONDS = 0.1
@@ -44,13 +49,6 @@ _HH_TRANSIENT_NETWORK_MARKERS = {
 }
 
 
-class HHCaptchaTimeout(RuntimeError):
-    """Manual CAPTCHA was not resolved within the product timeout."""
-
-    def __init__(self):
-        super().__init__("hh_captcha_timeout")
-
-
 class HHNetworkUnavailable(RuntimeError):
     """Bounded safe navigation retries could not restore HH connectivity."""
 
@@ -59,6 +57,78 @@ class HHNetworkUnavailable(RuntimeError):
         self.operation = operation
         self.network_error_code = network_error_code
         self.attempts = attempts
+
+
+class _WorkerProgress:
+    """Observe a synchronous worker; a stalled Playwright call is not killed here."""
+    def __init__(self, run_id, telemetry, clock=None):
+        self.run_id = run_id
+        self.telemetry = telemetry
+        self.clock = clock or time.perf_counter
+        self.lock = threading.Lock()
+        self.closed = threading.Event()
+        self.operation = None
+        self.stage = "run_setup"
+        self.vacancy_id = None
+        self.changed_at = self.clock()
+        self.timeout_reported = False
+        self.thread = threading.Thread(target=self._watch, name="worker-heartbeat", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def mark(self, stage, vacancy_id=None):
+        now = self.clock()
+        with self.lock:
+            previous = self.operation
+            previous_vacancy_id = self.vacancy_id
+            elapsed = max(0, round((now - self.changed_at) * 1000))
+            self.operation = stage
+            self.stage = stage
+            self.vacancy_id = vacancy_id
+            self.changed_at = now
+            self.timeout_reported = False
+        if previous is not None:
+            self.telemetry({"event": "operation_finished", "run_id": self.run_id,
+                            "operation": previous, "vacancy_context_id": previous_vacancy_id,
+                            "elapsed_ms": elapsed})
+        self.telemetry({"event": "operation_started", "run_id": self.run_id,
+                        "operation": stage, "vacancy_context_id": vacancy_id})
+
+    def tick(self):
+        with self.lock:
+            self.changed_at = self.clock()
+            self.timeout_reported = False
+
+    def _watch(self):
+        while not self.closed.wait(WORKER_HEARTBEAT_SECONDS):
+            with self.lock:
+                operation, stage, vacancy_id = self.operation, self.stage, self.vacancy_id
+                elapsed = max(0, self.clock() - self.changed_at)
+                timed_out = (operation is not None and stage != "captcha_wait"
+                             and elapsed >= WORKER_OPERATION_STALL_SECONDS
+                             and not self.timeout_reported)
+                if timed_out:
+                    self.timeout_reported = True
+            self.telemetry({"event": "worker_heartbeat", "run_id": self.run_id,
+                            "stage": stage, "vacancy_context_id": vacancy_id,
+                            "operation": operation,
+                            "state": ("paused_for_captcha" if stage == "captcha_wait"
+                                      else "stalled" if self.timeout_reported
+                                      else "waiting" if elapsed >= WORKER_HEARTBEAT_SECONDS
+                                      else "working"),
+                            "seconds_since_progress": round(elapsed)})
+            if timed_out:
+                self.telemetry({"event": "operation_timeout", "run_id": self.run_id,
+                                "stage": stage, "vacancy_context_id": vacancy_id,
+                                "operation": operation,
+                                "timeout_seconds": WORKER_OPERATION_STALL_SECONDS,
+                                "action": "cooperative_stop_requested"})
+                _request_stop()  # Playwright sync calls cannot safely be killed from this thread.
+
+    def close(self):
+        self.closed.set()
+        self.thread.join(timeout=0.5)
 
 
 def _navigation_error_code(error):
@@ -135,10 +205,11 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                              stopped=None, telemetry=None, on_stage=None, clock=None, sleep=None,
                              timeout_seconds=CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS,
                              poll_seconds=CAPTCHA_POLL_INTERVAL_SECONDS):
-    """Wait for a user to clear a proven HH CAPTCHA without doing other work."""
+    """Hold the same operation until explicit user continuation and HH state check."""
     clock = clock or time.monotonic
     sleep = sleep or time.sleep
     stopped = stopped or _observe_stop
+    challenge_structure = anti_captcha.capture_challenge_structure(page)
 
     def emit(event):
         if telemetry is None:
@@ -147,24 +218,36 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                "timeout_seconds": timeout_seconds}
         if vacancy_id is not None:
             row["vacancy_id"] = str(vacancy_id)
+        row["page_path"] = hh_web.safe_captcha_path(page)
+        if event == "captcha_wait_started":
+            row.update(challenge_structure)
         telemetry(row)
 
     if on_stage is not None:
         on_stage("captcha_wait")
+    _captcha_resume_requested.clear()
+    _captcha_wait_active.set()
     emit("captcha_wait_started")
-    deadline = clock() + timeout_seconds
-    while True:
-        if stopped():
-            emit("captcha_wait_stopped")
-            raise LLMStopped()
-        if not hh_web.captcha_present(page):
-            break
-        remaining = deadline - clock()
-        if remaining <= 0:
-            emit("captcha_wait_timeout")
-            raise HHCaptchaTimeout()
-        sleep(min(poll_seconds, remaining))
-    emit("captcha_wait_resolved")
+    started = clock()
+    expiry_reported = False
+    try:
+        while True:
+            if stopped():
+                emit("captcha_wait_stopped")
+                raise LLMStopped()
+            if _captcha_resume_requested.is_set():
+                _captcha_resume_requested.clear()
+                if hh_web.captcha_resolution_verified(page, operation, vacancy_id):
+                    emit("captcha_wait_resolved")
+                    return
+                emit("captcha_resume_rejected")
+            if not expiry_reported and clock() - started >= timeout_seconds:
+                emit("captcha_wait_expired")
+                expiry_reported = True
+            sleep(poll_seconds)
+    finally:
+        _captcha_wait_active.clear()
+        _captcha_resume_requested.clear()
 
 
 class LiveHistoryCorrupt(ValueError):
@@ -222,7 +305,7 @@ class _RunControl:
                     request = json.loads(raw.decode("utf-8"))
                     allowed = (isinstance(request, dict)
                                and secrets.compare_digest(str(request.get("token", "")), self.token)
-                               and request.get("action") in ("probe", "stop"))
+                               and request.get("action") in ("probe", "stop", "captcha_continue"))
                     if not allowed:
                         connection.sendall(b'{"ok":false}')
                         continue
@@ -235,6 +318,12 @@ class _RunControl:
                         _request_stop(stop_attempt_id=attempt_id)
                         _worker_stop_acknowledged("authenticated_control_socket", attempt_id)
                         connection.sendall(b'{"ok":true,"status":"stop_requested"}')
+                    elif request["action"] == "captcha_continue":
+                        if _captcha_wait_active.is_set():
+                            _captcha_resume_requested.set()
+                            connection.sendall(b'{"ok":true,"status":"captcha_continue_requested"}')
+                        else:
+                            connection.sendall(b'{"ok":false,"status":"captcha_not_waiting"}')
                     else:
                         connection.sendall(b'{"ok":true,"status":"active"}')
                 except (OSError, UnicodeError, ValueError, TypeError):
@@ -456,6 +545,8 @@ def _get_resume(page, resume_id, on_stage=None):
 def main():
     global _stop_requested, _active_run_id, _active_stage, _worker_stop_ack_logged, _worker_stop_observed_logged, _active_stop_attempt_id
     _stop_requested = False
+    _captcha_resume_requested.clear()
+    _captcha_wait_active.clear()
     llm.reset_runtime()
     mode = "SAFE" if config.DRY_RUN else "LIVE"
     run_id = uuid4().hex
@@ -476,14 +567,19 @@ def main():
     halt = False
     stage = "run_setup"
     current_vacancy_id = None
+    progress = None
     consecutive_description_not_found = 0
     def mark_stage(value):
         nonlocal stage
         global _active_stage
         stage = value
         _active_stage = value
+        if progress is not None:
+            progress.mark(value, current_vacancy_id)
 
     def record_llm_timing(event):
+        if progress is not None:
+            progress.tick()
         row = dict(event, run_id=run_id)
         if current_vacancy_id is not None:
             row["vacancy_context_id"] = current_vacancy_id
@@ -548,6 +644,8 @@ def main():
                   "search_period": config.SEARCH_PERIOD,
                   "order_by": config.ORDER_BY,
               }})
+        progress = _WorkerProgress(run_id, _log)
+        progress.start()
         print(mode + (": поиск и анализ; отправка заблокирована." if mode == "SAFE" else ": реальные отклики разрешены для этого запуска."), flush=True)
         seen_this_run = set()  # SAFE не использует и не меняет старый seen.json.
         with browser_context(on_stage=mark_stage) as (_, page):
@@ -720,10 +818,27 @@ def main():
                                               "vacancy_id":vid, "selected_resume_id":resume_id,
                                               "application_status":"submission_unknown"})
                                         blocked_vacancies[vid] = "submission_unknown"
-                                    outcome = hh_web.apply(page, full, entry["letter"], dry_run=False,
-                                        resume_url=config.RESUME_URL, resume_text=resume_text,
-                                        candidate_text=materials, instructions=instructions,
-                                        stopped=_observe_stop, before_submit=before_submit)
+                                    while True:
+                                        outcome = hh_web.apply(page, full, entry["letter"], dry_run=False,
+                                            resume_url=config.RESUME_URL, resume_text=resume_text,
+                                            candidate_text=materials, instructions=instructions,
+                                            stopped=_observe_stop, before_submit=before_submit,
+                                            on_stage=mark_stage)
+                                        captcha_reason = outcome.get("reason")
+                                        if captcha_reason not in ("captcha_before_submit", "captcha_after_possible_submit"):
+                                            break
+                                        if captcha_reason == "captcha_after_possible_submit":
+                                            history_store.record_safety(
+                                                config.APPLICATION_SAFETY_FILE, vid, "submission_unknown")
+                                            blocked_vacancies[vid] = "submission_unknown"
+                                        _wait_for_manual_captcha(
+                                            page, operation=("application_pre_submit" if captcha_reason == "captcha_before_submit"
+                                                             else "application_post_submit"),
+                                            run_id=run_id, vacancy_id=vid, stopped=_observe_stop,
+                                            telemetry=_log, on_stage=mark_stage)
+                                        if captcha_reason == "captcha_after_possible_submit":
+                                            break  # Persistent unknown result: never retry this submit.
+                                        mark_stage("application")
                                     entry.update(outcome)
                                     status = outcome["application_status"]
                                     entry["decision"] = status
@@ -747,8 +862,6 @@ def main():
                     except LLMStopped:
                         halt, run_status, stop_reason = True, "STOPPED", "user_stop"
                         break
-                    except HHCaptchaTimeout:
-                        raise
                     except LLMUnavailable as error:
                         halt, run_status, stop_reason = True, "STOPPED", "llm_infrastructure_unavailable"
                         entry.update(_exception_details(error, stage))
@@ -782,8 +895,6 @@ def main():
                   **_exception_details(error, stage)))
     except LLMStopped:
         run_status, stop_reason = "STOPPED", "user_stop"
-    except HHCaptchaTimeout:
-        run_status, stop_reason = "STOPPED", "hh_captcha_timeout"
     except LLMUnavailable as error:
         run_status, stop_reason = "STOPPED", "llm_infrastructure_unavailable"
         _log(dict(event="run_error", run_id=run_id, reason_code=stop_reason,
@@ -796,6 +907,8 @@ def main():
         print(json.dumps(diagnostic, ensure_ascii=False), flush=True)
         print("Прогон остановлен:", stop_reason, flush=True)
     finally:
+        if progress is not None:
+            progress.close()
         final = {"event": "run_finished", "run_id": run_id, "mode": mode, "status": run_status,
                  "stop_reason": stop_reason, "counts": counts}
         if (stop_reason == "user_stop" and isinstance(_active_stop_attempt_id, str)

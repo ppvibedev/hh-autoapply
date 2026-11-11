@@ -127,8 +127,39 @@ def captcha_present(page) -> bool:
         path = "[unknown]"
     if path in ("/captcha", "/account/captcha"):
         return True
-    count = _safe_count(page, '[data-qa*="captcha"]')
-    return count is not None and count > 0
+    count = _safe_count(page, '[data-qa*="captcha"]:visible')
+    return isinstance(count, int) and not isinstance(count, bool) and count > 0
+
+
+def safe_captcha_path(page) -> str:
+    """Return only a recognized HH path; never query, fragment or private URL."""
+    try:
+        path = _safe_hh_path(page.url).rstrip("/")
+    except Exception:
+        return "[unknown]"
+    if path in ("/captcha", "/account/captcha", "/search/vacancy",
+                "/applicant/vacancy_response"):
+        return path
+    return path if re.fullmatch(r"/vacancy/\d+", path) else "[other path]"
+
+
+def captcha_resolution_verified(page, operation: str, vacancy_id=None) -> bool:
+    """The challenge disappearing alone cannot authorize continuation."""
+    if captcha_present(page):
+        return False
+    path = safe_captcha_path(page)
+    if operation == "search":
+        return path == "/search/vacancy" and (_safe_count(page, SEL["card"]) or 0) > 0
+    if operation == "vacancy_detail" and str(vacancy_id).isdigit():
+        return (path == f"/vacancy/{vacancy_id}"
+                and (_safe_count(page, SEL["vac_desc"]) or 0) > 0)
+    if operation == "application_post_submit" and str(vacancy_id).isdigit():
+        return path in (f"/vacancy/{vacancy_id}", "/applicant/vacancy_response")
+    if operation == "application_pre_submit" and str(vacancy_id).isdigit():
+        return (path in (f"/vacancy/{vacancy_id}", "/applicant/vacancy_response")
+                and (_safe_count(page, '[data-qa="vacancy-response-submit-popup"], '
+                                       'button[data-qa="vacancy-response-submit"]') or 0) > 0)
+    return False
 
 
 def _limited_data_qa_snapshot(page) -> tuple[list[dict], bool]:
@@ -345,7 +376,7 @@ def search_page(page, *, text: str, area: str, salary_min: int,
         })
     if diagnostics is not None:
         try:
-            captcha_present = page.locator('[data-qa*="captcha"]').count() > 0
+            captcha_present = page.locator('[data-qa*="captcha"]:visible').count() > 0
         except Exception:
             captcha_present = "unknown"
         try:

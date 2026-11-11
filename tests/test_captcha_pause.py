@@ -1,5 +1,7 @@
 """Offline CAPTCHA pause/resume regression tests; no HH or external LLM."""
 import unittest
+import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import config
@@ -7,6 +9,8 @@ from llm_errors import LLMStopped
 import run_web
 import test_safe_mvp
 import webapp
+import hh_web
+import application
 
 
 class CaptchaPauseTests(unittest.TestCase):
@@ -57,7 +61,7 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertEqual(final["counts"]["manual_review"], 0)
         self.assertEqual(final["counts"]["applied_confirmed"], 0)
 
-    def test_detail_captcha_timeout_stops_before_next_vacancy_or_llm(self):
+    def test_detail_captcha_stop_does_not_advance_to_next_vacancy(self):
         page = MagicMock(); browser = MagicMock(); browser.__enter__.return_value = (None, page)
         rows, opened = [], []
         vacancies = [dict(test_safe_mvp.VAC, id="101"), dict(test_safe_mvp.VAC, id="102")]
@@ -72,7 +76,7 @@ class CaptchaPauseTests(unittest.TestCase):
              patches[6] as letter, patches[7], \
              patch("hh_web.search_page", return_value=vacancies), \
              patch("hh_web.load_full", side_effect=load), \
-             patch("run_web._wait_for_manual_captcha", side_effect=run_web.HHCaptchaTimeout()):
+             patch("run_web._wait_for_manual_captcha", side_effect=LLMStopped()):
             self.assertEqual(run_web.main(), 0)
 
         self.assertEqual(opened, ["101"])
@@ -80,7 +84,7 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertFalse(any(row.get("vacancy_id") and not row.get("event") for row in rows))
         final = next(row for row in rows if row.get("event") == "run_finished")
         self.assertEqual((final["status"], final["stop_reason"]),
-                         ("STOPPED", "hh_captcha_timeout"))
+                         ("STOPPED", "user_stop"))
 
     def test_search_captcha_resumes_same_page(self):
         page = MagicMock(); browser = MagicMock(); browser.__enter__.return_value = (None, page)
@@ -109,7 +113,7 @@ class CaptchaPauseTests(unittest.TestCase):
         outcome = next(row for row in rows if row.get("vacancy_id") and not row.get("event"))
         self.assertEqual(outcome["decision"], "rejected_score")
 
-    def test_search_captcha_timeout_is_not_generic_empty_result(self):
+    def test_search_captcha_stop_is_not_generic_empty_result(self):
         page = MagicMock(); browser = MagicMock(); browser.__enter__.return_value = (None, page)
         rows = []
 
@@ -122,22 +126,24 @@ class CaptchaPauseTests(unittest.TestCase):
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5] as score, \
              patches[6], patches[7], patch("hh_web.search_page", side_effect=search), \
              patch("hh_web.load_full") as load, \
-             patch("run_web._wait_for_manual_captcha", side_effect=run_web.HHCaptchaTimeout()):
+             patch("run_web._wait_for_manual_captcha", side_effect=LLMStopped()):
             self.assertEqual(run_web.main(), 0)
 
         score.assert_not_called(); load.assert_not_called()
         final = next(row for row in rows if row.get("event") == "run_finished")
         self.assertEqual((final["status"], final["stop_reason"]),
-                         ("STOPPED", "hh_captcha_timeout"))
+                         ("STOPPED", "user_stop"))
 
-    def test_wait_polls_until_solved_without_navigation_and_emits_lifecycle(self):
+    def test_wait_requires_explicit_continue_and_verified_page(self):
         rows, now = [], [0.0]
         page = MagicMock()
 
         def sleep(seconds):
             now[0] += seconds
+            if now[0] == 2:
+                run_web._captcha_resume_requested.set()
 
-        with patch("hh_web.captcha_present", side_effect=[True, True, False]):
+        with patch("hh_web.captcha_resolution_verified", return_value=True) as verified:
             run_web._wait_for_manual_captcha(
                 page, operation="vacancy_detail", run_id="a" * 32,
                 stopped=lambda: False, telemetry=rows.append,
@@ -145,8 +151,40 @@ class CaptchaPauseTests(unittest.TestCase):
 
         self.assertEqual([row["event"] for row in rows],
                          ["captcha_wait_started", "captcha_wait_resolved"])
+        verified.assert_called_once()
         page.goto.assert_not_called()
         self.assertEqual(now[0], 2)
+
+    def test_pause_records_structural_type_and_dashboard_shows_it(self):
+        rows = []
+        structure = {"captcha_type": "turnstile", "classification_confidence": "structural",
+                     "visible_iframe_count": 1, "recognized_marker_count": 1,
+                     "probe_status": "ok"}
+        with patch("anti_captcha.capture_challenge_structure", return_value=structure), \
+             self.assertRaises(LLMStopped):
+            run_web._wait_for_manual_captcha(
+                MagicMock(), operation="vacancy_detail", run_id="e" * 32,
+                vacancy_id="123", stopped=lambda: True, telemetry=rows.append,
+                sleep=lambda _: self.fail("Stop did not interrupt pause"))
+        self.assertEqual(rows[0]["event"], "captcha_wait_started")
+        self.assertEqual(rows[0]["captcha_type"], "turnstile")
+        self.assertEqual(rows[0]["vacancy_id"], "123")
+        self.assertEqual(webapp._active_captcha_type(rows[::-1]), "unknown")
+        self.assertEqual(webapp._active_captcha_type(rows[:1]), "turnstile")
+        self.assertEqual(rows[-1]["event"], "captcha_wait_stopped")
+
+    def test_unknown_type_keeps_manual_pause_and_private_data_out_of_event(self):
+        rows = []
+        page = MagicMock()
+        page.locator.return_value.evaluate_all.return_value = {
+            "visible": 0, "markers": [], "private_text": "secret@example.test"}
+        with self.assertRaises(LLMStopped):
+            run_web._wait_for_manual_captcha(
+                page, operation="search", run_id="f" * 32,
+                stopped=lambda: True, telemetry=rows.append,
+                sleep=lambda _: self.fail("Stop did not interrupt pause"))
+        self.assertEqual(rows[0]["captcha_type"], "unknown")
+        self.assertNotIn("secret@example.test", json.dumps(rows))
 
     def test_user_stop_exits_wait_without_sleeping(self):
         rows = []
@@ -158,27 +196,174 @@ class CaptchaPauseTests(unittest.TestCase):
                 sleep=lambda _seconds: self.fail("wait did not stop promptly"))
         self.assertEqual(rows[-1]["event"], "captcha_wait_stopped")
 
-    def test_wait_timeout_uses_fake_clock_and_canonical_reason(self):
+    def test_expired_challenge_keeps_browser_open_until_stop(self):
         rows, now = [], [0.0]
 
         def sleep(seconds):
             now[0] += seconds
 
-        with patch("hh_web.captcha_present", return_value=True), \
-             self.assertRaisesRegex(run_web.HHCaptchaTimeout, "hh_captcha_timeout"):
+        with self.assertRaises(LLMStopped):
             run_web._wait_for_manual_captcha(
                 MagicMock(), operation="search", run_id="c" * 32,
-                stopped=lambda: False, telemetry=rows.append,
+                stopped=lambda: now[0] >= 4, telemetry=rows.append,
                 clock=lambda: now[0], sleep=sleep, timeout_seconds=2, poll_seconds=1)
-        self.assertEqual(now[0], 2)
+        self.assertEqual(now[0], 4)
         self.assertEqual([row["event"] for row in rows],
-                         ["captcha_wait_started", "captcha_wait_timeout"])
+                         ["captcha_wait_started", "captcha_wait_expired", "captcha_wait_stopped"])
 
     def test_dashboard_state_tracks_only_active_captcha_wait(self):
         self.assertTrue(webapp._captcha_waiting([
             {"event": "captcha_wait_started"}, {"event": "run_started"}]))
         self.assertFalse(webapp._captcha_waiting([
             {"event": "captcha_wait_resolved"}, {"event": "captcha_wait_started"}]))
+        self.assertTrue(webapp._captcha_waiting([
+            {"event": "captcha_wait_expired"}, {"event": "captcha_wait_started"}]))
+
+    def test_disappeared_marker_without_verified_page_does_not_resume(self):
+        rows, now = [], [0]
+        def sleep(seconds):
+            now[0] += seconds
+            if now[0] in (1, 2):
+                run_web._captcha_resume_requested.set()
+        with patch("hh_web.captcha_resolution_verified", side_effect=[False, True]) as verify:
+            run_web._wait_for_manual_captcha(
+                MagicMock(), operation="vacancy_detail", run_id="d" * 32,
+                vacancy_id="123", stopped=lambda: False, telemetry=rows.append,
+                clock=lambda: now[0], sleep=sleep, poll_seconds=1)
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual([r["event"] for r in rows],
+                         ["captcha_wait_started", "captcha_resume_rejected", "captcha_wait_resolved"])
+
+    def test_captcha_continue_requires_active_authenticated_worker(self):
+        state = {"pid": 123, "run_id": "a" * 32, "control_token": "[not printed]"}
+        with patch("webapp._read_run_state", return_value=state), \
+             patch("webapp._pid_alive", return_value=True), \
+             patch("webapp._control_request", return_value={"ok": True,
+                   "status": "captcha_continue_requested"}) as control:
+            response = webapp.app.test_client().post("/api/captcha/continue")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(control.call_args.args, (state, "captcha_continue"))
+        self.assertNotIn("control_token", response.get_data(as_text=True))
+        with patch("webapp._read_run_state", return_value=None):
+            self.assertEqual(webapp.app.test_client().post("/api/captcha/continue").status_code, 409)
+
+    def test_resume_requires_expected_page_structure_for_search_and_detail(self):
+        page = MagicMock(); page.url = "https://hh.ru/search/vacancy?private=query"
+        cards = [0]
+        def locator(selector):
+            found = MagicMock()
+            found.count.return_value = 0 if "captcha" in selector else cards[0]
+            return found
+        page.locator.side_effect = locator
+        self.assertFalse(hh_web.captcha_resolution_verified(page, "search"))
+        cards[0] = 2
+        self.assertTrue(hh_web.captcha_resolution_verified(page, "search"))
+        page.url = "https://hh.ru/vacancy/123?private=query"
+        self.assertTrue(hh_web.captcha_resolution_verified(page, "vacancy_detail", "123"))
+        self.assertFalse(hh_web.captcha_resolution_verified(page, "vacancy_detail", "456"))
+        page.url = "https://hh.ru/captcha?private=query"
+        self.assertFalse(hh_web.captcha_resolution_verified(page, "search"))
+        self.assertEqual(hh_web.safe_captcha_path(page), "/captcha")
+
+    def test_form_captcha_before_submit_never_arms_request(self):
+        page = MagicMock(); page.url = "https://hh.ru/captcha?token=private-value"
+        journal = MagicMock()
+        with patch.object(config, "DRY_RUN", False), \
+             patch("hh_web.captcha_present", return_value=True), \
+             patch("application.form_diagnostics", return_value={}):
+            result = application.apply(page, test_safe_mvp.VAC, "Synthetic letter",
+                                       resume_id="aaaa", dry_run=False, before_submit=journal)
+        self.assertEqual(result["reason"], "captcha_before_submit")
+        self.assertEqual(result["application_status"], "needs_manual_review")
+        self.assertFalse(result["submit_click_attempted"] if "submit_click_attempted" in result else False)
+        journal.assert_not_called()
+        self.assertNotIn("private-value", json.dumps(result))
+
+    def test_form_early_manual_exit_routes_detected_captcha_to_pause(self):
+        for path in ("/vacancy/123", "/applicant/vacancy_response"):
+            with self.subTest(path=path):
+                page = MagicMock(); page.url = "https://hh.ru" + path
+                form = MagicMock()
+                form.locator.return_value.count.return_value = 1  # unsupported control
+                journal = MagicMock()
+                with patch.object(config, "DRY_RUN", False), \
+                     patch("application._signal", return_value=False), \
+                     patch("application._response_entry", return_value=MagicMock()), \
+                     patch("application._wait_response_form", return_value=(form, None)), \
+                     patch("application.form_diagnostics", return_value={}), \
+                     patch("hh_web.captcha_present", side_effect=[False, True]):
+                    result = application.apply(page, test_safe_mvp.VAC, "Synthetic letter",
+                                               resume_id="aaaa", dry_run=False,
+                                               before_submit=journal)
+                self.assertEqual(result["reason"], "captcha_before_submit")
+                self.assertEqual(result["stage"], "apply_questions")
+                self.assertEqual(result["application_status"], "needs_manual_review")
+                journal.assert_not_called()
+
+    def test_form_early_manual_exit_without_captcha_stays_manual(self):
+        page = MagicMock(); page.url = "https://hh.ru/vacancy/123"
+        form = MagicMock(); form.locator.return_value.count.return_value = 1
+        with patch.object(config, "DRY_RUN", False), \
+             patch("application._signal", return_value=False), \
+             patch("application._response_entry", return_value=MagicMock()), \
+             patch("application._wait_response_form", return_value=(form, None)), \
+             patch("application.form_diagnostics", return_value={}), \
+             patch("hh_web.captcha_present", return_value=False):
+            result = application.apply(page, test_safe_mvp.VAC, "Synthetic letter",
+                                       resume_id="aaaa", dry_run=False,
+                                       before_submit=MagicMock())
+        self.assertEqual(result["reason"], "unsupported_custom_control")
+
+    def test_blocked_route_registration_is_identified_before_submit(self):
+        page = MagicMock(); stages = []; journal = MagicMock()
+        page.context.route.side_effect = RuntimeError("synthetic route setup stall")
+        with patch.object(config, "DRY_RUN", False), self.assertRaises(RuntimeError):
+            application.apply(page, test_safe_mvp.VAC, "Synthetic letter",
+                              resume_id="aaaa", dry_run=False, before_submit=journal,
+                              on_stage=stages.append)
+        self.assertEqual(stages, ["application_route_setup"])
+        journal.assert_not_called()
+
+    def test_application_captcha_before_submit_retries_only_same_vacancy(self):
+        page = MagicMock(); browser = MagicMock(); browser.__enter__.return_value = (None, page)
+        rows, calls = [], []
+        def apply(_page, vacancy, _letter, **_kwargs):
+            calls.append(vacancy["id"])
+            return {"application_status": "needs_manual_review",
+                    "reason": "captcha_before_submit" if len(calls) == 1 else "selected_resume_not_verified"}
+        patches = self._base_patches(browser, rows)
+        with patch.object(config, "DRY_RUN", False), patches[0], patches[1], patches[2], \
+             patches[3], patches[4], patches[6], patches[7], \
+             patch("decide.score", return_value=test_safe_mvp.RESULT), \
+             patch("hh_web.search_page", return_value=[test_safe_mvp.VAC]), \
+             patch("hh_web.load_full", side_effect=lambda _p, vac, **_kw: vac), \
+             patch("hh_web.apply", side_effect=apply), \
+             patch("run_web._wait_for_manual_captcha") as wait:
+            self.assertEqual(run_web.main(), 0)
+        self.assertEqual(calls, [test_safe_mvp.VAC["id"]] * 2)
+        self.assertEqual(wait.call_args.kwargs["operation"], "application_pre_submit")
+        self.assertFalse(any(r.get("event") == "apply_submit_started" for r in rows))
+
+    def test_application_captcha_after_submit_never_retries_and_keeps_ledger(self):
+        page = MagicMock(); browser = MagicMock(); browser.__enter__.return_value = (None, page)
+        rows, calls = [], []
+        def apply(_page, vacancy, _letter, **kwargs):
+            calls.append(vacancy["id"])
+            kwargs["before_submit"]()
+            return {"application_status": "submission_unknown", "reason": "captcha_after_possible_submit"}
+        patches = self._base_patches(browser, rows)
+        with patch.object(config, "DRY_RUN", False), patches[0], patches[1], patches[2], \
+             patches[3], patches[4], patches[6], patches[7], \
+             patch("decide.score", return_value=test_safe_mvp.RESULT), \
+             patch("hh_web.search_page", return_value=[test_safe_mvp.VAC]), \
+             patch("hh_web.load_full", side_effect=lambda _p, vac, **_kw: vac), \
+             patch("hh_web.apply", side_effect=apply), \
+             patch("run_web._wait_for_manual_captcha") as wait:
+            self.assertEqual(run_web.main(), 0)
+        self.assertEqual(calls, [test_safe_mvp.VAC["id"]])
+        self.assertEqual(wait.call_args.kwargs["operation"], "application_post_submit")
+        self.assertEqual(json.loads(Path(config.APPLICATION_SAFETY_FILE).read_text())["vacancies"]
+                         [test_safe_mvp.VAC["id"]], "submission_unknown")
 
 
 if __name__ == "__main__":

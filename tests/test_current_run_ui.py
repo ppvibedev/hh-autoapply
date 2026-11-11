@@ -10,6 +10,45 @@ import webapp
 class CurrentRunTests(unittest.TestCase):
     setUp = test_safe_mvp.SafeTests.setUp
 
+    def test_captcha_type_is_visible_only_during_active_pause(self):
+        rid = "a" * 32
+        started = dict(event="captcha_wait_started", run_id=rid,
+                       captcha_type="recaptcha", classification_confidence="structural")
+        with patch("webapp._current_run_rows", return_value=(rid, [started])), \
+             patch("webapp._running", return_value=True), \
+             patch("webapp._read_resumes", return_value=[]), \
+             patch("webapp.envfile.read_env", return_value={}):
+            state = webapp.app.test_client().get("/api/state").get_json()
+        self.assertEqual(state["worker_state"], "PAUSED_FOR_CAPTCHA")
+        self.assertEqual(state["captcha_type"], "recaptcha")
+        self.assertIn("reCAPTCHA", state["captcha_message"])
+        self.assertNotIn("sitekey", json.dumps(state).lower())
+        with patch("webapp._current_run_rows", return_value=(rid, [
+                 dict(event="captcha_wait_resolved", run_id=rid), started])), \
+             patch("webapp._running", return_value=True), \
+             patch("webapp._read_resumes", return_value=[]), \
+             patch("webapp.envfile.read_env", return_value={}):
+            state = webapp.app.test_client().get("/api/state").get_json()
+        self.assertFalse(state["captcha_waiting"])
+        self.assertEqual(state["captcha_type"], "unknown")
+        self.assertEqual(webapp._active_captcha_type([
+            dict(event="captcha_wait_started", captcha_type="private-sitekey-value")]),
+            "unknown")
+
+    def test_dead_worker_without_run_finished_is_not_shown_as_ready(self):
+        rid = "a" * 32
+        rows = [dict(event="worker_stop_observed", run_id=rid),
+                dict(event="run_started", run_id=rid)]
+        with patch("webapp._current_run_rows", return_value=(rid, rows)), \
+             patch("webapp._running", return_value=False), \
+             patch("webapp._any_run_alive", return_value=False), \
+             patch("webapp._read_resumes", return_value=[]), \
+             patch("webapp.envfile.read_env", return_value={}):
+            state = webapp.app.test_client().get("/api/state").get_json()
+        self.assertFalse(state["running"])
+        self.assertTrue(state["run_incomplete"])
+        self.assertFalse(state["captcha_waiting"])
+
     def test_restart_empty_then_user_run_only(self):
         old_run = 'a' * 32
         new_run = 'b' * 32

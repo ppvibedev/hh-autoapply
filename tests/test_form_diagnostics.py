@@ -12,7 +12,7 @@ class FormDiagnosticsTests(unittest.TestCase):
         for count in (0,2):
             page=MagicMock(); page.url=test_safe_mvp.VAC['url']
             button=page.locator.return_value; button.count.return_value=count
-            with patch.object(config,'DRY_RUN',False), patch('application._signal',return_value=None), patch.object(application,'_form_diagnostic_recorded',False), patch('application.form_diagnostics',return_value={'form_count':0}) as capture:
+            with patch.object(config,'DRY_RUN',False), patch('hh_web.captcha_present',return_value=False), patch('application._signal',return_value=None), patch.object(application,'_form_diagnostic_recorded',False), patch('application.form_diagnostics',return_value={'form_count':0}) as capture:
                 result=application.apply(page,test_safe_mvp.VAC,'letter',resume_id='aaaa',dry_run=False,before_submit=lambda:None)
                 self.assertEqual(result['stage'],'apply_entry_lookup')
                 self.assertEqual(result['response_entry_count'],count)

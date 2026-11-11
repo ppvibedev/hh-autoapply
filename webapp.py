@@ -184,10 +184,32 @@ def _run_log(rows, limit=100):
 
 def _captcha_waiting(rows):
     """Derive the current manual-action state from the newest CAPTCHA lifecycle event."""
-    lifecycle = {"captcha_wait_started", "captcha_wait_resolved",
-                 "captcha_wait_timeout", "captcha_wait_stopped"}
+    lifecycle = {"captcha_wait_started", "captcha_wait_expired", "captcha_resume_rejected",
+                 "captcha_wait_resolved", "captcha_wait_stopped"}
     latest = next((row for row in rows if row.get("event") in lifecycle), None)
-    return bool(latest and latest.get("event") == "captcha_wait_started")
+    return bool(latest and latest.get("event") in
+                {"captcha_wait_started", "captcha_wait_expired", "captcha_resume_rejected"})
+
+
+def _active_captcha_type(rows):
+    """Use only a whitelisted type from the active pause, never raw page data."""
+    if not _captcha_waiting(rows):
+        return "unknown"
+    started = next((row for row in rows if row.get("event") == "captcha_wait_started"), None)
+    kind = started.get("captcha_type") if started else None
+    return kind if isinstance(kind, str) and kind in {"recaptcha", "hcaptcha", "turnstile"} else "unknown"
+
+
+def _worker_state(rows):
+    """Project bounded worker telemetry without treating a live PID as progress."""
+    heartbeat_state = "unknown"
+    for row in rows:
+        event = row.get("event")
+        if event in ("operation_finished", "operation_started", "operation_timeout"):
+            return "stalled" if event == "operation_timeout" else heartbeat_state if heartbeat_state != "unknown" else "working"
+        if event == "worker_heartbeat" and heartbeat_state == "unknown":
+            heartbeat_state = row.get("state") if row.get("state") in ("working", "waiting", "stalled", "paused_for_captcha") else "unknown"
+    return heartbeat_state
 
 
 def _counts(rows: list[dict]) -> dict[str, int]:
@@ -336,6 +358,12 @@ def _control_request(state, action, stop_attempt_id=None):
 def _kill_all_runs(stop_attempt_id=None) -> dict:
     """Stop in-memory worker or an authenticated recovered worker; never signal PID state."""
     if _running():
+        state = _read_run_state()
+        if state is not None and state["pid"] == _proc.pid:
+            response = _control_request(state, "stop", stop_attempt_id)
+            if response.get("ok") is True and response.get("status") == "stop_requested":
+                return {"ok": True, "stopped": True, "status": "in_memory_stop_requested",
+                        "delivery_path": "authenticated_control_socket", "delivery_accepted": True}
         try:
             _proc.terminate()
             return {"ok": True, "stopped": True, "status": "in_memory_stop_requested",
@@ -419,9 +447,16 @@ def api_state():
     env = envfile.read_env()
     run_id, rows = _current_run_rows()
     vacancy_rows = _vacancy_rows(rows, run_id) if run_id else []
-    captcha_waiting = _captcha_waiting(rows)
+    run_alive = _running() or _any_run_alive()
+    captcha_waiting = run_alive and _captcha_waiting(rows)
+    captcha_type = _active_captcha_type(rows) if captcha_waiting else "unknown"
+    run_incomplete = bool(run_id and not run_alive
+                          and any(row.get("event") == "run_started" for row in rows)
+                          and not any(row.get("event") == "run_finished" for row in rows))
+    worker_state = "PAUSED_FOR_CAPTCHA" if captcha_waiting else _worker_state(rows)
     return jsonify({
-        "running": _running() or _any_run_alive(),  # учитывает и осиротевшие процессы
+        "running": run_alive,  # учитывает и осиротевшие процессы
+        "run_incomplete": run_incomplete,
         "login_running": _login_running(),
         "dry_run": _active_mode != "LIVE",
         "mode": _active_mode,
@@ -434,8 +469,13 @@ def api_state():
         "resumes_refreshing": _resumes_running(),
         "run_id": run_id,
         "captcha_waiting": captcha_waiting,
-        "captcha_message": ("HH просит CAPTCHA. Решите её в открытом окне браузера. "
-                            "Прогон приостановлен до 120 секунд."
+        "captcha_type": captcha_type,
+        "worker_state": worker_state,
+        "captcha_message": ("ПАУЗА: CAPTCHA (тип: " +
+                            {"recaptcha": "reCAPTCHA", "hcaptcha": "hCaptcha",
+                             "turnstile": "Turnstile", "unknown": "неизвестен"}[captcha_type] +
+                            "). Решите её в браузере и нажмите «Продолжить». "
+                            "Текущая вакансия удерживается; Stop доступен."
                             if captcha_waiting else None),
         "run_log": _run_log(rows),
         "counts": _counts(rows),
@@ -730,6 +770,18 @@ def api_stop():
                        error="Нельзя безопасно подтвердить фоновый прогон; сигнал не отправлен")
     _complete_stop_attempt(attempt_id, payload, status_code)
     return jsonify(payload), status_code
+
+
+@app.post("/api/captcha/continue")
+def api_captcha_continue():
+    """Request verification of the current page; never authorize a submit."""
+    state = _read_run_state()
+    if state is None or not _pid_alive(state["pid"]):
+        return jsonify({"ok": False, "status": "captcha_worker_unavailable"}), 409
+    response = _control_request(state, "captcha_continue")
+    if response.get("ok") is True and response.get("status") == "captcha_continue_requested":
+        return jsonify({"ok": True, "status": "captcha_verification_requested"})
+    return jsonify({"ok": False, "status": "captcha_not_waiting"}), 409
 
 
 @app.get("/api/areas")

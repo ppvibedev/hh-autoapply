@@ -89,6 +89,15 @@ SESSION_FILE = "state/session.json"    # сохранённая залогине
 RUN_PID_FILE = "state/run.pid"         # Durable JSON state active run (ignored runtime data).
 RUN_CONTROL_SOCKET = "state/r.sock"  # Authenticated local stop channel for the active worker.
 HEADLESS = os.getenv("HEADLESS", "0") == "1"  # 0 = видимый браузер (нужно для капчи)
+CAPTCHA_REMINDER_SECONDS = max(30, _int("CAPTCHA_REMINDER_SECONDS", 120))  # только напоминание; паузу не завершает
+# Подготовка Anti-Captcha. Автоматическая отправка задач HH пока не включена:
+# тип реальной проверки и допустимость такого способа не подтверждены.
+ANTI_CAPTCHA_ENABLED = os.getenv("ANTI_CAPTCHA_ENABLED", "0") == "1"
+ANTI_CAPTCHA_API_KEY = os.getenv("ANTI_CAPTCHA_API_KEY", "").strip()
+ANTI_CAPTCHA_DAILY_LIMIT_USD = os.getenv("ANTI_CAPTCHA_DAILY_LIMIT_USD", "0").strip()
+ANTI_CAPTCHA_TASK_LIMIT_USD = os.getenv("ANTI_CAPTCHA_TASK_LIMIT_USD", "0").strip()
+ANTI_CAPTCHA_MAX_WAIT_SECONDS = max(1, _int("ANTI_CAPTCHA_MAX_WAIT_SECONDS", 120))
+ANTI_CAPTCHA_MANUAL_FALLBACK = os.getenv("ANTI_CAPTCHA_MANUAL_FALLBACK", "1") != "0"
 PAGES_PER_RUN = _int("PAGES_PER_RUN", 3)      # сколько страниц выдачи разбирать
 PAUSE_SECONDS = _int("PAUSE_SECONDS", 6)      # пауза между действиями (антибот)
 

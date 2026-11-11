@@ -5,6 +5,7 @@ import time
 from urllib.parse import urlparse, parse_qs, urljoin
 
 import config
+import hh_web
 from llm_errors import LLMUnavailable, LLMStopped
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from privacy import sanitize_candidate_text, sanitize_exception_message
@@ -1876,7 +1877,7 @@ def _form_scope_diagnostics(form, parsed_question_count, candidate_response_form
 
 
 def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidate_text='',
-          instructions='', stopped=lambda:False, before_submit=None):
+          instructions='', stopped=lambda:False, before_submit=None, on_stage=None):
     result = {'application_status':'needs_manual_review', 'reason':'form_not_supported', 'questions':[]}
     if config.DRY_RUN or dry_run:
         return dict(result, application_status='safe_not_sent',reason='SAFE blocks application actions')
@@ -1896,6 +1897,17 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
     language_warning_after_submission=False
     def finish(**values):
         outcome = dict(result, **values)
+        # A challenge may appear between the existing checkpoints (questions,
+        # resume, letter, or submit click). Route only a strict current-page
+        # CAPTCHA signal through the shared pause; never retry a possible submit.
+        if (outcome.get('application_status') not in ('applied_confirmed','already_applied','apply_failed')
+            and outcome.get('reason') not in ('user_stop_before_submit','captcha_before_submit',
+                                              'captcha_after_possible_submit')):
+            try: captcha_now = hh_web.captcha_present(page)
+            except Exception: captcha_now = False
+            if captcha_now:
+                outcome['application_status'] = 'submission_unknown' if armed else 'needs_manual_review'
+                outcome['reason'] = 'captcha_after_possible_submit' if armed else 'captcha_before_submit'
         outcome.setdefault('stage',stage)
         outcome['reason_code'] = outcome.get('reason','application_flow_error')
         if outcome.get('reason') in ('question_not_safely_answered','question_fill_not_verified') and outcome.get('questions'):
@@ -1966,11 +1978,15 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         else:
             blocked = blocked or info['endpoint_known']
             route.abort()
+    if on_stage: on_stage('application_route_setup')
     page.context.route('**/*',guard)
+    if on_stage: on_stage('application')
     page.on('response',on_response)
     try:
         if stopped(): return finish(reason='user_stop_before_submit')
         page.goto('https://hh.ru/vacancy/' + str(vacancy['id']),wait_until='domcontentloaded')
+        if hh_web.captcha_present(page):
+            return finish(reason='captcha_before_submit')
         if _signal(page,str(vacancy['id']),before=True):
             return finish(application_status='already_applied',reason='HH shows existing response on this vacancy')
         if _signal(page,str(vacancy['id'])):
@@ -1996,6 +2012,8 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         stage = 'apply_intermediate'
         form, reason = _wait_response_form(page,result['warnings'],lambda:blocked,stopped,result['modal_diagnostics'])
         if form is None:
+            if hh_web.captcha_present(page):
+                return finish(reason='captcha_before_submit',stage='apply_intermediate')
             try: result['form_diagnostics'] = form_diagnostics(page)
             except Exception as error:
                 result['diagnostic_error_type'] = type(error).__module__ + '.' + type(error).__qualname__
@@ -2078,7 +2096,9 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
         form, letters = _ensure_cover_letter_editor(page,form,letter,result['cover_letter_diagnostics'])
         if letters is None: return finish(reason='letter_field_not_verified')
         stage = 'apply_validate'
-        if form.locator('iframe:visible').count() or page.locator('[data-qa*="captcha"]:visible').count():
+        if hh_web.captcha_present(page):
+            return finish(reason='captcha_before_submit')
+        if form.locator('iframe:visible').count():
             return finish(reason='captcha_or_external_form')
         resume_matches_at_validation = _selected_resume(form,resume_id,resume_evidence,str(vacancy['id']))
         form_check_validity = form.evaluate("(form) => form.checkValidity ? form.checkValidity() : [...form.querySelectorAll('input,textarea,select')].every(el => el.checkValidity())") is True
@@ -2125,6 +2145,7 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
             page,form,letter,result['cover_letter_diagnostics'],'before_submit')
         if not _answers_verified(form,verified_answers): return finish(reason='question_fill_failed')
         stage = 'apply_submit'
+        if on_stage: on_stage('application_submit')
         try: before_submit()
         except Exception: return finish(reason='submission_journal_failed')
         armed = True
@@ -2137,12 +2158,16 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
             result['submit_click_completed']=True
         # Preserve the existing asynchronous request/confirmation wait.
         stage = 'apply_confirm'
+        if on_stage: on_stage('application_confirm')
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if (_signal(page,str(vacancy['id'])) == 'applied_confirmed'
                 or _signal(page,str(vacancy['id']),before=True) == 'already_applied'):
                 return finish(application_status='applied_confirmed',reason='HH explicit fresh success message',
                               confirmation='explicit_success_marker_same_vacancy')
+            if hh_web.captcha_present(page):
+                return finish(application_status='submission_unknown',
+                              reason='captcha_after_possible_submit')
             transient=_transient_error(page,form)
             if transient:
                 result['transient_error_seen']=True
@@ -2218,6 +2243,14 @@ def apply(page, vacancy, letter, *, resume_id, dry_run, resume_text='', candidat
     except (LLMUnavailable, LLMStopped):
         raise
     except Exception as error:
+        try:
+            captcha_now = hh_web.captcha_present(page)
+        except Exception:
+            captcha_now = False
+        if captcha_now:
+            return finish(application_status='submission_unknown' if armed else 'needs_manual_review',
+                          reason='captcha_after_possible_submit' if armed else 'captcha_before_submit',
+                          stage=stage)
         return finish(application_status='submission_unknown' if sent else 'needs_manual_review',
                     reason=str(error) if str(error) in ('cover_letter_control_not_found','cover_letter_open_failed',
                         'cover_letter_trigger_missing','cover_letter_trigger_click_failed','cover_letter_editor_not_appeared',

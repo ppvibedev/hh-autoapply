@@ -180,17 +180,30 @@ router не начинает новую операцию. Уже приняты�
 
 ## 15. CAPTCHA CURRENT behavior
 
-**CURRENT.** CAPTCHA не обходится автоматически. Строго подтверждённая CAPTCHA на search
-или detail navigation ставит текущую операцию на паузу и оставляет видимый Chromium
-открытым. Dashboard просит решить challenge вручную; worker проверяет CAPTCHA примерно раз
-в секунду не более 120 секунд и в это время не переходит к другим вакансиям, matching или
-application.
+**CURRENT.** CAPTCHA не обходится автоматически. Строго подтверждённая CAPTCHA на search,
+detail или в форме отклика переводит worker в `PAUSED_FOR_CAPTCHA` и удерживает текущую
+страницу и вакансию. Dashboard предлагает решить проверку в открытом Chromium и нажать
+«Продолжить после CAPTCHA». Только после этого worker проверяет, что CAPTCHA отсутствует
+и текущая страница имеет ожидаемый для операции путь и структуру. Одно исчезновение маркера
+не продолжает run. Если проверка не подтверждена, пауза остаётся. Значение
+`CAPTCHA_REMINDER_SECONDS` (по умолчанию 120) создаёт напоминание, но не закрывает браузер
+и не завершает run. Stop доступен во время паузы.
 
-После решения повторяется та же логическая search page либо открывается тот же exact vacancy
-URL, затем обычный pipeline продолжается. Успешно решённая CAPTCHA не является outcome
-вакансии и сама по себе не меняет counters. Stop прерывает ожидание с обычной причиной
-`user_stop`. Если CAPTCHA не исчезла за 120 секунд, весь run получает `STOPPED` с причиной
-`hh_captcha_timeout`; текущая вакансия не превращается в manual/application failure.
+При входе в паузу приложение пассивно проверяет видимые структурные признаки известных
+провайдеров CAPTCHA во фреймах. Dashboard показывает `reCAPTCHA`, `hCaptcha`, `Turnstile`
+или `unknown`; это определение типа, а не попытка решить проверку. Без однозначного
+признака тип остаётся `unknown`. В журнал попадают только тип, уверенность и ограниченные
+счётчики признаков — без URL фреймов, sitekey, изображений, токенов и текста страницы.
+Строгий CAPTCHA-сигнал проверяется и при раннем выходе из обработки формы: до submit
+он ведёт к той же паузе, после возможного submit сохраняет `submission_unknown` без
+повторной отправки.
+
+После подтверждения для search повторяется та же страница, для detail — тот же exact
+vacancy URL. CAPTCHA до submit позволяет повторить только подготовку формы для той же
+вакансии; submit до этого не начинался. CAPTCHA после потенциального submit сохраняет
+`submission_unknown` в safety ledger: после ручного продолжения submit не повторяется,
+исчезновение CAPTCHA не считается подтверждением отклика. Прерванный worker сохраняет
+уже записанный safety ledger; незавершённая пауза остаётся в журнале как событие.
 
 ### 15.1. HH navigation resilience
 
@@ -277,14 +290,19 @@ vacancy ID. После возможной отправки приложение 
 
 ## 22. Stop
 
-**CURRENT.** Dashboard отправляет Stop с correlation ID. Same-dashboard worker получает
-SIGTERM, recovered worker — authenticated local control socket. Worker отмечает request,
+**CURRENT.** Dashboard отправляет Stop с correlation ID. Same-dashboard worker сначала
+получает запрос через authenticated local control socket; если канал недоступен, остаётся
+SIGTERM. Recovered worker также использует authenticated socket. Worker отмечает request,
 acknowledgement/observation и заканчивает `STOPPED: user_stop`. После наблюдения Stop новая
 vacancy, LLM operation, retry или failover не начинается.
 
-Уже начатая блокирующая browser/provider операция может завершаться до своего timeout;
-Stop не обещает мгновенное прерывание системного вызова. UI показывает «остановка
-запрошена», а фактическое завершение подтверждает `run_finished`.
+Worker пишет heartbeat примерно каждые 10 секунд, а начало и окончание этапов — отдельно.
+Если прогресса нет 180 секунд, он пишет `operation_timeout`, запрашивает кооперативный Stop,
+а dashboard показывает зависшее состояние. Уже начатый блокирующий Playwright-вызов
+невозможно безопасно прервать из соседнего потока. Stop не обещает мгновенное завершение:
+его подтверждает только `run_finished`; при отсутствии подтверждения требуется отдельная
+проверка состояния submit перед ручной эскалацией. Если процесс завершился без
+`run_finished`, dashboard показывает прерванный незавершённый run вместо состояния «готов».
 
 ## 23. History и dashboard
 
@@ -325,8 +343,8 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 - `pages_exhausted` — не доказательство конца HH-выдачи.
 - Standalone response form может не дать доказанно переключить exact resume ID.
 - `needs_manual_review` смешивает бизнес- и технические причины.
-- Stop latency ограничена timeout уже начатой операции, включая активный `Page.goto`;
-  retry-ожидания сами по себе stop-aware.
+- Зависший внутри Playwright вызов может пережить операционный watchdog; он фиксирует
+  stall и запрашивает Stop, но не уничтожает процесс во время возможного submit.
 - Основной browser path и legacy API path сосуществуют; application через API не считается
   текущим production-маршрутом.
 
@@ -336,7 +354,7 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 
 | Тема | CURRENT | OPEN QUESTION |
 |---|---|---|
-| Automatic CAPTCHA solving | manual solve; pause/resume до 120 секунд | После LIVE evidence о частоте CAPTCHA решить, нужна ли внешняя solving integration. |
+| Automatic CAPTCHA solving | явная ручная пауза без автоматического закрытия | После evidence о типе CAPTCHA и допустимом способе решить вопрос внешней integration. |
 | `pages_exhausted` | исчерпан configured budget | Переименовать ли, чтобы не звучало как конец HH? |
 | Standalone resume form | без exact ID submit запрещён | Какой штатный HH-механизм выбора exact ID? |
 | `answer_missing` | manual с имеющейся diagnostic taxonomy | Нужна ли более точная пользовательская причина? |
@@ -345,6 +363,6 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 | Raw-card parser failure | diagnostic + общий terminal reason | Нужен ли отдельный run status/reason? |
 | Manual-review split | один outcome | Разделить business uncertainty и technical failure? |
 | Expired HH session | search redirect не даёт отдельный terminal status | Нужен ли fail-fast re-login state? |
-| Stop latency | ждёт возврата blocking operation | Нужно ли кооперативное прерывание глубже? |
+| Stop latency | watchdog фиксирует stall; блокирующий Playwright-вызов всё ещё может требовать ручной эскалации | Нужна ли процессная изоляция browser operations? |
 | History reset wording | журнал/seen/legacy cache, safety остаётся | Как точнее назвать кнопку и confirmation? |
 | Legacy API path | существует отдельно | Поддерживать, изолировать или удалить позже? |

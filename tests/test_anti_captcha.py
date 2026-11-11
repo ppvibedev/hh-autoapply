@@ -1,0 +1,148 @@
+"""Offline preparation checks; no paid task, HH, or external API call."""
+from decimal import Decimal
+import unittest
+from unittest.mock import Mock
+
+import requests
+
+from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus,
+                          capture_challenge_structure, classify_challenge_markers,
+                          preflight)
+
+
+class AntiCaptchaPreparationTests(unittest.TestCase):
+    def test_visible_structural_marker_snapshot_is_allowlisted(self):
+        private = "secret-sitekey-or-contact@example.test"
+        page = Mock()
+        page.locator.return_value.evaluate_all.return_value = {
+            "visible": 2,
+            "markers": [["www.google.com", "/recaptcha/"],
+                        ["private.example", private]],
+            "text": private, "sitekey": private, "cookies": private}
+        snapshot = capture_challenge_structure(page)
+        self.assertEqual(snapshot, {
+            "captcha_type": "recaptcha", "classification_confidence": "structural",
+            "visible_iframe_count": 2, "recognized_marker_count": 1,
+            "probe_status": "ok"})
+        self.assertNotIn(private, repr(snapshot))
+        page.locator.assert_called_once_with("iframe[src]")
+
+    def test_unknown_ambiguous_and_probe_failure_stay_unknown(self):
+        page = Mock()
+        probe = page.locator.return_value.evaluate_all
+        probe.return_value = {"visible": 1, "markers": []}
+        self.assertEqual(capture_challenge_structure(page)["captcha_type"], "unknown")
+        probe.return_value = {"visible": 2, "markers": [
+            ["www.google.com", "/recaptcha/"],
+            ["hcaptcha.com", "/1/"]]}
+        self.assertEqual(capture_challenge_structure(page)["captcha_type"], "unknown")
+        probe.side_effect = RuntimeError("private URL?sitekey=secret")
+        snapshot = capture_challenge_structure(page)
+        self.assertEqual(snapshot["probe_status"], "unavailable")
+        self.assertNotIn("secret", repr(snapshot))
+
+    def test_known_structures_and_unknown_or_ambiguous_type(self):
+        self.assertEqual(classify_challenge_markers(
+            [("www.google.com", "/recaptcha/api2/anchor")]), "recaptcha")
+        self.assertEqual(classify_challenge_markers(
+            [("hcaptcha.com", "/1/api.js")]), "hcaptcha")
+        self.assertEqual(classify_challenge_markers(
+            [("challenges.cloudflare.com", "/turnstile/v0/api.js")]), "turnstile")
+        self.assertEqual(classify_challenge_markers(
+            [("www.google.com", "/maps")]), "unknown")
+        self.assertEqual(classify_challenge_markers([]), "unknown")
+        self.assertEqual(classify_challenge_markers([
+            ("www.google.com", "/recaptcha/api2/anchor"),
+            ("hcaptcha.com", "/1/api.js")]), "unknown")
+
+    def test_missing_key_never_calls_transport(self):
+        post = Mock(side_effect=AssertionError("network forbidden"))
+        result = AntiCaptchaClient("", post=post).get_balance()
+        self.assertEqual(result.reason, "missing_api_key")
+        post.assert_not_called()
+
+    def test_official_balance_is_cached_and_never_exposes_key(self):
+        clock = Mock(return_value=10.0)
+        post = Mock(return_value=Mock(status_code=200,
+                                      json=lambda: {"errorId": 0, "balance": 4.5}))
+        client = AntiCaptchaClient("PRIVATE_KEY", post=post, clock=clock)
+        self.assertEqual(client.get_balance().amount_usd, Decimal("4.5"))
+        self.assertEqual(client.get_balance().amount_usd, Decimal("4.5"))
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.kwargs["timeout"], 10)
+        self.assertNotIn("PRIVATE_KEY", repr(client.get_balance()))
+        clock.return_value = 41.0
+        client.get_balance()
+        self.assertEqual(post.call_count, 2)
+
+    def test_transport_timeout_and_service_error_are_redacted(self):
+        secret = "PRIVATE_KEY"
+        post = Mock(side_effect=requests.Timeout(secret + " private URL"))
+        result = AntiCaptchaClient(secret, post=post).get_balance()
+        self.assertEqual(result.reason, "balance_transport_error")
+        self.assertNotIn(secret, repr(result))
+        post = Mock(return_value=Mock(status_code=200,
+                                      json=lambda: {"errorId": 1,
+                                                    "errorDescription": secret}))
+        result = AntiCaptchaClient(secret, post=post).get_balance()
+        self.assertEqual(result.reason, "balance_service_error")
+        self.assertNotIn(secret, repr(result))
+
+    def test_budget_balance_permission_and_unknown_type_fail_closed(self):
+        base = dict(enabled=True, has_key=True, challenge_type="recaptcha",
+                    daily_limit_usd="1", task_limit_usd="0.1",
+                    spent_today_usd="0", estimated_task_usd="0.05",
+                    balance=BalanceResult(True, Decimal("1")))
+        self.assertEqual(preflight(**base), "hh_permission_unconfirmed")
+        self.assertEqual(preflight(**(base | {"challenge_type": "unknown"})),
+                         "unsupported_or_unknown_type")
+        self.assertEqual(preflight(**(base | {"daily_limit_usd": "0"}),
+                                   hh_permission_confirmed=True), "budget_unavailable")
+        self.assertEqual(preflight(**(base | {"estimated_task_usd": "0.2"}),
+                                   hh_permission_confirmed=True), "budget_exceeded")
+        self.assertEqual(preflight(**(base | {"balance": BalanceResult(True, Decimal("0"))}),
+                                   hh_permission_confirmed=True), "insufficient_balance")
+        self.assertEqual(preflight(**base, hh_permission_confirmed=True),
+                         "preflight_only_no_paid_task_support")
+
+    def test_duplicate_or_stopped_captcha_cannot_start_paid_task(self):
+        client = AntiCaptchaClient("DUMMY_KEY", post=Mock())
+        self.assertFalse(hasattr(client, "create_task"))
+        self.assertFalse(hasattr(client, "submit_solution_to_hh"))
+
+    def test_existing_task_status_discards_solution_and_private_error(self):
+        secret = "PRIVATE_KEY"
+        post = Mock(return_value=Mock(status_code=200,
+                                      json=lambda: {"errorId": 0, "status": "ready",
+                                                    "cost": "0.002", "solution": {"text": secret}}))
+        client = AntiCaptchaClient(secret, post=post)
+        result = client.get_task_status(123)
+        self.assertEqual(result, TaskStatus("ready", Decimal("0.002")))
+        self.assertNotIn(secret, repr(result))
+        self.assertEqual(post.call_args.kwargs["timeout"], 10)
+
+    def test_task_polling_timeout_stop_and_service_error(self):
+        now = [0.0]
+        def clock():
+            return now[0]
+        def sleep(seconds):
+            now[0] += seconds
+        post = Mock(return_value=Mock(status_code=200,
+                                      json=lambda: {"errorId": 0, "status": "processing"}))
+        client = AntiCaptchaClient("DUMMY_KEY", post=post, clock=clock)
+        self.assertEqual(client.wait_for_task(123, max_wait_seconds=5,
+                                              stopped=lambda: False, sleep=sleep).state,
+                         "timeout")
+        self.assertLessEqual(post.call_count, 3)
+        post.reset_mock()
+        self.assertEqual(client.wait_for_task(123, max_wait_seconds=5,
+                                              stopped=lambda: True, sleep=sleep).state,
+                         "stopped")
+        post.assert_not_called()
+        post.return_value = Mock(status_code=200,
+                                 json=lambda: {"errorId": 1, "errorDescription": "private"})
+        self.assertEqual(client.get_task_status(123).reason, "task_service_error")
+
+
+if __name__ == "__main__":
+    unittest.main()
