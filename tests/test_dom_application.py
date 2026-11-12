@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 import test_safe_mvp
 import application as app
+import anti_captcha
 from playwright.sync_api import sync_playwright
 
 class DOMTests(unittest.TestCase):
@@ -24,6 +25,29 @@ class DOMTests(unittest.TestCase):
         self.context.route('**/*', lambda route: route.abort())
         self.page = self.context.new_page()
         self.addCleanup(self.context.close)
+
+    def test_dashboard_anti_captcha_form_loads_without_script_error(self):
+        errors = []
+        self.page.on("pageerror", lambda error: errors.append(str(error)))
+        html = (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text()
+        self.page.set_content(html)
+        self.assertEqual(self.page.locator("#antiCaptchaKey").get_attribute("type"), "password")
+        self.assertTrue(self.page.locator("#antiCaptchaSave").is_visible())
+        self.assertEqual(errors, [])
+
+    def test_image_captcha_requires_complete_visible_dialog_structure(self):
+        self.page.set_content('''<div role="dialog" style="width:300px;height:200px">
+          <div data-qa="captcha-challenge"><img src="data:image/png;base64,iVBORw0KGgo=" width="80" height="30"></div>
+          <input type="text" value="private-contact@example.test"><button>Confirm</button>
+          </div>''')
+        result = anti_captcha.capture_challenge_structure(self.page)
+        self.assertEqual(result["captcha_type"], "image_to_text")
+        controls = anti_captcha.image_challenge_controls(self.page)
+        self.assertIsNotNone(controls)
+        self.assertTrue(controls[0].screenshot())
+        self.assertNotIn("private-contact", repr(result))
+        self.page.locator('[data-qa="captcha-challenge"] img').evaluate('(el) => el.remove()')
+        self.assertEqual(anti_captcha.capture_challenge_structure(self.page)["captcha_type"], "unknown")
 
     def test_local_question_text_and_existing_llm_evidence(self):
         self.page.set_content('''<form>

@@ -34,6 +34,9 @@ class ConnectionsUITests(unittest.TestCase):
                         elif path=='/api/application-profile':
                             result=client.get(path); request.fulfill(status=result.status_code,
                                 body=result.get_data(as_text=True),content_type='application/json')
+                        elif path=='/api/anti-captcha':
+                            request.fulfill(json={'status':'not_configured','enabled':False,
+                                'key_configured':False,'balance_usd':None})
                         elif path=='/api/config':
                             result=client.post(path,json=request.request.post_data_json)
                             request.fulfill(status=result.status_code,body=result.get_data(as_text=True),

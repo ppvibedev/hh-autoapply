@@ -23,6 +23,7 @@ import requests
 from flask import Flask, jsonify, request, send_from_directory
 
 import application_profile
+import anti_captcha
 import config
 import envfile
 import history_store
@@ -41,6 +42,9 @@ LOGIN_FLAG = "state/login_done.flag"
 _areas_cache: list | None = None
 _stop_attempts: dict[str, tuple[dict, int] | None] = {}
 _stop_attempts_lock = threading.Lock()
+_anti_captcha_client_lock = threading.Lock()
+_anti_captcha_client_key = None
+_anti_captcha_client = None
 _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _STOP_ATTEMPT_LIMIT = 64
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}")
@@ -197,7 +201,7 @@ def _active_captcha_type(rows):
         return "unknown"
     started = next((row for row in rows if row.get("event") == "captcha_wait_started"), None)
     kind = started.get("captcha_type") if started else None
-    return kind if isinstance(kind, str) and kind in {"recaptcha", "hcaptcha", "turnstile"} else "unknown"
+    return kind if isinstance(kind, str) and kind in {"recaptcha", "hcaptcha", "turnstile", "image_to_text"} else "unknown"
 
 
 def _worker_state(rows):
@@ -473,7 +477,8 @@ def api_state():
         "worker_state": worker_state,
         "captcha_message": ("ПАУЗА: CAPTCHA (тип: " +
                             {"recaptcha": "reCAPTCHA", "hcaptcha": "hCaptcha",
-                             "turnstile": "Turnstile", "unknown": "неизвестен"}[captcha_type] +
+                             "turnstile": "Turnstile", "image_to_text": "текст с картинки",
+                             "unknown": "неизвестен"}[captcha_type] +
                             "). Решите её в браузере и нажмите «Продолжить». "
                             "Текущая вакансия удерживается; Stop доступен."
                             if captcha_waiting else None),
@@ -577,6 +582,78 @@ def api_llm_connection_test(connection_id):
     if not isinstance(text, str) or not text.strip():
         return jsonify({"ok": False, "status": "provider_invalid_response"})
     return jsonify({"ok": True, "status": "CONNECTED", "readiness": "smoke_test_only"})
+
+
+def _anti_captcha_local_request(*, write=False):
+    if request.remote_addr not in ("127.0.0.1", "::1") or request.host not in (
+            "127.0.0.1:8000", "localhost:8000", "localhost"):
+        return False
+    if write:
+        return (request.is_json and request.headers.get("Origin") == request.host_url.rstrip("/"))
+    return True
+
+
+def _anti_captcha_status():
+    global _anti_captcha_client, _anti_captcha_client_key
+    env = envfile.read_env()
+    key = env.get("ANTI_CAPTCHA_API_KEY", "").strip()
+    enabled = env.get("ANTI_CAPTCHA_ENABLED", "0") == "1"
+    if not key:
+        return {"status": "not_configured", "enabled": False, "key_configured": False,
+                "balance_usd": None}
+    if not enabled:
+        return {"status": "disabled", "enabled": False, "key_configured": True,
+                "balance_usd": None}
+    with _anti_captcha_client_lock:
+        if _anti_captcha_client is None or _anti_captcha_client_key != key:
+            _anti_captcha_client = anti_captcha.AntiCaptchaClient(key)
+            _anti_captcha_client_key = key
+        result = _anti_captcha_client.get_balance()
+    return {"status": "connected" if result.available else "connection_error",
+            "enabled": True, "key_configured": True,
+            "balance_usd": str(result.amount_usd) if result.available and result.amount_usd is not None else None}
+
+
+@app.get("/api/anti-captcha")
+def api_anti_captcha_status():
+    if not _anti_captcha_local_request():
+        return jsonify({"status": "forbidden"}), 403
+    response = jsonify(_anti_captcha_status())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api/anti-captcha")
+def api_anti_captcha_save():
+    global _anti_captcha_client, _anti_captcha_client_key
+    if not _anti_captcha_local_request(write=True):
+        return jsonify({"status": "forbidden"}), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or type(payload.get("enabled")) is not bool:
+        return jsonify({"status": "invalid_request"}), 400
+    value = payload.get("api_key", "")
+    if (not isinstance(value, str) or len(value) > 256 or
+            any(ord(char) < 33 or ord(char) > 126 or char == "#" for char in value)):
+        return jsonify({"status": "invalid_request"}), 400
+    clear_key = payload.get("clear_key", False)
+    if type(clear_key) is not bool or (clear_key and (payload["enabled"] or value)):
+        return jsonify({"status": "invalid_request"}), 400
+    existing = envfile.read_env().get("ANTI_CAPTCHA_API_KEY", "").strip()
+    if payload["enabled"] and not (value or existing):
+        return jsonify({"status": "not_configured"}), 400
+    updates = {"ANTI_CAPTCHA_ENABLED": "1" if payload["enabled"] else "0"}
+    if value or clear_key:
+        updates["ANTI_CAPTCHA_API_KEY"] = "" if clear_key else value
+    try:
+        envfile.update_env(updates)
+        with _anti_captcha_client_lock:
+            _anti_captcha_client = None
+            _anti_captcha_client_key = None
+        response = jsonify(_anti_captcha_status())
+    except (OSError, ValueError):
+        return jsonify({"status": "save_failed"}), 500
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.post("/api/config")

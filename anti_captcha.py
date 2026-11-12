@@ -1,12 +1,12 @@
-"""Offline-safe preparation for Anti-Captcha; no HH challenge is submitted here.
-
-Only the official non-paid getBalance and getTaskResult calls are implemented.
-No createTask, solution injection, or HH lifecycle hook is present.
-"""
+"""Structural CAPTCHA detection and bounded image-to-text service adapter."""
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import hashlib
+import hmac
+import threading
 import time
 
 import requests
@@ -14,6 +14,7 @@ import requests
 
 BALANCE_URL = "https://api.anti-captcha.com/getBalance"
 TASK_RESULT_URL = "https://api.anti-captcha.com/getTaskResult"
+CREATE_TASK_URL = "https://api.anti-captcha.com/createTask"
 BALANCE_CACHE_SECONDS = 30  # Official API asks clients not to call more often.
 _CHALLENGE_PATHS = {
     ("www.google.com", "/recaptcha/"): "recaptcha",
@@ -36,6 +37,43 @@ def classify_challenge_markers(markers: list[tuple[str, str]]) -> str:
     return next(iter(kinds)) if len(kinds) == 1 else "unknown"
 
 
+def _image_captcha_dialog_count(page) -> tuple[int | None, str]:
+    """Count only complete visible image/input/action CAPTCHA dialogs.
+
+    A generic image or text input on a response form is never enough. No
+    image bytes, labels, input values, DOM text or arbitrary attributes leave
+    the browser evaluation.
+    """
+    try:
+        count = page.locator('[role="dialog"]:visible').evaluate_all("""dialogs => {
+          const visible = el => {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          let candidates = 0;
+          for (const dialog of dialogs.slice(0, 10)) {
+            const markers = [...dialog.querySelectorAll('[data-qa*="captcha"]')]
+              .filter(visible);
+            if (!markers.length) continue;
+            const images = markers.filter(el => el.tagName === 'IMG')
+              .concat(markers.flatMap(el => [...el.querySelectorAll('img')])).filter(visible);
+            const inputs = [...dialog.querySelectorAll(
+              'input[type="text"], input:not([type]), input[type="search"]')]
+              .filter(el => visible(el) && !el.disabled);
+            const actions = [...dialog.querySelectorAll('button, [role="button"]')]
+              .filter(el => visible(el) && !el.disabled);
+            if (images.length === 1 && inputs.length === 1 && actions.length === 1)
+              candidates++;
+          }
+          return candidates;
+        }""")
+    except Exception:
+        return None, "unavailable"
+    return (count, "ok") if type(count) is int and 0 <= count <= 10 else (None, "unavailable")
+
+
 def capture_challenge_structure(page) -> dict:
     """Inspect visible iframes and return only allowlisted structural metadata.
 
@@ -43,9 +81,11 @@ def capture_challenge_structure(page) -> dict:
     sitekey, image, token, text or frame contents. Unknown HH challenges stay
     unknown and must be handled by the existing manual pause.
     """
+    image_dialogs, image_probe = _image_captcha_dialog_count(page)
     empty = {"captcha_type": "unknown", "classification_confidence": "none",
              "visible_iframe_count": None, "recognized_marker_count": 0,
-             "probe_status": "unavailable"}
+             "image_candidate_dialog_count": image_dialogs,
+             "image_probe_status": image_probe, "probe_status": "unavailable"}
     try:
         raw = page.locator("iframe[src]").evaluate_all("""nodes => {
           const markers = [];
@@ -88,10 +128,14 @@ def capture_challenge_structure(page) -> dict:
                         all(isinstance(part, str) for part in marker) and
                         tuple(marker) in _CHALLENGE_PATHS)]
     kind = classify_challenge_markers(safe_markers)
+    if image_dialogs == 1:
+        kind = "image_to_text" if not safe_markers else "unknown"
     return {"captcha_type": kind,
             "classification_confidence": "structural" if kind != "unknown" else "none",
             "visible_iframe_count": visible,
             "recognized_marker_count": len(safe_markers),
+            "image_candidate_dialog_count": image_dialogs,
+            "image_probe_status": image_probe,
             "probe_status": "ok"}
 
 
@@ -117,8 +161,19 @@ class TaskStatus:
     reason: str = ""
 
 
+@dataclass(frozen=True, repr=False)
+class ImageSolution:
+    state: str  # ready | processing | error | stopped | timeout
+    text: str = ""
+    cost_usd: Decimal | None = None
+    reason: str = ""
+
+    def __repr__(self):
+        return f"ImageSolution(state={self.state!r}, reason={self.reason!r})"
+
+
 class AntiCaptchaClient:
-    """Read-only balance/task status with a 30-second balance cache.
+    """Official API client with a 30-second balance cache.
 
     The key is never stored in a result or diagnostic. The transport is
     injectable so all tests remain offline.
@@ -179,6 +234,59 @@ class AntiCaptchaClient:
         except (requests.RequestException, ValueError, TypeError):
             return TaskStatus("error", reason="task_transport_error")
 
+    def create_image_task(self, image: bytes) -> tuple[int | None, str]:
+        """Send only the cropped challenge image; never expose the API response text."""
+        if not self._key or not image or len(image) > 500_000:
+            return None, "invalid_image_or_key"
+        try:
+            response = self._post(CREATE_TASK_URL, json={
+                "clientKey": self._key,
+                "task": {"type": "ImageToTextTask",
+                         "body": base64.b64encode(image).decode("ascii"),
+                         "languagePool": "rn"}}, timeout=10)
+            body = response.json() if response.status_code == 200 else None
+            task_id = body.get("taskId") if isinstance(body, dict) and body.get("errorId") == 0 else None
+            return (task_id, "created") if type(task_id) is int and task_id > 0 else (None, "task_creation_failed")
+        except (requests.RequestException, ValueError, TypeError):
+            return None, "task_transport_error"
+
+    def get_image_solution(self, task_id: int, *, timeout_seconds: float = 10) -> ImageSolution:
+        if not self._key or type(task_id) is not int or task_id <= 0:
+            return ImageSolution("error", reason="invalid_task_or_key")
+        try:
+            response = self._post(TASK_RESULT_URL,
+                                  json={"clientKey": self._key, "taskId": task_id},
+                                  timeout=min(10, timeout_seconds))
+            body = response.json() if response.status_code == 200 else None
+            if not isinstance(body, dict) or body.get("errorId") != 0:
+                return ImageSolution("error", reason="task_result_failed")
+            if body.get("status") == "processing":
+                return ImageSolution("processing")
+            solution = body.get("solution")
+            answer = solution.get("text") if isinstance(solution, dict) else None
+            if (body.get("status") == "ready" and isinstance(answer, str)
+                    and 0 < len(answer) <= 128 and answer.isprintable()):
+                return ImageSolution("ready", text=answer, cost_usd=_money(body.get("cost")))
+            return ImageSolution("error", reason="task_result_invalid")
+        except (requests.RequestException, ValueError, TypeError):
+            return ImageSolution("error", reason="task_transport_error")
+
+    def wait_for_image_solution(self, task_id: int, *, max_wait_seconds: int,
+                                stopped, sleep=time.sleep, poll_seconds: int = 2) -> ImageSolution:
+        if max_wait_seconds <= 0 or poll_seconds <= 0:
+            return ImageSolution("error", reason="invalid_wait_limit")
+        deadline = self._clock() + max_wait_seconds
+        while True:
+            if stopped():
+                return ImageSolution("stopped")
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return ImageSolution("timeout")
+            result = self.get_image_solution(task_id, timeout_seconds=min(10, remaining))
+            if result.state != "processing":
+                return result
+            sleep(min(poll_seconds, max(0, deadline - self._clock())))
+
     def wait_for_task(self, task_id: int, *, max_wait_seconds: int,
                       stopped, sleep=time.sleep, poll_seconds: int = 2) -> TaskStatus:
         """Bounded, stop-aware polling of an already-created task only."""
@@ -200,34 +308,45 @@ class AntiCaptchaClient:
             sleep(min(poll_seconds, remaining))
 
 
-def preflight(*, enabled: bool, has_key: bool, challenge_type: str,
-              daily_limit_usd: object, task_limit_usd: object,
-              spent_today_usd: object, estimated_task_usd: object,
-              balance: BalanceResult, hh_permission_confirmed: bool = False) -> str:
-    """Return a safe reason; no paid task can be created by this module.
+def image_challenge_controls(page):
+    """Return only one complete visible dialog, or None; no page-wide screenshot."""
+    try:
+        dialog = page.locator('[role="dialog"]:visible').filter(
+            has=page.locator('[data-qa*="captcha"]:visible'))
+        if dialog.count() != 1:
+            return None
+        image = dialog.locator('img[data-qa*="captcha"]:visible, '
+                               '[data-qa*="captcha"] img:visible')
+        field = dialog.locator('input[type="text"]:visible, input:not([type]):visible, '
+                              'input[type="search"]:visible')
+        action = dialog.locator('button:visible, [role="button"]:visible')
+        if image.count() != 1 or field.count() != 1 or action.count() != 1:
+            return None
+        if not field.is_enabled() or not action.is_enabled():
+            return None
+        return image, field, action
+    except Exception:
+        return None
 
-    An unknown price is rejected because the API reports actual cost only
-    after a task finishes. In-memory spending alone cannot enforce a daily
-    limit across restarts, so this is a preflight, not an accounting ledger.
-    """
-    if not enabled:
-        return "disabled"
-    if not has_key:
-        return "missing_api_key"
-    if challenge_type not in {"recaptcha", "hcaptcha", "turnstile"}:
-        return "unsupported_or_unknown_type"
-    if not hh_permission_confirmed:
-        return "hh_permission_unconfirmed"
-    daily = _money(daily_limit_usd)
-    task = _money(task_limit_usd)
-    spent = _money(spent_today_usd)
-    estimate = _money(estimated_task_usd)
-    if None in (daily, task, spent, estimate) or daily == 0 or task == 0 or estimate == 0:
-        return "budget_unavailable"
-    if estimate > task or spent + estimate > daily:
-        return "budget_exceeded"
-    if not balance.available or balance.amount_usd is None:
-        return "balance_unavailable"
-    if balance.amount_usd < estimate:
-        return "insufficient_balance"
-    return "preflight_only_no_paid_task_support"
+
+def challenge_digest(image: bytes, api_key: str) -> str:
+    return hmac.new(api_key.encode("utf-8"), image, hashlib.sha256).hexdigest()
+
+
+class ImageTaskRegistry:
+    """Claim each image before createTask, including uncertain transport results."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._seen: set[str] = set()
+
+    def claim(self, image: bytes, api_key: str) -> bool:
+        digest = challenge_digest(image, api_key)
+        with self._lock:
+            if digest in self._seen:
+                return False
+            self._seen.add(digest)
+            return True
+
+
+IMAGE_TASKS = ImageTaskRegistry()

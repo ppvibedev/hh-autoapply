@@ -1,20 +1,24 @@
 """Offline preparation checks; no paid task, HH, or external API call."""
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import unittest
 from unittest.mock import Mock
 
 import requests
 
-from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus,
-                          capture_challenge_structure, classify_challenge_markers,
-                          preflight)
+from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus, ImageSolution,
+                          ImageTaskRegistry, capture_challenge_structure,
+                          classify_challenge_markers)
 
 
 class AntiCaptchaPreparationTests(unittest.TestCase):
     def test_visible_structural_marker_snapshot_is_allowlisted(self):
         private = "secret-sitekey-or-contact@example.test"
         page = Mock()
-        page.locator.return_value.evaluate_all.return_value = {
+        image_probe, iframe_probe = Mock(), Mock()
+        page.locator.side_effect = lambda selector: image_probe if selector == '[role="dialog"]:visible' else iframe_probe
+        image_probe.evaluate_all.return_value = 0
+        iframe_probe.evaluate_all.return_value = {
             "visible": 2,
             "markers": [["www.google.com", "/recaptcha/"],
                         ["private.example", private]],
@@ -23,13 +27,33 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
         self.assertEqual(snapshot, {
             "captcha_type": "recaptcha", "classification_confidence": "structural",
             "visible_iframe_count": 2, "recognized_marker_count": 1,
+            "image_candidate_dialog_count": 0, "image_probe_status": "ok",
             "probe_status": "ok"})
         self.assertNotIn(private, repr(snapshot))
-        page.locator.assert_called_once_with("iframe[src]")
+
+    def test_image_dialog_is_structural_and_privacy_safe(self):
+        private = "private-captcha-answer-or-contact@example.test"
+        page = Mock()
+        image_probe, iframe_probe = Mock(), Mock()
+        page.locator.side_effect = lambda selector: image_probe if selector == '[role="dialog"]:visible' else iframe_probe
+        image_probe.evaluate_all.return_value = 1
+        iframe_probe.evaluate_all.return_value = {
+            "visible": 0, "markers": [], "text": private, "image": private}
+        snapshot = capture_challenge_structure(page)
+        self.assertEqual(snapshot["captcha_type"], "image_to_text")
+        self.assertEqual(snapshot["classification_confidence"], "structural")
+        self.assertEqual(snapshot["image_candidate_dialog_count"], 1)
+        self.assertNotIn(private, repr(snapshot))
+        iframe_probe.evaluate_all.return_value = {
+            "visible": 1, "markers": [["www.google.com", "/recaptcha/"]]}
+        self.assertEqual(capture_challenge_structure(page)["captcha_type"], "unknown")
 
     def test_unknown_ambiguous_and_probe_failure_stay_unknown(self):
         page = Mock()
-        probe = page.locator.return_value.evaluate_all
+        image_probe, iframe_probe = Mock(), Mock()
+        page.locator.side_effect = lambda selector: image_probe if selector == '[role="dialog"]:visible' else iframe_probe
+        image_probe.evaluate_all.return_value = 0
+        probe = iframe_probe.evaluate_all
         probe.return_value = {"visible": 1, "markers": []}
         self.assertEqual(capture_challenge_structure(page)["captcha_type"], "unknown")
         probe.return_value = {"visible": 2, "markers": [
@@ -88,27 +112,47 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
         self.assertEqual(result.reason, "balance_service_error")
         self.assertNotIn(secret, repr(result))
 
-    def test_budget_balance_permission_and_unknown_type_fail_closed(self):
-        base = dict(enabled=True, has_key=True, challenge_type="recaptcha",
-                    daily_limit_usd="1", task_limit_usd="0.1",
-                    spent_today_usd="0", estimated_task_usd="0.05",
-                    balance=BalanceResult(True, Decimal("1")))
-        self.assertEqual(preflight(**base), "hh_permission_unconfirmed")
-        self.assertEqual(preflight(**(base | {"challenge_type": "unknown"})),
-                         "unsupported_or_unknown_type")
-        self.assertEqual(preflight(**(base | {"daily_limit_usd": "0"}),
-                                   hh_permission_confirmed=True), "budget_unavailable")
-        self.assertEqual(preflight(**(base | {"estimated_task_usd": "0.2"}),
-                                   hh_permission_confirmed=True), "budget_exceeded")
-        self.assertEqual(preflight(**(base | {"balance": BalanceResult(True, Decimal("0"))}),
-                                   hh_permission_confirmed=True), "insufficient_balance")
-        self.assertEqual(preflight(**base, hh_permission_confirmed=True),
-                         "preflight_only_no_paid_task_support")
+    def test_image_task_uses_only_cropped_image_and_solution_is_redacted(self):
+        secret = "PRIVATE_CAPTCHA_ANSWER"
+        post = Mock(side_effect=[
+            Mock(status_code=200, json=lambda: {"errorId": 0, "taskId": 123}),
+            Mock(status_code=200, json=lambda: {"errorId": 0, "status": "ready",
+                                                  "solution": {"text": secret}, "cost": "0.001"})])
+        client = AntiCaptchaClient("DUMMY_KEY", post=post)
+        task_id, reason = client.create_image_task(b"synthetic-image-only")
+        self.assertEqual((task_id, reason), (123, "created"))
+        payload = post.call_args_list[0].kwargs["json"]
+        self.assertEqual(set(payload), {"clientKey", "task"})
+        self.assertEqual(set(payload["task"]), {"type", "body", "languagePool"})
+        self.assertEqual(payload["task"]["languagePool"], "rn")
+        result = client.get_image_solution(task_id)
+        self.assertEqual(result.text, secret)
+        self.assertNotIn(secret, repr(result))
+        self.assertEqual(result.cost_usd, Decimal("0.001"))
 
-    def test_duplicate_or_stopped_captcha_cannot_start_paid_task(self):
-        client = AntiCaptchaClient("DUMMY_KEY", post=Mock())
-        self.assertFalse(hasattr(client, "create_task"))
-        self.assertFalse(hasattr(client, "submit_solution_to_hh"))
+    def test_concurrent_duplicate_image_creates_one_claim(self):
+        registry = ImageTaskRegistry()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: registry.claim(b"synthetic-image", "DUMMY_KEY"),
+                                    range(8)))
+        self.assertEqual(results.count(True), 1)
+        self.assertTrue(registry.claim(b"different-image", "DUMMY_KEY"))
+
+    def test_image_task_timeout_and_stop_are_bounded(self):
+        now = [0.0]
+        client = AntiCaptchaClient("DUMMY_KEY", post=Mock(), clock=lambda: now[0])
+        client.get_image_solution = Mock(return_value=ImageSolution("processing"))
+        def sleep(seconds):
+            now[0] += seconds
+        result = client.wait_for_image_solution(7, max_wait_seconds=3,
+                                                stopped=lambda: False, sleep=sleep)
+        self.assertEqual(result.state, "timeout")
+        self.assertLessEqual(now[0], 3)
+        client.get_image_solution.reset_mock()
+        result = client.wait_for_image_solution(7, max_wait_seconds=3,
+                                                stopped=lambda: True, sleep=sleep)
+        self.assertEqual(result.state, "stopped")
+        client.get_image_solution.assert_not_called()
 
     def test_existing_task_status_discards_solution_and_private_error(self):
         secret = "PRIVATE_KEY"

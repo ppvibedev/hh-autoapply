@@ -211,7 +211,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
     stopped = stopped or _observe_stop
     challenge_structure = anti_captcha.capture_challenge_structure(page)
 
-    def emit(event):
+    def emit(event, **safe_fields):
         if telemetry is None:
             return
         row = {"event": event, "run_id": run_id, "operation": operation,
@@ -221,7 +221,108 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
         row["page_path"] = hh_web.safe_captcha_path(page)
         if event == "captcha_wait_started":
             row.update(challenge_structure)
+        row.update(safe_fields)
         telemetry(row)
+
+    def try_auto_image() -> bool:
+        if (not config.ANTI_CAPTCHA_ENABLED or not config.ANTI_CAPTCHA_API_KEY or
+                challenge_structure.get("captcha_type") != "image_to_text" or stopped()):
+            return False
+        client = anti_captcha.AntiCaptchaClient(config.ANTI_CAPTCHA_API_KEY)
+        for attempt in range(2):
+            if stopped():
+                return False
+            if anti_captcha.capture_challenge_structure(page).get("captcha_type") != "image_to_text":
+                emit("captcha_auto_fallback", reason="challenge_unrecognized")
+                return False
+            controls = anti_captcha.image_challenge_controls(page)
+            if controls is None:
+                emit("captcha_auto_fallback", reason="controls_not_unique")
+                return False
+            image = controls[0]
+            try:
+                image_bytes = image.screenshot(timeout=3000)
+            except Exception:
+                emit("captcha_auto_fallback", reason="image_capture_failed")
+                return False
+            if not image_bytes or len(image_bytes) > 500_000:
+                emit("captcha_auto_fallback", reason="image_invalid")
+                return False
+            balance = client.get_balance()
+            if not balance.available or balance.amount_usd is None or balance.amount_usd <= 0:
+                emit("captcha_auto_fallback", reason="balance_unavailable")
+                return False
+            if stopped():
+                return False
+            try:
+                current = anti_captcha.image_challenge_controls(page)
+                if current is None or current[0].screenshot(timeout=3000) != image_bytes:
+                    if attempt == 0 and current is not None:
+                        emit("captcha_auto_retry", reason="challenge_changed")
+                        continue
+                    emit("captcha_auto_fallback", reason="challenge_changed")
+                    return False
+            except Exception:
+                emit("captcha_auto_fallback", reason="challenge_changed")
+                return False
+            if not anti_captcha.IMAGE_TASKS.claim(image_bytes, config.ANTI_CAPTCHA_API_KEY):
+                emit("captcha_auto_fallback", reason="duplicate_challenge")
+                return False
+            if stopped():
+                return False
+            emit("captcha_auto_started", attempt=attempt + 1)
+            task_id, reason = client.create_image_task(image_bytes)
+            if task_id is None:
+                emit("captcha_auto_fallback", reason=reason)
+                return False
+            result = client.wait_for_image_solution(
+                task_id, max_wait_seconds=config.ANTI_CAPTCHA_MAX_WAIT_SECONDS,
+                stopped=stopped, sleep=sleep)
+            if result.state != "ready":
+                emit("captcha_auto_fallback", reason=result.reason or result.state)
+                return False
+            if stopped():
+                return False
+            try:
+                current = anti_captcha.image_challenge_controls(page)
+                if current is None or current[0].screenshot(timeout=3000) != image_bytes:
+                    if attempt == 0 and current is not None:
+                        emit("captcha_auto_retry", reason="challenge_changed")
+                        continue
+                    emit("captcha_auto_fallback", reason="challenge_changed")
+                    return False
+                current[1].fill(result.text, timeout=3000)
+                if stopped():
+                    return False
+                current[2].click(timeout=3000)
+            except Exception:
+                emit("captcha_auto_fallback", reason="answer_application_failed")
+                return False
+            verified = 0
+            changed = False
+            for _ in range(10):
+                if stopped():
+                    return False
+                if hh_web.captcha_resolution_verified(page, operation, vacancy_id):
+                    verified += 1
+                    if verified >= 2:
+                        emit("captcha_auto_resolved")
+                        return True
+                else:
+                    verified = 0
+                try:
+                    next_controls = anti_captcha.image_challenge_controls(page)
+                    changed = (next_controls is not None and
+                               next_controls[0].screenshot(timeout=3000) != image_bytes)
+                except Exception:
+                    changed = False
+                if changed:
+                    break
+                sleep(1)
+            if not changed or attempt == 1:
+                emit("captcha_auto_fallback", reason="hh_not_verified")
+                return False
+        return False
 
     if on_stage is not None:
         on_stage("captcha_wait")
@@ -231,6 +332,9 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
     started = clock()
     expiry_reported = False
     try:
+        if try_auto_image():
+            emit("captcha_wait_resolved")
+            return
         while True:
             if stopped():
                 emit("captcha_wait_stopped")

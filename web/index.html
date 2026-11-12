@@ -221,6 +221,21 @@
     </div>
   </div>
 
+  <div class="card" id="antiCaptchaCard">
+    <h2>Anti-Captcha для графических проверок</h2>
+    <p class="muted">Ключ хранится только на этом компьютере. После изменения настройки применяются к следующему прогону.</p>
+    <div class="row"><span id="antiCaptchaStatus" class="badge b-off">Проверка…</span>
+      <span id="antiCaptchaBalance" class="muted"></span></div>
+    <label for="antiCaptchaKey">API-ключ Anti-Captcha</label>
+    <input id="antiCaptchaKey" type="password" autocomplete="off" spellcheck="false"
+           placeholder="Новый ключ или замена сохранённого">
+    <div class="row" style="margin-top:12px">
+      <button type="button" id="antiCaptchaSave" class="primary" onclick="saveAntiCaptcha(true)">Сохранить и проверить</button>
+      <button type="button" onclick="saveAntiCaptcha(false)">Отключить</button>
+      <button type="button" onclick="clearAntiCaptchaKey()">Удалить ключ</button>
+    </div>
+  </div>
+
   <div class="card">
     <h2>Лента решений</h2>
     <div class="history-filters" id="historyFilters" aria-label="Фильтр ленты решений">
@@ -631,6 +646,42 @@ async function saveConnection(){
 }
 loadConnections();
 
+function renderAntiCaptcha(data){
+  const labels={connected:'Подключено',connection_error:'Ошибка подключения',
+    not_configured:'Не настроено',disabled:'Отключено'};
+  const status=document.getElementById('antiCaptchaStatus');
+  status.textContent=labels[data.status]||'Ошибка подключения';
+  status.className='badge '+(data.status==='connected'?'b-ok':'b-off');
+  document.getElementById('antiCaptchaBalance').textContent=
+    data.balance_usd!==null&&data.balance_usd!==undefined?`Баланс: $${data.balance_usd}`:'';
+}
+async function loadAntiCaptcha(){
+  try{
+    const response=await fetch('/api/anti-captcha',{cache:'no-store'});
+    const data=await response.json();
+    if(!response.ok) throw new Error();
+    renderAntiCaptcha(data);
+  }catch{document.getElementById('antiCaptchaStatus').textContent='Ошибка подключения';}
+}
+async function saveAntiCaptcha(enabled,clearKey=false){
+  const input=document.getElementById('antiCaptchaKey');
+  const key=input.value.trim();
+  input.value='';
+  const button=document.getElementById('antiCaptchaSave');button.disabled=true;
+  try{
+    const response=await fetch('/api/anti-captcha',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled,clear_key:clearKey,...(key&&enabled&&!clearKey?{api_key:key}:{})})});
+    const data=await response.json();
+    if(!response.ok) throw new Error();
+    renderAntiCaptcha(data);
+    showToast(enabled?'Настройки сохранены; подключение проверено':'Anti-Captcha отключена');
+  }catch{showToast('Не удалось сохранить или проверить Anti-Captcha','err');}
+  finally{input.value='';button.disabled=false;}
+}
+function clearAntiCaptchaKey(){document.getElementById('antiCaptchaKey').value='';saveAntiCaptcha(false,true);}
+loadAntiCaptcha();
+
 async function loadApplicationProfile(){
   const input=document.getElementById('APPLICATION_TELEGRAM');
   try {
@@ -644,7 +695,7 @@ document.getElementById('APPLICATION_TELEGRAM').addEventListener('input',event=>
 
 async function postForm(silent){
   const body = {};
-  document.querySelectorAll('input,select').forEach(el=>{ if(el.id && !el.id.startsWith('connection')) body[el.id]=el.value; });
+  document.querySelectorAll('input,select').forEach(el=>{ if(el.id && !el.id.startsWith('connection') && !el.id.startsWith('antiCaptcha')) body[el.id]=el.value; });
   body.APPLICATION_TELEGRAM=(body.APPLICATION_TELEGRAM||'').trim();
   const d = await postAction('/api/config', silent?null:'Настройки сохранены', body);
   if(d) document.getElementById('APPLICATION_TELEGRAM').value=body.APPLICATION_TELEGRAM;
