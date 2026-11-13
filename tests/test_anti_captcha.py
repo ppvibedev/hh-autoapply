@@ -2,12 +2,12 @@
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
 from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus, ImageSolution,
-                          ImageTaskRegistry, capture_challenge_structure,
+                          ImageTaskRegistry, capture_challenge_structure, image_challenge_controls,
                           classify_challenge_markers)
 
 
@@ -28,7 +28,7 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
             "captcha_type": "recaptcha", "classification_confidence": "structural",
             "visible_iframe_count": 2, "recognized_marker_count": 1,
             "image_candidate_dialog_count": 0, "image_probe_status": "ok",
-            "probe_status": "ok"})
+            "hh_image_pair_count": 0, "probe_status": "ok"})
         self.assertNotIn(private, repr(snapshot))
 
     def test_image_dialog_is_structural_and_privacy_safe(self):
@@ -47,6 +47,79 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
         iframe_probe.evaluate_all.return_value = {
             "visible": 1, "markers": [["www.google.com", "/recaptcha/"]]}
         self.assertEqual(capture_challenge_structure(page)["captcha_type"], "unknown")
+
+    def test_real_hh_image_pair_without_dialog_is_classified(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content('''<div><div>
+                  <img data-qa="account-captcha-picture" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                  <button data-qa="captcha-renew-text" type="button"></button>
+                  <button data-qa="captcha-language" type="button"></button>
+                  <input data-qa="account-captcha-input" type="text">
+                  </div></div>''')
+                snapshot = capture_challenge_structure(page)
+                self.assertEqual(snapshot["captcha_type"], "image_to_text")
+                self.assertEqual(snapshot["image_candidate_dialog_count"], 0)
+                self.assertEqual(snapshot["hh_image_pair_count"], 1)
+                self.assertNotIn("R0lGOD", repr(snapshot))
+                self.assertIsNone(image_challenge_controls(page))
+                page.set_content('''<form><div>
+                  <img data-qa="account-captcha-picture" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                  <button data-qa="captcha-renew-text" type="button"></button>
+                  <button data-qa="captcha-language" type="button"></button>
+                  <input data-qa="account-captcha-input" type="text">
+                  <button type="submit"></button>
+                  </div></form>''')
+                controls = image_challenge_controls(page)
+                self.assertIsNotNone(controls)
+                self.assertEqual(controls[0].get_attribute("data-qa"), "account-captcha-picture")
+                self.assertEqual(controls[1].get_attribute("data-qa"), "account-captcha-input")
+                self.assertEqual(controls[2].get_attribute("type"), "submit")
+                page.locator('button[type="submit"]').evaluate('button => button.disabled = true')
+                self.assertIsNone(image_challenge_controls(page))
+            finally:
+                browser.close()
+
+    def test_hh_image_pair_routes_to_offline_handler_when_form_action_is_unique(self):
+        import run_web
+        from playwright.sync_api import sync_playwright
+        from unittest.mock import MagicMock
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content('''<form onsubmit="event.preventDefault(); this.remove()"><div>
+                  <img data-qa="account-captcha-picture" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                  <input data-qa="account-captcha-input" type="text">
+                  <button type="submit"></button>
+                  </div></form>''')
+                client = MagicMock()
+                client.get_balance.return_value = BalanceResult(True, Decimal("1"))
+                client.create_image_task.return_value = (123, None)
+                client.wait_for_image_solution.return_value = ImageSolution("ready", "sample")
+                rows = []
+                with patch("config.ANTI_CAPTCHA_ENABLED", True), \
+                     patch("config.ANTI_CAPTCHA_API_KEY", "offline-test-key"), \
+                     patch("anti_captcha.AntiCaptchaClient", return_value=client), \
+                     patch("anti_captcha.IMAGE_TASKS", ImageTaskRegistry()), \
+                     patch("hh_web.safe_captcha_path", return_value="/vacancy/123"), \
+                     patch("hh_web.captcha_resolution_verified",
+                           side_effect=lambda *_: page.locator('form').count() == 0):
+                    run_web._wait_for_manual_captcha(
+                        page, operation="application_post_submit", run_id="f" * 32,
+                        vacancy_id="123", stopped=lambda: False, telemetry=rows.append,
+                        sleep=lambda _: None)
+                self.assertEqual(client.create_image_task.call_count, 1)
+                self.assertEqual(page.locator("form").count(), 0)
+                self.assertEqual(rows[0]["captcha_type"], "image_to_text")
+                self.assertIn("captcha_auto_resolved", [row["event"] for row in rows])
+                self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
+                self.assertNotIn("offline-test-key", repr(rows))
+            finally:
+                browser.close()
 
     def test_unknown_ambiguous_and_probe_failure_stay_unknown(self):
         page = Mock()

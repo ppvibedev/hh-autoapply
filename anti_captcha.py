@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
+import re
 import threading
 import time
 
@@ -74,6 +75,106 @@ def _image_captcha_dialog_count(page) -> tuple[int | None, str]:
     return (count, "ok") if type(count) is int and 0 <= count <= 10 else (None, "unavailable")
 
 
+def _hh_image_pair_count(page) -> int:
+    """HH's observed image and answer field have exact, challenge-specific QA IDs."""
+    try:
+        image = page.locator('img[data-qa="account-captcha-picture"]:visible')
+        field = page.locator('input[data-qa="account-captcha-input"]:visible')
+        return int(image.count() == 1 and field.count() == 1 and field.is_enabled())
+    except Exception:
+        return 0
+
+
+def _unknown_image_structure(page) -> list[list[dict]]:
+    """Bounded structural clues for an unrecognized live challenge; no DOM content."""
+    try:
+        raw = page.locator('[data-qa*="captcha"]:visible').evaluate_all("""nodes => {
+          const safeQa = el => {
+            const value = el.getAttribute('data-qa') || '';
+            return /^[a-zA-Z0-9_-]{1,80}$/.test(value) &&
+              (value.startsWith('captcha-') || value.startsWith('account-captcha-'))
+              ? value : null;
+          };
+          const visible = el => {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const shape = el => ({
+            tag: el.tagName.toLowerCase(),
+            role: ['dialog', 'alertdialog', 'button', 'textbox'].includes(el.getAttribute('role'))
+              ? el.getAttribute('role') : null,
+            data_qa: safeQa(el),
+            visible: visible(el),
+            img_count: el.querySelectorAll('img').length,
+            canvas_count: el.querySelectorAll('canvas').length,
+            input_count: el.querySelectorAll('input').length,
+            button_count: el.querySelectorAll('button, [role="button"]').length,
+            buttons: [...el.querySelectorAll('button, [role="button"]')].slice(0, 6)
+              .map(button => ({tag: button.tagName.toLowerCase(), data_qa: safeQa(button),
+                type: ['submit', 'button', 'reset'].includes(button.getAttribute('type'))
+                  ? button.getAttribute('type') : null,
+                enabled: !button.disabled, visible: visible(button)})),
+            background_image: getComputedStyle(el).backgroundImage.startsWith('url(')
+          });
+          return nodes.slice(0, 4).map(node => {
+            const chain = [];
+            for (let el = node, depth = 0; el && depth < 8; el = el.parentElement, depth++)
+              chain.push(shape(el));
+            return chain;
+          });
+        }""")
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    def safe_shape(node):
+        if not isinstance(node, dict):
+            return None
+        tag = node.get("tag")
+        if not isinstance(tag, str) or tag not in {"div", "span", "section", "form", "img", "input", "button", "label"}:
+            return None
+        role = node.get("role")
+        qa = node.get("data_qa")
+        if not isinstance(role, (str, type(None))) or role not in {None, "dialog", "alertdialog", "button", "textbox"}:
+            role = None
+        if not (isinstance(qa, str) and re.fullmatch(r"(?:captcha|account-captcha)-[A-Za-z0-9_-]{1,64}", qa)):
+            qa = None
+        result = {"tag": tag, "role": role, "data_qa": qa}
+        for key in ("visible", "background_image"):
+            result[key] = node.get(key) if type(node.get(key)) is bool else False
+        for key in ("img_count", "canvas_count", "input_count", "button_count"):
+            count = node.get(key)
+            result[key] = min(count, 100) if type(count) is int and count >= 0 else 0
+        buttons = node.get("buttons")
+        result["buttons"] = []
+        if isinstance(buttons, list):
+            for button in buttons[:6]:
+                if (not isinstance(button, dict) or not isinstance(button.get("tag"), str)
+                        or button.get("tag") not in {"button", "div", "span"}):
+                    continue
+                bqa = button.get("data_qa")
+                if not (isinstance(bqa, str) and re.fullmatch(r"(?:captcha|account-captcha)-[A-Za-z0-9_-]{1,64}", bqa)):
+                    bqa = None
+                button_type = button.get("type")
+                result["buttons"].append({
+                    "tag": button["tag"], "data_qa": bqa,
+                    "type": button_type if isinstance(button_type, str) and button_type in {"submit", "button", "reset"} else None,
+                    "enabled": button.get("enabled") is True,
+                    "visible": button.get("visible") is True,
+                })
+        return result
+    output = []
+    for chain in raw[:4]:
+        if not isinstance(chain, list):
+            continue
+        safe_chain = [shape for node in chain[:8] if (shape := safe_shape(node)) is not None]
+        if safe_chain:
+            output.append(safe_chain)
+    return output
+
+
 def capture_challenge_structure(page) -> dict:
     """Inspect visible iframes and return only allowlisted structural metadata.
 
@@ -82,9 +183,11 @@ def capture_challenge_structure(page) -> dict:
     unknown and must be handled by the existing manual pause.
     """
     image_dialogs, image_probe = _image_captcha_dialog_count(page)
+    hh_image_pairs = _hh_image_pair_count(page)
     empty = {"captcha_type": "unknown", "classification_confidence": "none",
              "visible_iframe_count": None, "recognized_marker_count": 0,
              "image_candidate_dialog_count": image_dialogs,
+             "hh_image_pair_count": hh_image_pairs,
              "image_probe_status": image_probe, "probe_status": "unavailable"}
     try:
         raw = page.locator("iframe[src]").evaluate_all("""nodes => {
@@ -128,15 +231,21 @@ def capture_challenge_structure(page) -> dict:
                         all(isinstance(part, str) for part in marker) and
                         tuple(marker) in _CHALLENGE_PATHS)]
     kind = classify_challenge_markers(safe_markers)
-    if image_dialogs == 1:
+    if image_dialogs == 1 or hh_image_pairs == 1:
         kind = "image_to_text" if not safe_markers else "unknown"
-    return {"captcha_type": kind,
+    result = {"captcha_type": kind,
             "classification_confidence": "structural" if kind != "unknown" else "none",
             "visible_iframe_count": visible,
             "recognized_marker_count": len(safe_markers),
             "image_candidate_dialog_count": image_dialogs,
+            "hh_image_pair_count": hh_image_pairs,
             "image_probe_status": image_probe,
             "probe_status": "ok"}
+    if kind in {"unknown", "image_to_text"} and hh_image_pairs == 1:
+        result["hh_image_structure"] = _unknown_image_structure(page)
+    elif kind == "unknown":
+        result["unknown_image_structure"] = _unknown_image_structure(page)
+    return result
 
 
 def _money(value: object) -> Decimal | None:
@@ -309,8 +418,20 @@ class AntiCaptchaClient:
 
 
 def image_challenge_controls(page):
-    """Return only one complete visible dialog, or None; no page-wide screenshot."""
+    """Return unambiguous visible image/field/action controls, or None."""
     try:
+        # Observed HH account CAPTCHA has no role=dialog. Its exact image and
+        # answer IDs identify the challenge; the associated form supplies the
+        # only semantic submit control. Ambiguous/missing controls stay manual.
+        if _hh_image_pair_count(page) == 1:
+            image = page.locator('img[data-qa="account-captcha-picture"]:visible')
+            field = page.locator('input[data-qa="account-captcha-input"]:visible')
+            form = field.locator('xpath=ancestor::form[1]')
+            if (form.count() == 1 and
+                    form.locator('img[data-qa="account-captcha-picture"]:visible').count() == 1):
+                action = form.locator('button[type="submit"]:visible')
+                if action.count() == 1 and action.is_enabled():
+                    return image, field, action
         dialog = page.locator('[role="dialog"]:visible').filter(
             has=page.locator('[data-qa*="captcha"]:visible'))
         if dialog.count() != 1:

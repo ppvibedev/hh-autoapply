@@ -210,6 +210,19 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
     sleep = sleep or time.sleep
     stopped = stopped or _observe_stop
     challenge_structure = anti_captcha.capture_challenge_structure(page)
+    if (challenge_structure.get("captcha_type") == "unknown" and
+            challenge_structure.get("probe_status") == "ok" and
+            config.ANTI_CAPTCHA_ENABLED and config.ANTI_CAPTCHA_API_KEY and
+            hh_web.captcha_present(page)):
+        # The CAPTCHA shell can appear before its image and field. This short
+        # read-only wait never continues or retries a possible HH submission.
+        for _ in range(10):
+            if stopped():
+                break
+            sleep(0.2)
+            challenge_structure = anti_captcha.capture_challenge_structure(page)
+            if challenge_structure.get("captcha_type") != "unknown":
+                break
 
     def emit(event, **safe_fields):
         if telemetry is None:
