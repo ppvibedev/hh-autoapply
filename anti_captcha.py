@@ -492,14 +492,39 @@ def image_control_failure_reason(page) -> str:
 def hh_wrong_image_answer_visible(page) -> bool:
     """Recognize the observed HH rejection only beside an active exact CAPTCHA pair."""
     try:
-        # The exact image/input pair anchors this check to the active HH
-        # CAPTCHA even if validation feedback is mounted outside its dialog.
         if _hh_image_pair_count(page) != 1:
             return False
         error = page.get_by_text("Неверный текст. Пожалуйста, повторите попытку", exact=True)
-        return error.count() == 1 and error.is_visible()
+        # Hidden copies and nested portal nodes must not hide one visible error.
+        return any(error.nth(index).is_visible() for index in range(min(error.count(), 20)))
     except Exception:
         return False
+
+
+def hh_image_loaded(image) -> bool:
+    """Return only image readiness; never read or persist its source or pixels."""
+    try:
+        return image.evaluate("el => el.complete && el.naturalWidth > 0 && el.naturalHeight > 0") is True
+    except Exception:
+        return False
+
+
+def hh_rejection_probe(page) -> dict:
+    """Bounded structural/error-state counts for a failed HH CAPTCHA check."""
+    result = {"exact_error_visible_count": 0, "input_aria_invalid": False,
+              "active_image_pair": False}
+    try:
+        if _hh_image_pair_count(page) != 1:
+            return result
+        result["active_image_pair"] = True
+        field = page.locator('input[data-qa="account-captcha-input"]:visible')
+        result["input_aria_invalid"] = field.get_attribute("aria-invalid") == "true"
+        error = page.get_by_text("Неверный текст. Пожалуйста, повторите попытку", exact=True)
+        result["exact_error_visible_count"] = sum(
+            error.nth(index).is_visible() for index in range(min(error.count(), 20)))
+    except Exception:
+        pass
+    return result
 
 
 def challenge_digest(image: bytes, api_key: str) -> str:

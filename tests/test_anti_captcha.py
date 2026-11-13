@@ -9,6 +9,7 @@ import requests
 from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus, ImageSolution,
                           ImageTaskRegistry, capture_challenge_structure, image_challenge_controls,
                           image_control_failure_reason, hh_wrong_image_answer_visible,
+                          hh_image_loaded, hh_rejection_probe,
                           classify_challenge_markers)
 
 
@@ -180,8 +181,14 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
                     src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
                   <input data-qa="account-captcha-input">
                   <button type="submit">OK</button></div>
+                  <div style="display:none">Неверный текст. Пожалуйста, повторите попытку</div>
                   <div role="alert">Неверный текст. Пожалуйста, повторите попытку</div>''')
                 self.assertIs(hh_wrong_image_answer_visible(page), True)
+                self.assertIs(hh_image_loaded(page.locator('img[data-qa="account-captcha-picture"]')), True)
+                probe = hh_rejection_probe(page)
+                self.assertEqual(probe["exact_error_visible_count"], 1)
+                self.assertTrue(probe["active_image_pair"])
+                self.assertNotIn("Неверный текст", str(probe))
                 page.locator('[data-qa="account-captcha-input"]').evaluate("element => element.remove()")
                 self.assertIs(hh_wrong_image_answer_visible(page), False)
             finally:

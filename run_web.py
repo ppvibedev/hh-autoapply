@@ -37,8 +37,9 @@ _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 LIVE_HISTORY_REREAD_DELAY_SECONDS = 0.02
 CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS = config.CAPTCHA_REMINDER_SECONDS
 CAPTCHA_POLL_INTERVAL_SECONDS = 1
+CAPTCHA_IMAGE_APPEAR_SECONDS = 4
 CAPTCHA_PREFLIGHT_REFRESH_LIMIT = 3
-CAPTCHA_PAID_TASK_LIMIT = 2
+CAPTCHA_PAID_TASK_LIMIT = 3
 CAPTCHA_HH_VERIFY_SECONDS = 10
 CAPTCHA_HH_VERIFY_POLL_SECONDS = 0.5
 WORKER_HEARTBEAT_SECONDS = 10
@@ -220,7 +221,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             hh_web.captcha_present(page)):
         # The CAPTCHA shell can appear before its image and field. This short
         # read-only wait never continues or retries a possible HH submission.
-        for _ in range(10):
+        for _ in range(int(CAPTCHA_IMAGE_APPEAR_SECONDS / 0.2)):
             if stopped():
                 break
             sleep(0.2)
@@ -256,18 +257,35 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
         client = anti_captcha.AntiCaptchaClient(config.ANTI_CAPTCHA_API_KEY)
         paid_tasks = 0
         preflight_refreshes = 0
+        image_load_deadline = clock() + CAPTCHA_IMAGE_APPEAR_SECONDS
+        image_wait_started = clock()
         while paid_tasks < CAPTCHA_PAID_TASK_LIMIT:
             if stopped():
                 return False
             if anti_captcha.capture_challenge_structure(page).get("captcha_type") != "image_to_text":
+                remaining = image_load_deadline - clock()
+                if hh_web.captcha_present(page) and remaining > 0:
+                    sleep(min(0.25, remaining))
+                    continue
                 emit("captcha_auto_fallback", reason="challenge_unrecognized")
                 return False
             controls = anti_captcha.image_challenge_controls(page)
             if controls is None:
+                remaining = image_load_deadline - clock()
+                if hh_web.captcha_present(page) and remaining > 0:
+                    sleep(min(0.25, remaining))
+                    continue
                 emit("captcha_auto_fallback",
                      reason=anti_captcha.image_control_failure_reason(page))
                 return False
             image = controls[0]
+            if not anti_captcha.hh_image_loaded(image):
+                remaining = image_load_deadline - clock()
+                if remaining <= 0:
+                    emit("captcha_auto_fallback", reason="image_not_loaded")
+                    return False
+                sleep(min(0.25, remaining))
+                continue
             try:
                 image_bytes = image.screenshot(timeout=3000)
             except Exception:
@@ -276,19 +294,21 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             if not image_bytes or len(image_bytes) > 500_000:
                 emit("captcha_auto_fallback", reason="image_invalid")
                 return False
-            balance = client.get_balance()
-            if not balance.available or balance.amount_usd is None or balance.amount_usd <= 0:
-                emit("captcha_auto_fallback", reason="balance_unavailable")
+            if stopped():
                 return False
+            # Observe the loaded image twice without pressing HH's refresh control.
+            sleep(0.5)
             if stopped():
                 return False
             try:
                 current = anti_captcha.image_challenge_controls(page)
-                if current is None or current[0].screenshot(timeout=3000) != image_bytes:
+                if (current is None or not anti_captcha.hh_image_loaded(current[0]) or
+                        current[0].screenshot(timeout=3000) != image_bytes):
                     if current is not None and preflight_refreshes < CAPTCHA_PREFLIGHT_REFRESH_LIMIT:
                         preflight_refreshes += 1
                         emit("captcha_auto_retry", reason="preflight_challenge_changed",
                              preflight_refreshes=preflight_refreshes, paid_tasks=paid_tasks)
+                        image_load_deadline = clock() + CAPTCHA_IMAGE_APPEAR_SECONDS
                         continue
                     emit("captcha_auto_fallback", reason="preflight_refresh_limit" if current is not None
                          else "challenge_controls_missing")
@@ -296,6 +316,14 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             except Exception:
                 emit("captcha_auto_fallback", reason="challenge_changed")
                 return False
+            balance = client.get_balance()
+            if not balance.available or balance.amount_usd is None or balance.amount_usd <= 0:
+                emit("captcha_auto_fallback", reason="balance_unavailable")
+                return False
+            if stopped():
+                return False
+            emit("captcha_image_ready", elapsed_ms=max(0, int((clock() - image_wait_started) * 1000)),
+                 preflight_refreshes=preflight_refreshes, paid_tasks=paid_tasks)
             if not anti_captcha.IMAGE_TASKS.claim(image_bytes, config.ANTI_CAPTCHA_API_KEY):
                 emit("captcha_auto_fallback", reason="duplicate_challenge")
                 return False
@@ -328,6 +356,8 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                     if current is not None and paid_tasks < CAPTCHA_PAID_TASK_LIMIT:
                         emit("captcha_auto_retry", reason="challenge_changed_before_answer",
                              paid_tasks=paid_tasks)
+                        image_load_deadline = clock() + CAPTCHA_IMAGE_APPEAR_SECONDS
+                        image_wait_started = clock()
                         continue
                     emit("captcha_auto_fallback", reason="challenge_changed")
                     return False
@@ -342,6 +372,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             changed = False
             explicit_rejection = False
             deadline = clock() + CAPTCHA_HH_VERIFY_SECONDS
+            image_change_reported = False
             for tick in range(int(CAPTCHA_HH_VERIFY_SECONDS / CAPTCHA_HH_VERIFY_POLL_SECONDS) + 1):
                 if stopped():
                     return False
@@ -368,16 +399,24 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                                next_controls[0].screenshot(timeout=3000) != image_bytes)
                 except Exception:
                     changed = False
+                if changed and not image_change_reported:
+                    emit("captcha_hh_image_changed", attempt=paid_tasks,
+                         elapsed_ms=max(0, int((clock() - (deadline - CAPTCHA_HH_VERIFY_SECONDS)) * 1000)),
+                         rejection_probe=anti_captcha.hh_rejection_probe(page))
+                    image_change_reported = True
                 if changed and explicit_rejection:
                     break
             state = ("explicit_rejected" if explicit_rejection else
                      "new_challenge" if changed else "unknown")
-            emit("captcha_hh_verification_result", verified=False, state=state)
+            emit("captcha_hh_verification_result", verified=False, state=state,
+                 rejection_probe=anti_captcha.hh_rejection_probe(page))
             if not (changed and explicit_rejection) or paid_tasks >= CAPTCHA_PAID_TASK_LIMIT:
                 emit("captcha_auto_fallback", reason="hh_not_verified")
                 return False
             emit("captcha_auto_retry", reason="hh_rejected_new_challenge",
                  paid_tasks=paid_tasks)
+            image_load_deadline = clock() + CAPTCHA_IMAGE_APPEAR_SECONDS
+            image_wait_started = clock()
         return False
 
     if on_stage is not None:
