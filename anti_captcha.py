@@ -496,7 +496,30 @@ def hh_wrong_image_answer_visible(page) -> bool:
             return False
         error = page.get_by_text("Неверный текст. Пожалуйста, повторите попытку", exact=True)
         # Hidden copies and nested portal nodes must not hide one visible error.
-        return any(error.nth(index).is_visible() for index in range(min(error.count(), 20)))
+        if any(error.nth(index).is_visible() for index in range(min(error.count(), 20))):
+            return True
+        field = page.locator('input[data-qa="account-captcha-input"]:visible')
+        if field.count() != 1:
+            return False
+        # HH can render the known error inside a larger alert linked to the invalid field.
+        return field.evaluate("""el => {
+          if (el.getAttribute('aria-invalid') !== 'true') return false;
+          const scope = el.closest('[role="dialog"], form');
+          if (!scope) return false;
+          const ids = ['aria-errormessage', 'aria-describedby']
+            .flatMap(name => (el.getAttribute(name) || '').split(/\\s+/).filter(Boolean));
+          return ids.slice(0, 4).some(id => {
+            const node = document.getElementById(id);
+            if (!node || !scope.contains(node) || node.getAttribute('role') !== 'alert')
+              return false;
+            const style = getComputedStyle(node);
+            const rect = node.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
+              style.visibility !== 'hidden' &&
+              (node.textContent || '').replace(/\\s+/g, ' ').includes(
+                'Неверный текст. Пожалуйста, повторите попытку');
+          });
+        }""") is True
     except Exception:
         return False
 

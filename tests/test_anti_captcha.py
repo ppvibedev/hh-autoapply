@@ -195,6 +195,34 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_linked_invalid_captcha_alert_recognizes_delayed_hh_rejection(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content('''<div role="dialog"><form>
+                  <img data-qa="account-captcha-picture" width="80" height="30"
+                    src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                  <input data-qa="account-captcha-input" aria-describedby="captcha-error"
+                    value="PRIVATE_ANSWER">
+                  <div id="captcha-error" role="alert">
+                    Ошибка: Неверный текст. Пожалуйста, повторите попытку</div>
+                  </form></div>''')
+                self.assertEqual(page.get_by_text(
+                    "Неверный текст. Пожалуйста, повторите попытку", exact=True).count(), 0)
+                self.assertFalse(hh_wrong_image_answer_visible(page))
+                field = page.locator('[data-qa="account-captcha-input"]')
+                field.evaluate("el => el.setAttribute('aria-invalid', 'true')")
+                self.assertTrue(hh_wrong_image_answer_visible(page))
+                page.locator('#captcha-error').evaluate("el => el.style.display = 'none'")
+                self.assertFalse(hh_wrong_image_answer_visible(page))
+                page.locator('#captcha-error').evaluate("el => el.style.display = 'block'")
+                field.evaluate("el => el.removeAttribute('aria-describedby')")
+                self.assertFalse(hh_wrong_image_answer_visible(page))
+            finally:
+                browser.close()
+
     def test_hh_error_structure_snapshot_never_returns_dom_text_or_values(self):
         from playwright.sync_api import sync_playwright
         with sync_playwright() as playwright:
