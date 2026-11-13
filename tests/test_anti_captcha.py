@@ -8,6 +8,7 @@ import requests
 
 from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus, ImageSolution,
                           ImageTaskRegistry, capture_challenge_structure, image_challenge_controls,
+                          image_control_failure_reason,
                           classify_challenge_markers)
 
 
@@ -66,6 +67,7 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
                 self.assertEqual(snapshot["hh_image_pair_count"], 1)
                 self.assertNotIn("R0lGOD", repr(snapshot))
                 self.assertIsNone(image_challenge_controls(page))
+                self.assertEqual(image_control_failure_reason(page), "captcha_control_scope_missing")
                 page.set_content('''<form><div>
                   <img data-qa="account-captcha-picture" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
                   <button data-qa="captcha-renew-text" type="button"></button>
@@ -80,10 +82,11 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
                 self.assertEqual(controls[2].get_attribute("type"), "submit")
                 page.locator('button[type="submit"]').evaluate('button => button.disabled = true')
                 self.assertIsNone(image_challenge_controls(page))
+                self.assertEqual(image_control_failure_reason(page), "captcha_submit_disabled")
             finally:
                 browser.close()
 
-    def test_hh_image_pair_routes_to_offline_handler_when_form_action_is_unique(self):
+    def test_observed_hh_dialog_routes_to_offline_handler_without_main_submit(self):
         import run_web
         from playwright.sync_api import sync_playwright
         from unittest.mock import MagicMock
@@ -91,11 +94,19 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
             browser = playwright.chromium.launch(headless=True)
             try:
                 page = browser.new_page()
-                page.set_content('''<form onsubmit="event.preventDefault(); this.remove()"><div>
-                  <img data-qa="account-captcha-picture" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
-                  <input data-qa="account-captcha-input" type="text">
-                  <button type="submit"></button>
-                  </div></form>''')
+                page.set_content('''<main><button type="submit" id="application-submit"></button></main>
+                  <div role="dialog" style="width:300px;height:200px">
+                    <button type="button" id="close"></button>
+                    <div><div><div><div><div><div>
+                      <img data-qa="account-captcha-picture" width="80" height="30"
+                           src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                      <button data-qa="captcha-renew-text" type="button"></button>
+                      <button data-qa="captcha-language" type="button"></button>
+                      <input data-qa="account-captcha-input" type="text">
+                    </div></div></div></div></div></div>
+                    <input type="text"><button type="submit" id="captcha-submit"
+                      onclick="event.preventDefault(); this.closest('[role=dialog]').remove()"></button>
+                  </div>''')
                 client = MagicMock()
                 client.get_balance.return_value = BalanceResult(True, Decimal("1"))
                 client.create_image_task.return_value = (123, None)
@@ -107,17 +118,37 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
                      patch("anti_captcha.IMAGE_TASKS", ImageTaskRegistry()), \
                      patch("hh_web.safe_captcha_path", return_value="/vacancy/123"), \
                      patch("hh_web.captcha_resolution_verified",
-                           side_effect=lambda *_: page.locator('form').count() == 0):
+                           side_effect=lambda *_: page.locator('[role="dialog"]').count() == 0):
                     run_web._wait_for_manual_captcha(
                         page, operation="application_post_submit", run_id="f" * 32,
                         vacancy_id="123", stopped=lambda: False, telemetry=rows.append,
                         sleep=lambda _: None)
                 self.assertEqual(client.create_image_task.call_count, 1)
-                self.assertEqual(page.locator("form").count(), 0)
+                self.assertEqual(page.locator('[role="dialog"]').count(), 0)
+                self.assertEqual(page.locator('#application-submit').count(), 1)
                 self.assertEqual(rows[0]["captcha_type"], "image_to_text")
                 self.assertIn("captcha_auto_resolved", [row["event"] for row in rows])
                 self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
                 self.assertNotIn("offline-test-key", repr(rows))
+            finally:
+                browser.close()
+
+    def test_observed_hh_dialog_ambiguous_submit_stays_manual(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content('''<button type="submit" id="application-submit"></button>
+                  <div role="dialog" style="width:300px;height:200px">
+                    <img data-qa="account-captcha-picture" width="80" height="30"
+                      src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                    <input data-qa="account-captcha-input" type="text">
+                    <button type="submit"></button><button type="submit"></button>
+                  </div>''')
+                self.assertIsNone(image_challenge_controls(page))
+                self.assertEqual(image_control_failure_reason(page), "captcha_submit_ambiguous")
+                self.assertEqual(page.locator('#application-submit').count(), 1)
             finally:
                 browser.close()
 

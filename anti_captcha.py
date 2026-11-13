@@ -420,18 +420,27 @@ class AntiCaptchaClient:
 def image_challenge_controls(page):
     """Return unambiguous visible image/field/action controls, or None."""
     try:
-        # Observed HH account CAPTCHA has no role=dialog. Its exact image and
-        # answer IDs identify the challenge; the associated form supplies the
-        # only semantic submit control. Ambiguous/missing controls stay manual.
+        # The HH image and input have exact challenge IDs. In the observed
+        # modal, the CAPTCHA submit is the sole submit button inside its
+        # dialog; the main application submit is outside that dialog.
         if _hh_image_pair_count(page) == 1:
             image = page.locator('img[data-qa="account-captcha-picture"]:visible')
             field = page.locator('input[data-qa="account-captcha-input"]:visible')
+            dialog = image.locator('xpath=ancestor::*[@role="dialog"][1]')
+            if dialog.count() == 1:
+                if dialog.locator('input[data-qa="account-captcha-input"]:visible').count() != 1:
+                    return None
+                action = dialog.locator('button[type="submit"]:visible')
+                return (image, field, action) if action.count() == 1 and action.is_enabled() else None
+            # Keep the existing form variant, but require the exact same pair
+            # and a unique semantic submit within that form.
             form = field.locator('xpath=ancestor::form[1]')
             if (form.count() == 1 and
                     form.locator('img[data-qa="account-captcha-picture"]:visible').count() == 1):
                 action = form.locator('button[type="submit"]:visible')
                 if action.count() == 1 and action.is_enabled():
                     return image, field, action
+            return None
         dialog = page.locator('[role="dialog"]:visible').filter(
             has=page.locator('[data-qa*="captcha"]:visible'))
         if dialog.count() != 1:
@@ -448,6 +457,36 @@ def image_challenge_controls(page):
         return image, field, action
     except Exception:
         return None
+
+
+def image_control_failure_reason(page) -> str:
+    """Allowlisted reason for a failed structural CAPTCHA control lookup."""
+    try:
+        if _hh_image_pair_count(page) != 1:
+            return "captcha_image_or_input_not_unique"
+        image = page.locator('img[data-qa="account-captcha-picture"]:visible')
+        dialog = image.locator('xpath=ancestor::*[@role="dialog"][1]')
+        if dialog.count() == 1:
+            if dialog.locator('input[data-qa="account-captcha-input"]:visible').count() != 1:
+                return "captcha_input_outside_dialog"
+            actions = dialog.locator('button[type="submit"]:visible')
+        else:
+            field = page.locator('input[data-qa="account-captcha-input"]:visible')
+            form = field.locator('xpath=ancestor::form[1]')
+            if (form.count() != 1 or
+                    form.locator('img[data-qa="account-captcha-picture"]:visible').count() != 1):
+                return "captcha_control_scope_missing"
+            actions = form.locator('button[type="submit"]:visible')
+        count = actions.count()
+        if count == 0:
+            return "captcha_submit_missing"
+        if count != 1:
+            return "captcha_submit_ambiguous"
+        if not actions.is_enabled():
+            return "captcha_submit_disabled"
+        return "captcha_controls_unavailable"
+    except Exception:
+        return "captcha_controls_unavailable"
 
 
 def challenge_digest(image: bytes, api_key: str) -> str:

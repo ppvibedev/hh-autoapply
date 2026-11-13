@@ -46,6 +46,12 @@ class CaptchaPauseTests(unittest.TestCase):
         field.fill.assert_called_once_with("synthetic-answer", timeout=3000)
         action.click.assert_called_once_with(timeout=3000)
         self.assertEqual(verified.call_count, 2)
+        self.assertEqual([r["event"] for r in rows if r["event"].startswith("captcha_auto_task")],
+                         ["captcha_auto_task_created", "captcha_auto_task_result"])
+        self.assertEqual(next(r for r in rows if r["event"] == "captcha_auto_task_result")["state"],
+                         "ready")
+        self.assertEqual(next(r for r in rows if r["event"] == "captcha_hh_verification_result")["verified"],
+                         True)
         self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
         self.assertNotIn("synthetic-answer", json.dumps(rows))
         self.assertNotIn("DUMMY_KEY", json.dumps(rows))
@@ -88,6 +94,27 @@ class CaptchaPauseTests(unittest.TestCase):
         client.create_image_task.assert_not_called()
         field.fill.assert_not_called(); action.click.assert_not_called()
 
+    def test_recognized_hh_captcha_with_ambiguous_submit_logs_reason_without_paid_task(self):
+        rows = []
+        structure = {"captcha_type": "image_to_text", "classification_confidence": "structural"}
+        with patch("anti_captcha.capture_challenge_structure", return_value=structure), \
+             patch("anti_captcha.image_challenge_controls", return_value=None), \
+             patch("anti_captcha.image_control_failure_reason",
+                   return_value="captcha_submit_ambiguous"), \
+             patch("anti_captcha.AntiCaptchaClient") as client, \
+             patch.object(config, "ANTI_CAPTCHA_ENABLED", True), \
+             patch.object(config, "ANTI_CAPTCHA_API_KEY", "DUMMY_KEY"), \
+             patch("hh_web.safe_captcha_path", return_value="/vacancy/123"), \
+             self.assertRaises(LLMStopped):
+            run_web._wait_for_manual_captcha(
+                MagicMock(), operation="application_post_submit", run_id="e" * 32,
+                vacancy_id="123", telemetry=rows.append,
+                stopped=lambda: any(r["event"] == "captcha_auto_fallback" for r in rows))
+        self.assertEqual(rows[1]["event"], "captcha_auto_fallback")
+        self.assertEqual(rows[1]["reason"], "captcha_submit_ambiguous")
+        client.return_value.create_image_task.assert_not_called()
+        self.assertNotIn("DUMMY_KEY", json.dumps(rows))
+
     def test_unaccepted_image_answer_stays_on_same_vacancy_without_second_task(self):
         image, field, action, client, registry = [MagicMock() for _ in range(5)]
         image.screenshot.return_value = b"synthetic-image"
@@ -109,6 +136,8 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertEqual(action.click.call_count, 1)
         client.create_image_task.assert_called_once()
         self.assertEqual(now[0], 10)
+        self.assertEqual(next(r for r in rows if r["event"] == "captcha_hh_verification_result")["verified"],
+                         False)
         self.assertEqual(rows[-2]["reason"], "hh_not_verified")
         self.assertEqual(rows[0]["vacancy_id"], "123")
 
@@ -268,7 +297,8 @@ class CaptchaPauseTests(unittest.TestCase):
                 clock=lambda: now[0], sleep=sleep, timeout_seconds=120, poll_seconds=1)
 
         self.assertEqual([row["event"] for row in rows],
-                         ["captcha_wait_started", "captcha_wait_resolved"])
+                         ["captcha_wait_started", "captcha_auto_skipped", "captcha_wait_resolved"])
+        self.assertIn(rows[1]["reason"], {"integration_disabled", "api_key_missing", "unsupported_or_unknown_type"})
         verified.assert_called_once()
         page.goto.assert_not_called()
         self.assertEqual(now[0], 2)
@@ -332,7 +362,8 @@ class CaptchaPauseTests(unittest.TestCase):
                 clock=lambda: now[0], sleep=sleep, timeout_seconds=2, poll_seconds=1)
         self.assertEqual(now[0], 4)
         self.assertEqual([row["event"] for row in rows],
-                         ["captcha_wait_started", "captcha_wait_expired", "captcha_wait_stopped"])
+                         ["captcha_wait_started", "captcha_auto_skipped",
+                          "captcha_wait_expired", "captcha_wait_stopped"])
 
     def test_dashboard_state_tracks_only_active_captcha_wait(self):
         self.assertTrue(webapp._captcha_waiting([
@@ -355,7 +386,8 @@ class CaptchaPauseTests(unittest.TestCase):
                 clock=lambda: now[0], sleep=sleep, poll_seconds=1)
         self.assertEqual(verify.call_count, 2)
         self.assertEqual([r["event"] for r in rows],
-                         ["captcha_wait_started", "captcha_resume_rejected", "captcha_wait_resolved"])
+                         ["captcha_wait_started", "captcha_auto_skipped",
+                          "captcha_resume_rejected", "captcha_wait_resolved"])
 
     def test_captcha_continue_requires_active_authenticated_worker(self):
         state = {"pid": 123, "run_id": "a" * 32, "control_token": "[not printed]"}

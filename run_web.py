@@ -238,8 +238,16 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
         telemetry(row)
 
     def try_auto_image() -> bool:
-        if (not config.ANTI_CAPTCHA_ENABLED or not config.ANTI_CAPTCHA_API_KEY or
-                challenge_structure.get("captcha_type") != "image_to_text" or stopped()):
+        if not config.ANTI_CAPTCHA_ENABLED:
+            emit("captcha_auto_skipped", reason="integration_disabled")
+            return False
+        if not config.ANTI_CAPTCHA_API_KEY:
+            emit("captcha_auto_skipped", reason="api_key_missing")
+            return False
+        if challenge_structure.get("captcha_type") != "image_to_text":
+            emit("captcha_auto_skipped", reason="unsupported_or_unknown_type")
+            return False
+        if stopped():
             return False
         client = anti_captcha.AntiCaptchaClient(config.ANTI_CAPTCHA_API_KEY)
         for attempt in range(2):
@@ -250,7 +258,8 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 return False
             controls = anti_captcha.image_challenge_controls(page)
             if controls is None:
-                emit("captcha_auto_fallback", reason="controls_not_unique")
+                emit("captcha_auto_fallback",
+                     reason=anti_captcha.image_control_failure_reason(page))
                 return False
             image = controls[0]
             try:
@@ -288,9 +297,14 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             if task_id is None:
                 emit("captcha_auto_fallback", reason=reason)
                 return False
+            emit("captcha_auto_task_created", attempt=attempt + 1)
             result = client.wait_for_image_solution(
                 task_id, max_wait_seconds=config.ANTI_CAPTCHA_MAX_WAIT_SECONDS,
                 stopped=stopped, sleep=sleep)
+            emit("captcha_auto_task_result", attempt=attempt + 1,
+                 state=result.state if isinstance(result.state, str) and
+                 result.state in {"ready", "error", "stopped", "timeout"}
+                 else "unknown")
             if result.state != "ready":
                 emit("captcha_auto_fallback", reason=result.reason or result.state)
                 return False
@@ -319,6 +333,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 if hh_web.captcha_resolution_verified(page, operation, vacancy_id):
                     verified += 1
                     if verified >= 2:
+                        emit("captcha_hh_verification_result", verified=True)
                         emit("captcha_auto_resolved")
                         return True
                 else:
@@ -332,6 +347,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 if changed:
                     break
                 sleep(1)
+            emit("captcha_hh_verification_result", verified=False)
             if not changed or attempt == 1:
                 emit("captcha_auto_fallback", reason="hh_not_verified")
                 return False
