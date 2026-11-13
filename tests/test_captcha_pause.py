@@ -131,11 +131,11 @@ class CaptchaPauseTests(unittest.TestCase):
              self.assertRaises(LLMStopped):
             run_web._wait_for_manual_captcha(MagicMock(), operation="application_post_submit",
                                              run_id="e" * 32, vacancy_id="123",
-                                             stopped=lambda: now[0] >= 10, sleep=sleep,
+                                             stopped=lambda: now[0] >= 15, sleep=sleep,
                                              telemetry=rows.append)
         self.assertEqual(action.click.call_count, 1)
         client.create_image_task.assert_called_once()
-        self.assertEqual(now[0], 10)
+        self.assertEqual(now[0], 15)
         self.assertEqual(next(r for r in rows if r["event"] == "captcha_hh_verification_result")["verified"],
                          False)
         self.assertEqual(rows[-2]["reason"], "hh_not_verified")
@@ -143,7 +143,7 @@ class CaptchaPauseTests(unittest.TestCase):
 
     def test_new_image_without_explicit_rejection_stays_manual(self):
         image, field, action, client, registry = [MagicMock() for _ in range(5)]
-        image.screenshot.side_effect = [b"first"] * 3 + [b"second"] * 12
+        image.screenshot.side_effect = [b"first"] * 3 + [b"second"] * 40
         client.get_balance.return_value = BalanceResult(True, Decimal("1"))
         client.create_image_task.side_effect = [(7, "created"), (8, "created")]
         client.wait_for_image_solution.side_effect = [ImageSolution("ready", "wrong"),
@@ -227,6 +227,34 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertEqual(client.create_image_task.call_count, 2)
         self.assertEqual(next(r for r in rows if r["event"] == "captcha_hh_verification_result")["state"],
                          "explicit_rejected")
+        self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
+
+    def test_async_hh_rejection_after_five_seconds_starts_second_captcha_task(self):
+        image, field, action, client, registry = [MagicMock() for _ in range(5)]
+        image.screenshot.side_effect = [b"first"] * 3 + [b"second"] * 40
+        client.get_balance.return_value = BalanceResult(True, Decimal("1"))
+        client.create_image_task.side_effect = [(7, "created"), (8, "created")]
+        client.wait_for_image_solution.side_effect = [ImageSolution("ready", "wrong"),
+                                                      ImageSolution("ready", "correct")]
+        registry.claim.return_value = True
+        rows, now = [], [0.0]
+        def sleep(seconds):
+            now[0] += seconds
+        patches = self._auto_image_patches(image, field, action, client, registry)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
+             patch("anti_captcha.hh_wrong_image_answer_visible",
+                   side_effect=lambda _: action.click.call_count == 1 and now[0] >= 6), \
+             patch("hh_web.captcha_resolution_verified",
+                   side_effect=lambda *_: action.click.call_count == 2):
+            run_web._wait_for_manual_captcha(MagicMock(), operation="application_post_submit",
+                                             run_id="e" * 32, vacancy_id="123",
+                                             stopped=lambda: False, telemetry=rows.append,
+                                             clock=lambda: now[0], sleep=sleep)
+        self.assertGreaterEqual(now[0], 6)
+        self.assertLess(now[0], run_web.CAPTCHA_HH_VERIFY_SECONDS + 2)
+        self.assertEqual(client.create_image_task.call_count, 2)
+        self.assertEqual(action.click.call_count, 2)
+        self.assertEqual([r["attempt"] for r in rows if r["event"] == "captcha_auto_started"], [1, 2])
         self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
 
     def test_second_rejected_challenge_returns_to_manual_without_third_task(self):

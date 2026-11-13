@@ -490,15 +490,13 @@ def image_control_failure_reason(page) -> str:
 
 
 def hh_wrong_image_answer_visible(page) -> bool:
-    """Check HH's observed rejection message without returning or logging page text."""
+    """Recognize the observed HH rejection only beside an active exact CAPTCHA pair."""
     try:
-        image = page.locator('img[data-qa="account-captcha-picture"]:visible')
-        if image.count() != 1:
+        # The exact image/input pair anchors this check to the active HH
+        # CAPTCHA even if validation feedback is mounted outside its dialog.
+        if _hh_image_pair_count(page) != 1:
             return False
-        dialog = image.locator('xpath=ancestor::*[@role="dialog"][1]')
-        if dialog.count() != 1:
-            return False
-        error = dialog.get_by_text("Неверный текст. Пожалуйста, повторите попытку", exact=True)
+        error = page.get_by_text("Неверный текст. Пожалуйста, повторите попытку", exact=True)
         return error.count() == 1 and error.is_visible()
     except Exception:
         return False

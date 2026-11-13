@@ -161,9 +161,28 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
                 page.set_content('''<div role="dialog" style="width:300px;height:200px">
                   <img data-qa="account-captcha-picture" width="80" height="30"
                     src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                  <input data-qa="account-captcha-input">
                   <p>Неверный текст. Пожалуйста, повторите попытку</p></div>''')
                 self.assertIs(hh_wrong_image_answer_visible(page), True)
                 page.locator("p").evaluate("element => element.remove()")
+                self.assertIs(hh_wrong_image_answer_visible(page), False)
+            finally:
+                browser.close()
+
+    def test_hh_rejection_outside_dialog_requires_exact_active_pair(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content('''<div role="dialog" style="width:300px;height:200px">
+                  <img data-qa="account-captcha-picture" width="80" height="30"
+                    src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                  <input data-qa="account-captcha-input">
+                  <button type="submit">OK</button></div>
+                  <div role="alert">Неверный текст. Пожалуйста, повторите попытку</div>''')
+                self.assertIs(hh_wrong_image_answer_visible(page), True)
+                page.locator('[data-qa="account-captcha-input"]').evaluate("element => element.remove()")
                 self.assertIs(hh_wrong_image_answer_visible(page), False)
             finally:
                 browser.close()
