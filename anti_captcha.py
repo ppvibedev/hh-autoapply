@@ -527,6 +527,98 @@ def hh_rejection_probe(page) -> dict:
     return result
 
 
+_HH_ERROR_SHAPE_JS = """el => {
+  const known = 'Неверный текст. Пожалуйста, повторите попытку';
+  const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+  const qa = el.getAttribute('data-qa') || '';
+  const role = el.getAttribute('role') || '';
+  const ariaInvalid = el.getAttribute('aria-invalid');
+  const style = getComputedStyle(el);
+  const rect = el.getBoundingClientRect();
+  return {
+    tag: ['div', 'span', 'p', 'small', 'label', 'input', 'form', 'section'].includes(el.tagName.toLowerCase())
+      ? el.tagName.toLowerCase() : 'other',
+    role: ['alert', 'status', 'dialog', 'alertdialog', 'textbox'].includes(role) ? role : null,
+    data_qa: /^[a-zA-Z0-9_-]{1,80}$/.test(qa) &&
+      (/^(account-captcha|captcha)-[a-zA-Z0-9_-]+$/.test(qa) ||
+       ['error', 'form-error', 'validation-error'].includes(qa))
+      ? qa : null,
+    aria_invalid: ariaInvalid === 'true' || ariaInvalid === 'false' ? ariaInvalid : null,
+    visible: rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden',
+    known_message_match: normalize(el.textContent).includes(known)
+  };
+}"""
+
+
+def hh_error_structure_snapshot(page) -> dict:
+    """One bounded DOM shape after CAPTCHA submit; never return text or field values."""
+    result = {"status": "unavailable", "field_total_count": 0, "field_visible_count": 0,
+              "field_aria_invalid": None, "field_has_aria_describedby": False,
+              "field_has_aria_errormessage": False, "nearby": [], "linked_message_nodes": [],
+              "semantic_message_nodes": [], "semantic_message_total_count": 0,
+              "exact_message_nodes": [],
+              "exact_message_total_count": 0}
+    try:
+        fields = page.locator('input[data-qa="account-captcha-input"]')
+        visible_fields = page.locator('input[data-qa="account-captcha-input"]:visible')
+        result["field_total_count"] = min(fields.count(), 20)
+        result["field_visible_count"] = min(visible_fields.count(), 20)
+        if visible_fields.count() != 1:
+            result["status"] = "field_not_unique"
+            return result
+        field = visible_fields
+        aria_invalid = field.get_attribute("aria-invalid")
+        result["field_aria_invalid"] = aria_invalid if aria_invalid in ("true", "false") else None
+        result["field_has_aria_describedby"] = bool(field.get_attribute("aria-describedby"))
+        result["field_has_aria_errormessage"] = bool(field.get_attribute("aria-errormessage"))
+        result["nearby"] = field.evaluate("""el => {
+          const parent = el.parentElement;
+          const grandparent = parent && parent.parentElement;
+          const nodes = [parent, parent && parent.previousElementSibling,
+            parent && parent.nextElementSibling, grandparent,
+            ...(grandparent ? [...grandparent.children].slice(0, 8) : [])];
+          const shape = """ + _HH_ERROR_SHAPE_JS + """;
+          return [...new Set(nodes.filter(Boolean))].slice(0, 8).map(shape);
+        }""")
+        result["linked_message_nodes"] = field.evaluate("""el => {
+          const shape = """ + _HH_ERROR_SHAPE_JS + """;
+          const ids = ['aria-errormessage', 'aria-describedby']
+            .flatMap(name => (el.getAttribute(name) || '').split(/\\s+/).filter(Boolean));
+          return [...new Set(ids.slice(0, 4).map(id => document.getElementById(id)).filter(Boolean))]
+            .map(shape);
+        }""")
+        semantic = page.locator('[role="alert"], [role="status"], '
+                                '[aria-live="assertive"], [aria-live="polite"]')
+        result["semantic_message_total_count"] = min(semantic.count(), 100)
+        result["semantic_message_nodes"] = semantic.evaluate_all("""nodes => {
+          const shape = """ + _HH_ERROR_SHAPE_JS + """;
+          const field = document.querySelector('input[data-qa="account-captcha-input"]');
+          const scope = field && field.closest('[role="dialog"], form');
+          const shaped = nodes.slice(0, 100).map(node => ({...shape(node),
+            relation: scope && scope.contains(node) ? 'same_captcha_scope' : 'outside_captcha_scope'}));
+          return [...shaped.filter(node => node.known_message_match ||
+            node.relation === 'same_captcha_scope'), ...shaped].filter(
+              (node, index, all) => all.indexOf(node) === index).slice(0, 8);
+        }""")
+        error = page.get_by_text("Неверный текст. Пожалуйста, повторите попытку", exact=True)
+        result["exact_message_total_count"] = min(error.count(), 20)
+        result["exact_message_nodes"] = error.evaluate_all("""nodes => {
+          const shape = """ + _HH_ERROR_SHAPE_JS + """;
+          const field = document.querySelector('input[data-qa="account-captcha-input"]');
+          const scope = field && field.closest('[role="dialog"], form');
+          return nodes.slice(0, 8).map(node => ({...shape(node),
+            relation: scope && scope.contains(node) ? 'same_captcha_scope' : 'outside_captcha_scope'}));
+        }""")
+        result["status"] = "ok"
+    except Exception:
+        result["status"] = "probe_error"
+        result["nearby"] = []
+        result["linked_message_nodes"] = []
+        result["semantic_message_nodes"] = []
+        result["exact_message_nodes"] = []
+    return result
+
+
 def challenge_digest(image: bytes, api_key: str) -> str:
     return hmac.new(api_key.encode("utf-8"), image, hashlib.sha256).hexdigest()
 

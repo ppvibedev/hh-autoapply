@@ -1,6 +1,7 @@
 """Offline preparation checks; no paid task, HH, or external API call."""
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -9,7 +10,7 @@ import requests
 from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus, ImageSolution,
                           ImageTaskRegistry, capture_challenge_structure, image_challenge_controls,
                           image_control_failure_reason, hh_wrong_image_answer_visible,
-                          hh_image_loaded, hh_rejection_probe,
+                          hh_image_loaded, hh_rejection_probe, hh_error_structure_snapshot,
                           classify_challenge_markers)
 
 
@@ -191,6 +192,44 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
                 self.assertNotIn("Неверный текст", str(probe))
                 page.locator('[data-qa="account-captcha-input"]').evaluate("element => element.remove()")
                 self.assertIs(hh_wrong_image_answer_visible(page), False)
+            finally:
+                browser.close()
+
+    def test_hh_error_structure_snapshot_never_returns_dom_text_or_values(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content('''<div role="dialog"><form>
+                  <div><input data-qa="account-captcha-input" aria-invalid="true"
+                    aria-describedby="captcha-error-node"
+                    value="PRIVATE_ANSWER"></div>
+                  <div id="captcha-error-node" role="alert" data-qa="captcha-error">
+                    Неверный текст. Пожалуйста, повторите попытку</div>
+                  <div data-qa="candidate-PRIVATE_MARKER">PRIVATE_CONTACT</div>
+                  </form></div>''')
+                snapshot = hh_error_structure_snapshot(page)
+                self.assertEqual(snapshot["status"], "ok")
+                self.assertEqual(snapshot["field_aria_invalid"], "true")
+                self.assertTrue(snapshot["field_has_aria_describedby"])
+                self.assertEqual(len(snapshot["linked_message_nodes"]), 1)
+                self.assertEqual(len(snapshot["semantic_message_nodes"]), 1)
+                self.assertGreaterEqual(snapshot["exact_message_total_count"], 1)
+                self.assertTrue(any(node["known_message_match"] for node in snapshot["exact_message_nodes"]))
+                serialized = json.dumps(snapshot, ensure_ascii=False)
+                for private in ("PRIVATE_ANSWER", "PRIVATE_CONTACT", "PRIVATE_MARKER",
+                                "Неверный текст"):
+                    self.assertNotIn(private, serialized)
+                page.locator('#captcha-error-node').evaluate("element => element.remove()")
+                self.assertEqual(hh_error_structure_snapshot(page)["exact_message_total_count"], 0)
+                page.evaluate("""() => {
+                  const alert = document.createElement('div');
+                  alert.id = 'captcha-error-node'; alert.setAttribute('role', 'alert');
+                  alert.textContent = 'Неверный текст. Пожалуйста, повторите попытку';
+                  document.querySelector('form').append(alert);
+                }""")
+                self.assertGreaterEqual(hh_error_structure_snapshot(page)["exact_message_total_count"], 1)
             finally:
                 browser.close()
 

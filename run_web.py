@@ -373,6 +373,15 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             explicit_rejection = False
             deadline = clock() + CAPTCHA_HH_VERIFY_SECONDS
             image_change_reported = False
+            error_trace = []
+            def remember_error_structure(phase, *, final=False):
+                if len(error_trace) >= (8 if final else 7):
+                    return
+                snapshot = anti_captcha.hh_error_structure_snapshot(page)
+                if final or not error_trace or error_trace[-1]["structure"] != snapshot:
+                    error_trace.append({
+                        "elapsed_ms": max(0, int((clock() - (deadline - CAPTCHA_HH_VERIFY_SECONDS)) * 1000)),
+                        "phase": phase, "structure": snapshot})
             for tick in range(int(CAPTCHA_HH_VERIFY_SECONDS / CAPTCHA_HH_VERIFY_POLL_SECONDS) + 1):
                 if stopped():
                     return False
@@ -404,12 +413,17 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                          elapsed_ms=max(0, int((clock() - (deadline - CAPTCHA_HH_VERIFY_SECONDS)) * 1000)),
                          rejection_probe=anti_captcha.hh_rejection_probe(page))
                     image_change_reported = True
+                if tick in (0, 1, 2, 4, 8, 12, 20) or (changed and explicit_rejection):
+                    remember_error_structure("image_changed" if changed else "observed")
                 if changed and explicit_rejection:
                     break
             state = ("explicit_rejected" if explicit_rejection else
                      "new_challenge" if changed else "unknown")
+            remember_error_structure("final", final=True)
             emit("captcha_hh_verification_result", verified=False, state=state,
                  rejection_probe=anti_captcha.hh_rejection_probe(page))
+            if not (changed and explicit_rejection) or paid_tasks >= CAPTCHA_PAID_TASK_LIMIT:
+                emit("captcha_hh_error_structure", attempt=paid_tasks, samples=error_trace)
             if not (changed and explicit_rejection) or paid_tasks >= CAPTCHA_PAID_TASK_LIMIT:
                 emit("captcha_auto_fallback", reason="hh_not_verified")
                 return False

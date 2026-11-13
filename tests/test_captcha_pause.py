@@ -168,6 +168,40 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertEqual(next(row for row in rows if row["event"] == "captcha_auto_fallback")["reason"],
                          "hh_not_verified")
 
+    def test_delayed_error_structure_is_saved_once_without_retry_or_private_text(self):
+        image, field, action, client, registry = [MagicMock() for _ in range(5)]
+        image.screenshot.side_effect = [b"first"] * 3 + [b"second"] * 40
+        client.get_balance.return_value = BalanceResult(True, Decimal("1"))
+        client.create_image_task.return_value = (7, "created")
+        client.wait_for_image_solution.return_value = ImageSolution("ready", "PRIVATE_ANSWER")
+        registry.claim.return_value = True
+        rows, now = [], [0.0]
+        def sleep(seconds):
+            now[0] += seconds
+        def structure(_):
+            return {"status": "ok", "field_aria_invalid": "true" if now[0] >= 6 else None,
+                    "exact_message_total_count": 1 if now[0] >= 6 else 0,
+                    "nearby": [], "exact_message_nodes": []}
+        patches = self._auto_image_patches(image, field, action, client, registry)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
+             patch("hh_web.captcha_resolution_verified", return_value=False), \
+             patch("anti_captcha.hh_wrong_image_answer_visible", return_value=False), \
+             patch("anti_captcha.hh_error_structure_snapshot", side_effect=structure), \
+             self.assertRaises(LLMStopped):
+            run_web._wait_for_manual_captcha(MagicMock(), operation="application_post_submit",
+                                             run_id="e" * 32, vacancy_id="123",
+                                             stopped=lambda: any(r["event"] == "captcha_auto_fallback" for r in rows),
+                                             telemetry=rows.append, clock=lambda: now[0], sleep=sleep)
+        traces = [r for r in rows if r["event"] == "captcha_hh_error_structure"]
+        self.assertEqual(len(traces), 1)
+        samples = traces[0]["samples"]
+        self.assertLessEqual(len(samples), 8)
+        self.assertEqual(samples[0]["elapsed_ms"], 0)
+        self.assertTrue(any(sample["elapsed_ms"] >= 6000 and
+                            sample["structure"]["field_aria_invalid"] == "true" for sample in samples))
+        self.assertEqual(client.create_image_task.call_count, 1)
+        self.assertNotIn("PRIVATE_ANSWER", json.dumps(rows))
+
     def test_preflight_refresh_does_not_consume_paid_retry_after_rejection(self):
         image, field, action, client, registry = [MagicMock() for _ in range(5)]
         image.screenshot.side_effect = ([b"old", b"new"] + [b"new"] * 3 +
