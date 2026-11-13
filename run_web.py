@@ -37,6 +37,10 @@ _STOP_ATTEMPT_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 LIVE_HISTORY_REREAD_DELAY_SECONDS = 0.02
 CAPTCHA_MANUAL_SOLVE_TIMEOUT_SECONDS = config.CAPTCHA_REMINDER_SECONDS
 CAPTCHA_POLL_INTERVAL_SECONDS = 1
+CAPTCHA_PREFLIGHT_REFRESH_LIMIT = 3
+CAPTCHA_PAID_TASK_LIMIT = 2
+CAPTCHA_HH_VERIFY_SECONDS = 5
+CAPTCHA_HH_VERIFY_POLL_SECONDS = 0.5
 WORKER_HEARTBEAT_SECONDS = 10
 WORKER_OPERATION_STALL_SECONDS = 180
 HH_NAVIGATION_MAX_ATTEMPTS = 3
@@ -250,7 +254,9 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
         if stopped():
             return False
         client = anti_captcha.AntiCaptchaClient(config.ANTI_CAPTCHA_API_KEY)
-        for attempt in range(2):
+        paid_tasks = 0
+        preflight_refreshes = 0
+        while paid_tasks < CAPTCHA_PAID_TASK_LIMIT:
             if stopped():
                 return False
             if anti_captcha.capture_challenge_structure(page).get("captcha_type") != "image_to_text":
@@ -279,10 +285,13 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             try:
                 current = anti_captcha.image_challenge_controls(page)
                 if current is None or current[0].screenshot(timeout=3000) != image_bytes:
-                    if attempt == 0 and current is not None:
-                        emit("captcha_auto_retry", reason="challenge_changed")
+                    if current is not None and preflight_refreshes < CAPTCHA_PREFLIGHT_REFRESH_LIMIT:
+                        preflight_refreshes += 1
+                        emit("captcha_auto_retry", reason="preflight_challenge_changed",
+                             preflight_refreshes=preflight_refreshes, paid_tasks=paid_tasks)
                         continue
-                    emit("captcha_auto_fallback", reason="challenge_changed")
+                    emit("captcha_auto_fallback", reason="preflight_refresh_limit" if current is not None
+                         else "challenge_controls_missing")
                     return False
             except Exception:
                 emit("captcha_auto_fallback", reason="challenge_changed")
@@ -292,16 +301,19 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 return False
             if stopped():
                 return False
-            emit("captcha_auto_started", attempt=attempt + 1)
+            # A failed transport may still have created a paid task, so count
+            # the request before sending and never retry that same image.
+            paid_tasks += 1
+            emit("captcha_auto_started", attempt=paid_tasks)
             task_id, reason = client.create_image_task(image_bytes)
             if task_id is None:
                 emit("captcha_auto_fallback", reason=reason)
                 return False
-            emit("captcha_auto_task_created", attempt=attempt + 1)
+            emit("captcha_auto_task_created", attempt=paid_tasks)
             result = client.wait_for_image_solution(
                 task_id, max_wait_seconds=config.ANTI_CAPTCHA_MAX_WAIT_SECONDS,
                 stopped=stopped, sleep=sleep)
-            emit("captcha_auto_task_result", attempt=attempt + 1,
+            emit("captcha_auto_task_result", attempt=paid_tasks,
                  state=result.state if isinstance(result.state, str) and
                  result.state in {"ready", "error", "stopped", "timeout"}
                  else "unknown")
@@ -313,8 +325,9 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             try:
                 current = anti_captcha.image_challenge_controls(page)
                 if current is None or current[0].screenshot(timeout=3000) != image_bytes:
-                    if attempt == 0 and current is not None:
-                        emit("captcha_auto_retry", reason="challenge_changed")
+                    if current is not None and paid_tasks < CAPTCHA_PAID_TASK_LIMIT:
+                        emit("captcha_auto_retry", reason="challenge_changed_before_answer",
+                             paid_tasks=paid_tasks)
                         continue
                     emit("captcha_auto_fallback", reason="challenge_changed")
                     return False
@@ -327,30 +340,44 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 return False
             verified = 0
             changed = False
-            for _ in range(10):
+            explicit_rejection = False
+            deadline = clock() + CAPTCHA_HH_VERIFY_SECONDS
+            for tick in range(int(CAPTCHA_HH_VERIFY_SECONDS / CAPTCHA_HH_VERIFY_POLL_SECONDS) + 1):
                 if stopped():
                     return False
+                if tick:
+                    remaining = deadline - clock()
+                    if remaining <= 0:
+                        break
+                    sleep(min(CAPTCHA_HH_VERIFY_POLL_SECONDS, remaining))
+                    if stopped():
+                        return False
                 if hh_web.captcha_resolution_verified(page, operation, vacancy_id):
                     verified += 1
                     if verified >= 2:
-                        emit("captcha_hh_verification_result", verified=True)
+                        emit("captcha_hh_verification_result", verified=True, state="captcha_cleared")
                         emit("captcha_auto_resolved")
                         return True
                 else:
                     verified = 0
+                explicit_rejection = (explicit_rejection or
+                                      anti_captcha.hh_wrong_image_answer_visible(page))
                 try:
                     next_controls = anti_captcha.image_challenge_controls(page)
                     changed = (next_controls is not None and
                                next_controls[0].screenshot(timeout=3000) != image_bytes)
                 except Exception:
                     changed = False
-                if changed:
+                if changed and explicit_rejection:
                     break
-                sleep(1)
-            emit("captcha_hh_verification_result", verified=False)
-            if not changed or attempt == 1:
+            state = ("explicit_rejected" if explicit_rejection else
+                     "new_challenge" if changed else "unknown")
+            emit("captcha_hh_verification_result", verified=False, state=state)
+            if not (changed and explicit_rejection) or paid_tasks >= CAPTCHA_PAID_TASK_LIMIT:
                 emit("captcha_auto_fallback", reason="hh_not_verified")
                 return False
+            emit("captcha_auto_retry", reason="hh_rejected_new_challenge",
+                 paid_tasks=paid_tasks)
         return False
 
     if on_stage is not None:

@@ -8,7 +8,7 @@ import requests
 
 from anti_captcha import (AntiCaptchaClient, BalanceResult, TaskStatus, ImageSolution,
                           ImageTaskRegistry, capture_challenge_structure, image_challenge_controls,
-                          image_control_failure_reason,
+                          image_control_failure_reason, hh_wrong_image_answer_visible,
                           classify_challenge_markers)
 
 
@@ -149,6 +149,22 @@ class AntiCaptchaPreparationTests(unittest.TestCase):
                 self.assertIsNone(image_challenge_controls(page))
                 self.assertEqual(image_control_failure_reason(page), "captcha_submit_ambiguous")
                 self.assertEqual(page.locator('#application-submit').count(), 1)
+            finally:
+                browser.close()
+
+    def test_hh_wrong_answer_marker_is_boolean_only(self):
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content('''<div role="dialog" style="width:300px;height:200px">
+                  <img data-qa="account-captcha-picture" width="80" height="30"
+                    src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+                  <p>Неверный текст. Пожалуйста, повторите попытку</p></div>''')
+                self.assertIs(hh_wrong_image_answer_visible(page), True)
+                page.locator("p").evaluate("element => element.remove()")
+                self.assertIs(hh_wrong_image_answer_visible(page), False)
             finally:
                 browser.close()
 
