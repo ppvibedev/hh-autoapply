@@ -256,13 +256,25 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             return False
         client = anti_captcha.AntiCaptchaClient(config.ANTI_CAPTCHA_API_KEY)
         paid_tasks = 0
+        answer_submitted = False
         preflight_refreshes = 0
         image_load_deadline = clock() + CAPTCHA_IMAGE_APPEAR_SECONDS
         image_wait_started = clock()
+        def resolved_after_answer():
+            if not answer_submitted or stopped() or not hh_web.captcha_resolution_verified(page, operation, vacancy_id):
+                return False
+            sleep(CAPTCHA_HH_VERIFY_POLL_SECONDS)
+            if stopped() or not hh_web.captcha_resolution_verified(page, operation, vacancy_id):
+                return False
+            emit("captcha_hh_verification_result", verified=True, state="captcha_cleared")
+            emit("captcha_auto_resolved")
+            return True
         while paid_tasks < CAPTCHA_PAID_TASK_LIMIT:
             if stopped():
                 return False
             if anti_captcha.capture_challenge_structure(page).get("captcha_type") != "image_to_text":
+                if resolved_after_answer():
+                    return True
                 remaining = image_load_deadline - clock()
                 if hh_web.captcha_present(page) and remaining > 0:
                     sleep(min(0.25, remaining))
@@ -271,6 +283,8 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 return False
             controls = anti_captcha.image_challenge_controls(page)
             if controls is None:
+                if resolved_after_answer():
+                    return True
                 remaining = image_load_deadline - clock()
                 if hh_web.captcha_present(page) and remaining > 0:
                     sleep(min(0.25, remaining))
@@ -365,6 +379,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 if stopped():
                     return False
                 current[2].click(timeout=3000)
+                answer_submitted = True
             except Exception:
                 emit("captcha_auto_fallback", reason="answer_application_failed")
                 return False
@@ -1050,6 +1065,12 @@ def main():
                                             run_id=run_id, vacancy_id=vid, stopped=_observe_stop,
                                             telemetry=_log, on_stage=mark_stage)
                                         if captcha_reason == "captcha_after_possible_submit":
+                                            from application import _signal
+                                            if (_signal(page, str(vid)) == "applied_confirmed" or
+                                                    _signal(page, str(vid), before=True) == "already_applied"):
+                                                outcome.update(application_status="applied_confirmed",
+                                                               reason="HH explicit fresh success message",
+                                                               confirmation="explicit_success_marker_same_vacancy")
                                             break  # Persistent unknown result: never retry this submit.
                                         mark_stage("application")
                                     entry.update(outcome)

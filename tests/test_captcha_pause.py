@@ -311,6 +311,36 @@ class CaptchaPauseTests(unittest.TestCase):
                          "explicit_rejected")
         self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
 
+    def test_controls_disappear_after_second_answer_resumes_without_third_task(self):
+        image, field, action, client, registry = [MagicMock() for _ in range(5)]
+        image.screenshot.side_effect = lambda **_: f"image-{action.click.call_count}".encode()
+        client.get_balance.return_value = BalanceResult(True, Decimal("1"))
+        client.create_image_task.side_effect = [(7, "created"), (8, "created")]
+        client.wait_for_image_solution.return_value = ImageSolution("ready", "synthetic")
+        registry.claim.return_value = True
+        rows, after_second = [], [0]
+        def controls(_):
+            if action.click.call_count == 2:
+                after_second[0] += 1
+                if after_second[0] > 1:
+                    return None
+            return image, field, action
+        patches = self._auto_image_patches(image, field, action, client, registry)
+        with patches[0], patches[1] as control_probe, patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], \
+             patch("anti_captcha.hh_wrong_image_answer_visible", return_value=True), \
+             patch("hh_web.captcha_resolution_verified",
+                   side_effect=lambda *_: action.click.call_count == 2 and after_second[0] > 1):
+            control_probe.side_effect = controls
+            run_web._wait_for_manual_captcha(MagicMock(), operation="application_post_submit",
+                                             run_id="e" * 32, vacancy_id="123",
+                                             stopped=lambda: False, telemetry=rows.append,
+                                             sleep=lambda _: None)
+        self.assertEqual(client.create_image_task.call_count, 2)
+        self.assertEqual(action.click.call_count, 2)
+        self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
+        self.assertFalse(any(r.get("reason") == "challenge_controls_missing" for r in rows))
+
     def test_async_hh_rejection_after_five_seconds_starts_second_captcha_task(self):
         image, field, action, client, registry = [MagicMock() for _ in range(5)]
         image.screenshot.side_effect = [b"first"] * 3 + [b"second"] * 40
@@ -758,6 +788,28 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertEqual(wait.call_args.kwargs["operation"], "application_post_submit")
         self.assertEqual(json.loads(Path(config.APPLICATION_SAFETY_FILE).read_text())["vacancies"]
                          [test_safe_mvp.VAC["id"]], "submission_unknown")
+
+    def test_post_captcha_confirmation_upgrades_only_same_vacancy_without_resubmit(self):
+        page = MagicMock(); browser = MagicMock(); browser.__enter__.return_value = (None, page)
+        rows, calls = [], []
+        def apply(_page, vacancy, _letter, **kwargs):
+            calls.append(vacancy["id"])
+            kwargs["before_submit"]()
+            return {"application_status": "submission_unknown", "reason": "captcha_after_possible_submit"}
+        patches = self._base_patches(browser, rows)
+        with patch.object(config, "DRY_RUN", False), patches[0], patches[1], patches[2], \
+             patches[3], patches[4], patches[6], patches[7], \
+             patch("decide.score", return_value=test_safe_mvp.RESULT), \
+             patch("hh_web.search_page", return_value=[test_safe_mvp.VAC]), \
+             patch("hh_web.load_full", side_effect=lambda _p, vac, **_kw: vac), \
+             patch("hh_web.apply", side_effect=apply), \
+             patch("run_web._wait_for_manual_captcha"), \
+             patch("application._signal", side_effect=lambda _page, vid, before=False:
+                   "applied_confirmed" if vid == test_safe_mvp.VAC["id"] and not before else None):
+            self.assertEqual(run_web.main(), 0)
+        self.assertEqual(calls, [test_safe_mvp.VAC["id"]])
+        self.assertEqual(json.loads(Path(config.APPLICATION_SAFETY_FILE).read_text())["vacancies"]
+                         [test_safe_mvp.VAC["id"]], "applied_confirmed")
 
 
 if __name__ == "__main__":
