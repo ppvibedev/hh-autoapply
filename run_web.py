@@ -258,6 +258,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
         paid_tasks = 0
         answer_submitted = False
         preflight_refreshes = 0
+        awaiting_rejected_challenge = False
         image_load_deadline = clock() + CAPTCHA_IMAGE_APPEAR_SECONDS
         image_wait_started = clock()
         def resolved_after_answer():
@@ -273,22 +274,58 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             if stopped():
                 return False
             if anti_captcha.capture_challenge_structure(page).get("captcha_type") != "image_to_text":
-                if resolved_after_answer():
+                if not awaiting_rejected_challenge and resolved_after_answer():
                     return True
                 remaining = image_load_deadline - clock()
-                if hh_web.captcha_present(page) and remaining > 0:
+                if remaining > 0 and (awaiting_rejected_challenge or hh_web.captcha_present(page)):
                     sleep(min(0.25, remaining))
                     continue
+                if awaiting_rejected_challenge and resolved_after_answer():
+                    return True
                 emit("captcha_auto_fallback", reason="challenge_unrecognized")
                 return False
             controls = anti_captcha.image_challenge_controls(page)
             if controls is None:
-                if resolved_after_answer():
+                if not awaiting_rejected_challenge and resolved_after_answer():
                     return True
                 remaining = image_load_deadline - clock()
-                if hh_web.captcha_present(page) and remaining > 0:
+                if remaining > 0 and (awaiting_rejected_challenge or hh_web.captcha_present(page)):
                     sleep(min(0.25, remaining))
                     continue
+                if awaiting_rejected_challenge and resolved_after_answer():
+                    return True
+                if answer_submitted:
+                    try:
+                        from application import _signal
+                        markers = page.locator('[data-qa*="captcha"]:visible')
+                        marker_count = markers.count()
+                        if not isinstance(marker_count, int) or isinstance(marker_count, bool):
+                            raise ValueError('captcha_marker_count_unavailable')
+                        marker_shapes = markers.evaluate_all("""nodes => nodes.slice(0, 12).map(el => ({
+                          tag: ['div', 'span', 'img', 'input', 'button', 'iframe'].includes(el.tagName.toLowerCase())
+                            ? el.tagName.toLowerCase() : 'other',
+                          data_qa: /^[a-z-]*captcha[a-z-]*$/.test(el.getAttribute('data-qa') || '') &&
+                            (el.getAttribute('data-qa') || '').length <= 64
+                            ? el.getAttribute('data-qa') : null
+                        }))""")
+                        dialog_shapes = page.locator('[role="dialog"]:visible').evaluate_all("""nodes =>
+                          nodes.slice(0, 6).map(el => {
+                            const qa = el.getAttribute('data-qa') || '';
+                            return {data_qa: /^[a-z-]{1,64}$/.test(qa) &&
+                              /(dialog|modal|captcha|response)/.test(qa) ? qa : null,
+                              form_count: Math.min(el.querySelectorAll('form').length, 20),
+                              input_count: Math.min(el.querySelectorAll('input').length, 20),
+                              button_count: Math.min(el.querySelectorAll('button').length, 20)};
+                          })""")
+                        emit("captcha_controls_missing_state", captcha_marker_count=min(marker_count, 100),
+                             captcha_marker_shapes=marker_shapes,
+                             dialog_shapes=dialog_shapes,
+                             captcha_present=hh_web.captcha_present(page),
+                             resolution_verified=hh_web.captcha_resolution_verified(page, operation, vacancy_id),
+                             success_marker_same_vacancy=_signal(page, str(vacancy_id)) == 'applied_confirmed',
+                             response_marker_same_vacancy=_signal(page, str(vacancy_id), before=True) == 'already_applied')
+                    except Exception:
+                        emit("captcha_controls_missing_state", probe_status="unavailable")
                 emit("captcha_auto_fallback",
                      reason=anti_captcha.image_control_failure_reason(page))
                 return False
@@ -318,6 +355,9 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 current = anti_captcha.image_challenge_controls(page)
                 if (current is None or not anti_captcha.hh_image_loaded(current[0]) or
                         current[0].screenshot(timeout=3000) != image_bytes):
+                    if awaiting_rejected_challenge and clock() < image_load_deadline:
+                        sleep(min(0.25, image_load_deadline - clock()))
+                        continue
                     if current is not None and preflight_refreshes < CAPTCHA_PREFLIGHT_REFRESH_LIMIT:
                         preflight_refreshes += 1
                         emit("captcha_auto_retry", reason="preflight_challenge_changed",
@@ -330,6 +370,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
             except Exception:
                 emit("captcha_auto_fallback", reason="challenge_changed")
                 return False
+            awaiting_rejected_challenge = False
             balance = client.get_balance()
             if not balance.available or balance.amount_usd is None or balance.amount_usd <= 0:
                 emit("captcha_auto_fallback", reason="balance_unavailable")
@@ -444,6 +485,7 @@ def _wait_for_manual_captcha(page, *, operation, run_id, vacancy_id=None,
                 return False
             emit("captcha_auto_retry", reason="hh_rejected_new_challenge",
                  paid_tasks=paid_tasks)
+            awaiting_rejected_challenge = True
             image_load_deadline = clock() + CAPTCHA_IMAGE_APPEAR_SECONDS
             image_wait_started = clock()
         return False

@@ -341,6 +341,42 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertEqual(rows[-1]["event"], "captcha_wait_resolved")
         self.assertFalse(any(r.get("reason") == "challenge_controls_missing" for r in rows))
 
+    def test_unverified_missing_controls_emits_structural_snapshot_only(self):
+        image, field, action, client, registry = [MagicMock() for _ in range(5)]
+        image.screenshot.side_effect = lambda **_: b"new" if action.click.call_count else b"old"
+        client.get_balance.return_value = BalanceResult(True, Decimal("1"))
+        client.create_image_task.return_value = (7, "created")
+        client.wait_for_image_solution.return_value = ImageSolution("ready", "PRIVATE_ANSWER")
+        registry.claim.return_value = True
+        page = MagicMock(); markers = page.locator.return_value
+        markers.count.return_value = 1
+        markers.evaluate_all.return_value = [{"tag": "div", "data_qa": "captcha-info"}]
+        rows, now, after_click = [], [0.0], [0]
+        def controls(_):
+            if action.click.call_count:
+                after_click[0] += 1
+                if after_click[0] > 1:
+                    return None
+            return image, field, action
+        def sleep(seconds):
+            now[0] += seconds
+        patches = self._auto_image_patches(image, field, action, client, registry)
+        with patches[0], patches[1] as control_probe, patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], \
+             patch("anti_captcha.hh_wrong_image_answer_visible", return_value=True), \
+             patch("hh_web.captcha_resolution_verified", return_value=False), \
+             patch("hh_web.captcha_present", return_value=False), \
+             patch("application._signal", return_value=None), self.assertRaises(LLMStopped):
+            control_probe.side_effect = controls
+            run_web._wait_for_manual_captcha(page, operation="application_post_submit",
+                                             run_id="e" * 32, vacancy_id="123",
+                                             stopped=lambda: any(r.get("event") == "captcha_auto_fallback" for r in rows),
+                                             telemetry=rows.append, clock=lambda: now[0], sleep=sleep)
+        snapshot = next(r for r in rows if r["event"] == "captcha_controls_missing_state")
+        self.assertEqual(snapshot["captcha_marker_count"], 1)
+        self.assertFalse(snapshot["resolution_verified"])
+        self.assertNotIn("PRIVATE_ANSWER", json.dumps(rows))
+
     def test_async_hh_rejection_after_five_seconds_starts_second_captcha_task(self):
         image, field, action, client, registry = [MagicMock() for _ in range(5)]
         image.screenshot.side_effect = [b"first"] * 3 + [b"second"] * 40
@@ -393,6 +429,44 @@ class CaptchaPauseTests(unittest.TestCase):
         self.assertEqual([r["attempt"] for r in rows if r["event"] == "captcha_auto_started"], [1, 2, 3])
         self.assertEqual(next(r for r in rows if r["event"] == "captcha_auto_fallback")["reason"],
                          "hh_not_verified")
+
+    def test_third_challenge_waits_for_two_second_modal_gap(self):
+        image, field, action, client, registry = [MagicMock() for _ in range(5)]
+        image.screenshot.side_effect = lambda **_: f"image-{action.click.call_count}".encode()
+        client.get_balance.return_value = BalanceResult(True, Decimal("1"))
+        client.create_image_task.side_effect = [(7, "created"), (8, "created"), (9, "created")]
+        client.wait_for_image_solution.return_value = ImageSolution("ready", "synthetic")
+        registry.claim.return_value = True
+        rows, now, second_check, gap_start = [], [0.0], [0], [None]
+        def sleep(seconds):
+            now[0] += seconds
+        def controls(_):
+            if action.click.call_count == 2:
+                second_check[0] += 1
+                if second_check[0] > 1:
+                    if gap_start[0] is None:
+                        gap_start[0] = now[0]
+                    if now[0] - gap_start[0] < 2:
+                        return None
+            return image, field, action
+        image.evaluate.side_effect = lambda _: (action.click.call_count != 2 or
+                                                 gap_start[0] is None or now[0] - gap_start[0] >= 2.5)
+        patches = self._auto_image_patches(image, field, action, client, registry)
+        with patches[0], patches[1] as control_probe, patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], \
+             patch("anti_captcha.hh_wrong_image_answer_visible", return_value=True), \
+             patch("hh_web.captcha_resolution_verified", return_value=False), \
+             patch("hh_web.captcha_present", return_value=False), \
+             self.assertRaises(LLMStopped):
+            control_probe.side_effect = controls
+            run_web._wait_for_manual_captcha(MagicMock(), operation="application_post_submit",
+                                             run_id="e" * 32, vacancy_id="123",
+                                             stopped=lambda: any(r["event"] == "captcha_auto_fallback" for r in rows),
+                                             telemetry=rows.append, clock=lambda: now[0], sleep=sleep)
+        self.assertGreaterEqual(now[0] - gap_start[0], 2.5)
+        self.assertEqual(client.create_image_task.call_count, 3)
+        self.assertEqual(action.click.call_count, 3)
+        self.assertFalse(any(r.get("reason") == "challenge_controls_missing" for r in rows))
 
     def test_late_hh_success_wins_over_early_new_image(self):
         image, field, action, client, registry = [MagicMock() for _ in range(5)]
