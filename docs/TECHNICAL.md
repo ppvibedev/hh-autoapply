@@ -178,3 +178,12 @@ resume ID application остаётся заблокированной до cover
 - `test_history_*`, `test_current_run_ui.py`, `test_dashboard_history.py` — persistence/UI.
 
 Tests должны быть offline: mock HH/LLM и synthetic candidate data.
+
+## Лицензии зависимостей
+
+Исходники проекта распространяются под PolyForm Noncommercial 1.0.0. Установщик
+скачивает зависимости отдельно: Requests — Apache-2.0, python-dotenv — BSD-3-Clause,
+Playwright — Apache-2.0, Flask — BSD-3-Clause. Они не перелицензируются лицензией
+проекта; их собственные notices сохраняются в установленных пакетах. Chromium
+скачивается Playwright отдельно и содержит собственные third-party notices.
+Публичный исходный снимок не включает Python-пакеты или бинарные файлы Chromium.

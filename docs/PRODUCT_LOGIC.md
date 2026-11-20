@@ -410,3 +410,11 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 | Stop latency | watchdog фиксирует stall; блокирующий Playwright-вызов всё ещё может требовать ручной эскалации | Нужна ли процессная изоляция browser operations? |
 | History reset wording | журнал/seen/legacy cache, safety остаётся | Как точнее назвать кнопку и confirmation? |
 | Legacy API path | существует отдельно | Поддерживать, изолировать или удалить позже? |
+
+## 27. macOS Beta distribution
+
+Установка через `setup.sh` требует нативный Python 3.11. Скрипт проверяет версию и
+архитектуру до установки зависимостей, не заменяет несовместимую `.venv` автоматически
+и сохраняет `.env`, `state/`, `private/`. Windows пока не поддерживается.
+Исходники beta предоставляются под PolyForm Noncommercial License 1.0.0;
+зависимости сохраняют собственные лицензии. Установка на другом Mac ещё не проверена.
