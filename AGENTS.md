@@ -46,6 +46,7 @@
 
 - `docs/PRODUCT_LOGIC.md` — каноническое owner-facing описание наблюдаемого поведения. Production code и regression tests являются источником проверки этого описания.
 - Любое изменение observable product behavior должно в том же commit: проверить `PRODUCT_LOGIC.md`, обновить затронутые разделы при изменении semantics и добавить/обновить regression test.
+- При таком изменении проверь также затронутые актуальные `README.md`, `docs/OPERATIONS.md` и `docs/TECHNICAL.md`; обнови только ставшие неточными утверждения в том же изменении. README обновляй, если меняются публичное описание возможностей, требования или ограничения.
 - Observable behavior включает settings, decision order, filters, statuses, SAFE/LIVE, matching, application, resume, questions, submission, Stop, persistence/history и видимую пользователю UI-semantics.
 - Для refactor, diagnostics-only и внутренней оптимизации без observable change обновление `PRODUCT_LOGIC.md` не обязательно. В итоговом отчёте укажи `PRODUCT_LOGIC reviewed: no observable change` либо `PRODUCT_LOGIC updated: <sections>`.
 - Не описывай `PROPOSED`, `HISTORICAL` или `UNKNOWN` как `CURRENT`.

@@ -375,11 +375,23 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 - Search login redirect не имеет отдельного terminal run status.
 - `pages_exhausted` — не доказательство конца HH-выдачи.
 - Standalone response form может не дать доказанно переключить exact resume ID.
+- Автоматическая CAPTCHA ограничена однозначной графической проверкой и внешним платным
+  сервисом; любой отдельный challenge может остаться для ручного решения.
+- Включённые LLM connections могут все оказаться временно недоступны или не принять
+  production payload; конечные 120 секунд/12 attempts останавливают текущую операцию.
 - `needs_manual_review` смешивает бизнес- и технические причины.
 - Зависший внутри Playwright вызов может пережить операционный watchdog; он фиксирует
   stall и запрашивает Stop, но не уничтожает процесс во время возможного submit.
 - Основной browser path и legacy API path сосуществуют; application через API не считается
   текущим production-маршрутом.
+- Инструкция установки проверена на macOS; Windows-совместимость текущей реализации не
+  подтверждена из-за Unix control socket и macOS-ориентированных скриптов.
+
+**Статус проверки.** В реальных LIVE-прогонах подтверждены отправки с HH success marker,
+точная проверка resume ID и несколько автоматических прохождений графической CAPTCHA с
+продолжением обработки. Регрессионные ветки Stop, сетевых ошибок и CAPTCHA дополнительно
+проверяются offline на искусственных данных. Это не гарантия прохождения любого нового
+варианта HH-формы, CAPTCHA или внешнего LLM-запроса.
 
 ## 26. Open product decisions
 
@@ -387,7 +399,6 @@ Run status: `COMPLETED`, `STOPPED` или `FAILED`. `pages_exhausted` сейча
 
 | Тема | CURRENT | OPEN QUESTION |
 |---|---|---|
-| Automatic CAPTCHA solving | явная ручная пауза без автоматического закрытия | После evidence о типе CAPTCHA и допустимом способе решить вопрос внешней integration. |
 | `pages_exhausted` | исчерпан configured budget | Переименовать ли, чтобы не звучало как конец HH? |
 | Standalone resume form | без exact ID submit запрещён | Какой штатный HH-механизм выбора exact ID? |
 | `answer_missing` | manual с имеющейся diagnostic taxonomy | Нужна ли более точная пользовательская причина? |
